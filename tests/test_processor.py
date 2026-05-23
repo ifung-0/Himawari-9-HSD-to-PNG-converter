@@ -324,6 +324,16 @@ class ProcessorTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             h.validate_runtime_dependencies(config, info, start, area)
 
+    def test_timelapse_rejects_geotiff_frame_output(self):
+        config = h.default_config()
+        config.mode = "Timelapse"
+        info = h.parse_url(h.USER_URL)
+        start = h.datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
+        area = mock.Mock(width=22000, height=22000)
+
+        with self.assertRaisesRegex(RuntimeError, "Timelapse frames would be too large"):
+            h.validate_runtime_dependencies(config, info, start, area)
+
     def test_pyspectral_quality_handling(self):
         self.assertEqual(
             h.SATPY_OPTIONAL_DEP_FALLBACKS["True Color RGB (Enhanced)"],
@@ -438,6 +448,20 @@ class ProcessorTests(unittest.TestCase):
                 h.download_segments([task], workers=1, cancel_event=cancel_event)
 
         executor.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
+
+    @mock.patch("himawari_lowram_processor.cleanup_paths")
+    def test_cleanup_partial_downloads_only_removes_part_files(self, mock_cleanup):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            frame_dir = h.Path(tmp_dir)
+            part_path = frame_dir / "segment.dat.part"
+            complete_path = frame_dir / "segment.dat"
+            part_path.write_text("partial")
+            complete_path.write_text("complete")
+
+            h.cleanup_partial_downloads(frame_dir)
+
+        mock_cleanup.assert_called_once()
+        self.assertEqual(mock_cleanup.call_args.args[0], [part_path])
 
     def test_run_honors_precanceled_event(self):
         cancel_event = threading.Event()

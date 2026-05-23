@@ -890,6 +890,11 @@ def cleanup_paths(paths: Iterable[Path]) -> None:
             LOG.warning("Cleanup failed for %s: %s", path, exc)
 
 
+def cleanup_partial_downloads(frame_dir: Path) -> None:
+    if frame_dir.exists():
+        cleanup_paths(list(frame_dir.glob("*.part")))
+
+
 def intersect_extents(areas: Iterable[AreaDefinition]) -> tuple[float, float, float, float]:
     area_list = list(areas)
     if not area_list:
@@ -1229,6 +1234,7 @@ def process_frame(
     frame_dir = tasks[0].destination.parent if tasks else TEMP_DIR
     local_files: list[Path] = []
     scene: Scene | None = None
+    frame_succeeded = False
 
     LOG.info("[%s/%s] Processing %s", frame_idx + 1, total_frames, dt.strftime("%Y%m%d_%H%M"))
     emit_progress(progress, f"Frame {frame_idx + 1}/{total_frames}: starting", 0, max(1, len(tasks)))
@@ -1333,9 +1339,10 @@ def process_frame(
                 overlay=overlay_options,
             )
             log_memory("after save", config)
+            frame_succeeded = True
             return output_path
 
-        return save_custom_composite_output(
+        output_path = save_custom_composite_output(
             scene,
             active,
             master_area,
@@ -1346,6 +1353,8 @@ def process_frame(
             progress=progress,
             cancel_event=cancel_event,
         )
+        frame_succeeded = True
+        return output_path
     except ProcessingCancelled:
         LOG.info("Frame canceled.")
         raise
@@ -1354,7 +1363,10 @@ def process_frame(
         return None
     finally:
         scene = None
-        cleanup_paths([frame_dir])
+        if frame_succeeded:
+            cleanup_paths([frame_dir])
+        else:
+            cleanup_partial_downloads(frame_dir)
         gc.collect()
         log_memory("frame cleanup", config)
 
@@ -1456,6 +1468,11 @@ def validate_runtime_dependencies(config: ProcessorConfig, info: UrlInfo, start:
         config.image_format,
     )
     safe_name = enforce_safe_output_format(preview_name, area, config)
+    if config.mode == "Timelapse" and writer_for_output(safe_name) == "geotiff":
+        raise RuntimeError(
+            "Timelapse frames would be too large for low-RAM GIF/MP4 assembly and would need GeoTIFF output. "
+            "Use Single Image, choose a coarser product such as B13, or use a smaller Himawari area."
+        )
     if writer_for_output(safe_name) == "geotiff":
         require_module("rasterio", "GeoTIFF output")
 

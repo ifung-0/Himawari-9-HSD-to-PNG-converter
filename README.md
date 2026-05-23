@@ -119,8 +119,9 @@ True color reproduction needs `B01`, `B02`, `B03`, and `B04`; with night
 fallback enabled the app also downloads `B13`, so one frame can be 50 files.
 
 For a faster daytime single image, turn off `Use night fallback for day-only
-products` to avoid the extra `B13` band. Keep the temp folder between retries
-so already-downloaded segments can be reused.
+products` to avoid the extra `B13` band. Already-downloaded complete `.DAT`
+segments are kept after failed or canceled frames, so retrying the same
+timestamp can reuse them.
 
 After pressing `Stop Download`, wait for the canceled message before starting
 again. The app lets active download workers close their `.part` files first so
@@ -186,6 +187,10 @@ This usually means all frames failed or were unavailable. Check the log panel
 for the first frame error. Common causes are invalid timestamps, missing NOAA
 segments, or unsupported composites in the active Satpy environment.
 
+Full-disk 500 m true-color timelapses are intentionally rejected when the app
+would need GeoTIFF frame output. GIF/MP4 assembly has to read every finished
+frame into memory, which is not low-RAM at full-disk true-color size.
+
 Fix:
 
 ```powershell
@@ -193,7 +198,8 @@ python check_environment.py
 ```
 
 Then try a simple timelapse with `B13 (Infrared Window)`, `gif`, and a short
-time range before using heavier true color products.
+time range before using heavier true color products. Use `Single Image` for
+full-disk 500 m true-color GeoTIFF output.
 
 ### Single image says failed and no output was created
 
@@ -221,7 +227,8 @@ python -m unittest discover -s tests
 ### Downloads are slow, stuck, or partially written
 
 Large full-disk products need many compressed NOAA segments. Use `Stop
-Download` to cancel safely. Partial `.part` files are cleaned up automatically.
+Download` to cancel safely. Partial `.part` files are cleaned up automatically,
+while complete `.DAT` files are kept for retry reuse.
 
 Fix: retry the same timestamp, lower the download worker count if the network
 is unstable, or test with a single low-resolution band like `B13`.
