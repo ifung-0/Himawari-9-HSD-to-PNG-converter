@@ -33,6 +33,20 @@ Install dependencies first:
 python install_requirements.py
 ```
 
+If true color reproduction fails with a Satpy error like
+`No dataset matching 'true_color_reproduction' found`, run the environment
+checker with the same Python that launches the GUI:
+
+```powershell
+python check_environment.py
+python check_environment.py --fix
+```
+
+The checker verifies the active Python executable, installed package versions,
+Satpy's AHI reader/composite configuration, `pyspectral`, and GeoTIFF/overlay
+helpers. With `--fix`, it upgrades packages from `requirements.txt` and then
+checks again.
+
 Launch the GUI:
 
 ```powershell
