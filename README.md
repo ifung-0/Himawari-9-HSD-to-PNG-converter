@@ -122,6 +122,10 @@ For a faster daytime single image, turn off `Use night fallback for day-only
 products` to avoid the extra `B13` band. Keep the temp folder between retries
 so already-downloaded segments can be reused.
 
+After pressing `Stop Download`, wait for the canceled message before starting
+again. The app lets active download workers close their `.part` files first so
+Windows does not leave temporary files locked.
+
 ### `No dataset matching 'true_color_reproduction' found`
 
 Satpy cannot find the AHI true color reproduction composite. This is usually

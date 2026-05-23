@@ -420,6 +420,25 @@ class ProcessorTests(unittest.TestCase):
         with self.assertRaises(h.ProcessingCancelled):
             h.download_segments([task], workers=1, cancel_event=cancel_event)
 
+    @mock.patch("himawari_lowram_processor.concurrent.futures.ThreadPoolExecutor")
+    def test_download_segments_waits_for_workers_after_cancel(self, mock_executor_class):
+        cancel_event = threading.Event()
+        executor = mock.Mock()
+        future = mock.Mock()
+        executor.submit.return_value = future
+        mock_executor_class.return_value = executor
+
+        def wait_side_effect(_pending, timeout, return_when):
+            cancel_event.set()
+            return set(), {future}
+
+        task = h.DownloadTask("https://example.test/file.bz2", h.Path("missing.dat"))
+        with mock.patch("himawari_lowram_processor.concurrent.futures.wait", side_effect=wait_side_effect):
+            with self.assertRaises(h.ProcessingCancelled):
+                h.download_segments([task], workers=1, cancel_event=cancel_event)
+
+        executor.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
+
     def test_run_honors_precanceled_event(self):
         cancel_event = threading.Event()
         cancel_event.set()

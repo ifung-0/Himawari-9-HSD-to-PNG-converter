@@ -551,8 +551,7 @@ def download_segments(
         emit_progress(progress, "Download canceled", completed, total)
         raise
     finally:
-        wait_for_workers = cancel_event is None or not cancel_event.is_set()
-        pool.shutdown(wait=wait_for_workers, cancel_futures=True)
+        pool.shutdown(wait=True, cancel_futures=True)
     return results
 
 
