@@ -1,0 +1,14 @@
+satpy>=0.60
+dask>=2026.3
+xarray>=2026.4
+pyresample>=1.35
+requests>=2.32
+imageio>=2.37
+pillow>=10.2
+numpy>=2.0
+psutil>=5.9
+pyspectral>=0.13
+pycoast>=1.7
+aggdraw>=1.3
+rasterio>=1.3
+imageio-ffmpeg>=0.4; platform_system != "Emscripten"

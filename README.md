@@ -1,0 +1,107 @@
+# Himawari-9 Low-RAM Imagery Processor
+
+This project downloads Himawari-9 AHI-L1b HSD segments from NOAA AWS S3,
+processes them with Satpy, and writes either a single PNG or a GIF/MP4
+timelapse. The pipeline is designed for a hard 10 GiB memory budget.
+
+## Why This Version Is Low RAM
+
+- Downloads are streamed and decompressed incrementally.
+- Active downloads can be canceled from the GUI; partial `.part` files are
+  cleaned up when cancellation is requested.
+- Dask chunks default to `64MiB`.
+- Download concurrency is capped to 4 workers.
+- Dask execution is capped to 1 worker by default, with a hard max of 2.
+- Custom composites use lazy `xarray`/Dask operations.
+- The old full-frame `np.array(...values)` and percentile colorization paths
+  are gone from processing.
+- Full-disk output uses Satpy's `native` resampler by default to avoid
+  bilinear KD-tree index arrays that can consume multiple GiB before saving.
+- Timelapse frame areas are snapped to a native-compatible B13 grid before
+  resampling so Satpy's native resampler keeps integer expansion/reduction
+  factors across shifted Target scans.
+- Set `IMAGE_FORMAT = "tif"` to use Satpy/rasterio chunked GeoTIFF writing for
+  very large full-disk outputs.
+- Full-disk 500 m PNG requests are automatically switched to GeoTIFF because
+  the PNG/Pillow writer has to assemble one huge image in memory.
+
+## Usage
+
+Install dependencies first:
+
+```powershell
+python install_requirements.py
+```
+
+Launch the GUI:
+
+```powershell
+python himawari_lowram_processor.py
+```
+
+The window lets you edit the Himawari URL, choose any supported band or
+composite, switch between single-image and timelapse modes, set timelapse
+hours/interval/FPS, choose PNG or GeoTIFF output, cap download and Dask workers,
+choose the low-memory resampler, toggle night fallback, and pick output/temp
+folders.
+It also has optional coastline/country border overlays with a user-selected
+line color. The default border color is green.
+Overlay rendering uses Satpy/pycoast, so install requirements first and place
+pycoast-compatible coastline/border shapefiles under the project `overlays/`
+folder if your environment does not already provide them.
+
+The progress bar advances while segment downloads and timelapse frame assembly
+run, and the live log panel shows memory checkpoints and processing stages.
+Use `Stop Download` to cancel the current run, including active segment
+downloads and pending frames. Use `Terminate` to request cancellation and close
+the GUI.
+
+For official-looking true color and true color reproduction, keep the
+lower-quality fallback checkbox off and make sure `pyspectral` is installed in
+the same Python environment that launches the GUI. `install_requirements.py`
+installs it from `requirements.txt`.
+
+You can still change the default values near the top of
+`himawari_lowram_processor.py` if you want the GUI to open with different
+initial settings:
+
+```python
+USER_URL = "https://noaa-himawari9.s3.amazonaws.com/..."
+MODE = "Single Image"
+COMPOSITE_CHOICE = "True Color RGB (Enhanced)"
+IMAGE_FORMAT = "png"
+```
+
+Outputs are written to `outputs/`. Temporary DAT files are written under
+`temp/` and cleaned after each frame.
+
+Cancellation is cooperative. Downloads stop at the next streamed chunk or
+request timeout, while Satpy load/resample/save calls finish their current call
+before the processor observes the stop request.
+
+## Supported Choices
+
+All standalone bands are supported from `B01` through `B16`.
+
+Built-in Satpy composites include true color, true color reproduction, natural
+color, day/night microphysics, dust, airmass, day snow-fog, and day convective
+storm mappings where available in the installed Satpy AHI configuration.
+
+Custom lazy composites:
+
+- `Sandwich (B03 + B13)`
+- `B03 and B13 at night`
+- `Heavy Rainfall Potential`
+
+## Verification
+
+Run the local checks:
+
+```powershell
+python -m py_compile himawari_lowram_processor.py
+python -m unittest discover -s tests
+python -c "import himawari_lowram_processor as h; print(len(h.BAND_RESOLUTION))"
+```
+
+Full live rendering requires network access to NOAA AWS S3 and the Satpy AHI
+reader dependencies.
