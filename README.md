@@ -39,13 +39,16 @@ checker with the same Python that launches the GUI:
 
 ```powershell
 python check_environment.py
+python check_environment.py --auto
 python check_environment.py --fix
 ```
 
 The checker verifies the active Python executable, installed package versions,
 Satpy's AHI reader/composite configuration, `pyspectral`, and GeoTIFF/overlay
-helpers. With `--fix`, it upgrades packages from `requirements.txt` and then
-checks again.
+helpers. With `--fix`, it upgrades packages from `requirements.txt` using the
+current Python. With `--auto`, it does the same repair automatically and, if
+the active Python is unsupported, tries to create/use a local `.venv` with
+Python 3.12 or 3.13 from the Windows `py` launcher.
 
 Launch the GUI:
 
@@ -119,11 +122,14 @@ Fix:
 
 ```powershell
 python check_environment.py
+python check_environment.py --auto
 python check_environment.py --fix
 ```
 
 If it still fails, check that the reported Python executable is the same one
-used to launch `himawari_lowram_processor.py`.
+used to launch `himawari_lowram_processor.py`. Python 3.12 or 3.13 is
+recommended; if the checker reports Python 3.14, use `--auto` to create a
+supported `.venv` when Python 3.12/3.13 is installed.
 
 ### True color says `pyspectral` is missing
 

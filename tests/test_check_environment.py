@@ -17,6 +17,17 @@ class EnvironmentCheckTests(unittest.TestCase):
         self.assertEqual(command[-2], "-r")
         self.assertEqual(command[-1], str(env.REQUIREMENTS_FILE))
 
+    def test_supported_python_version_accepts_312_and_313(self):
+        self.assertTrue(env.supported_python_version((3, 12)))
+        self.assertTrue(env.supported_python_version((3, 13)))
+        self.assertFalse(env.supported_python_version((3, 14)))
+
+    def test_venv_python_path_uses_project_venv(self):
+        path = env.venv_python_path()
+
+        self.assertIn(".venv", str(path))
+        self.assertTrue(str(path).endswith("python.exe") or str(path).endswith("python"))
+
     def test_has_critical_failures_ignores_optional_warnings(self):
         results = [
             env.CheckResult("optional", False, "missing", critical=False),
@@ -40,6 +51,26 @@ class EnvironmentCheckTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         mock_call.assert_called_once_with(env.pip_install_command(upgrade=True), cwd=env.PROJECT_DIR)
+
+    @mock.patch("check_environment.run_fix", return_value=0)
+    @mock.patch("check_environment.run_environment_check_with", return_value=0)
+    @mock.patch("check_environment.venv_python_path")
+    def test_auto_fix_uses_existing_venv_for_unsupported_python(
+        self,
+        mock_venv_path,
+        mock_check_repaired,
+        mock_run_fix,
+    ):
+        python_path = mock.Mock()
+        python_path.exists.return_value = True
+        mock_venv_path.return_value = python_path
+        results = [env.CheckResult("python version", False, "unsupported")]
+
+        result = env.run_auto_fix(results)
+
+        self.assertEqual(result, 0)
+        mock_run_fix.assert_called_once_with(python_path)
+        mock_check_repaired.assert_called_once_with(python_path)
 
 
 if __name__ == "__main__":
