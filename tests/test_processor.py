@@ -349,6 +349,38 @@ class ProcessorTests(unittest.TestCase):
         with self.assertRaises(h.ProcessingCancelled):
             h.run(h.default_config(), cancel_event=cancel_event)
 
+    @mock.patch("himawari_lowram_processor.native_compatible_common_area")
+    @mock.patch("himawari_lowram_processor.cleanup_paths")
+    @mock.patch("himawari_lowram_processor.Scene")
+    @mock.patch("himawari_lowram_processor.download_segments")
+    def test_common_area_scan_forwards_download_progress(
+        self,
+        mock_download,
+        mock_scene_class,
+        _mock_cleanup,
+        mock_native_area,
+    ):
+        events = []
+        config = h.default_config()
+        info = h.parse_url(h.USER_URL)
+        dt = h.datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
+        fake_path = h.Path("fake-b13.dat")
+        fake_area = mock.Mock(width=10, height=10)
+        fake_scene = mock.Mock()
+        fake_scene.__getitem__ = mock.Mock(return_value=mock.Mock(attrs={"area": fake_area}))
+        mock_scene_class.return_value = fake_scene
+        mock_download.return_value = [fake_path] * info.total_segments
+        mock_native_area.return_value = fake_area
+
+        def progress(message, current, total):
+            events.append((message, current, total))
+
+        result = h.common_area_from_frames(info, [dt], 2000, config=config, progress=progress)
+
+        self.assertIs(result, fake_area)
+        self.assertIs(mock_download.call_args.kwargs["progress"], progress)
+        self.assertTrue(events)
+
     @mock.patch("himawari_lowram_processor.process_frame", return_value=None)
     @mock.patch("himawari_lowram_processor.validate_runtime_dependencies")
     @mock.patch("himawari_lowram_processor.common_area_from_frames")

@@ -1015,6 +1015,7 @@ def common_area_from_frames(
             tasks,
             config.download_workers,
             auto_download=config.auto_download,
+            progress=progress,
             cancel_event=cancel_event,
         )
         if len(results) != len(tasks):
