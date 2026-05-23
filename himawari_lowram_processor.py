@@ -1040,7 +1040,6 @@ def common_area_from_frames(
     LOG.info("Scanning frames for common native area")
     emit_progress(progress, "Downloading B13 scan segments for common area", 0, len(steps))
     areas = []
-    downloaded = []
 
     for idx, dt in enumerate(steps, start=1):
         check_cancel(cancel_event)
@@ -1056,7 +1055,6 @@ def common_area_from_frames(
             LOG.warning("Could not scan %s; segment unavailable", dt.strftime("%Y%m%d_%H%M"))
             emit_progress(progress, f"Area scan skipped {idx}/{len(steps)}", idx, len(steps))
             continue
-        downloaded.extend(results)
         try:
             scene = Scene(filenames=[str(path) for path in results], reader="ahi_hsd")
             scene.load(["B13"], calibration="brightness_temperature")
@@ -1069,8 +1067,7 @@ def common_area_from_frames(
         finally:
             gc.collect()
 
-    cleanup_paths(downloaded)
-    log_memory("area scan cleanup", config)
+    log_memory("area scan complete", config)
 
     target_area = native_compatible_common_area(areas, pixel_size_m)
     LOG.info("Area locked: %sx%s px at %s m native target", target_area.width, target_area.height, pixel_size_m)

@@ -112,6 +112,16 @@ Custom lazy composites:
 
 ## Common Errors and Fixes
 
+### Downloading 50 segments feels slow
+
+Full-disk (`FLDK`) Himawari files are split into 10 scan segments per band.
+True color reproduction needs `B01`, `B02`, `B03`, and `B04`; with night
+fallback enabled the app also downloads `B13`, so one frame can be 50 files.
+
+For a faster daytime single image, turn off `Use night fallback for day-only
+products` to avoid the extra `B13` band. Keep the temp folder between retries
+so already-downloaded segments can be reused.
+
 ### `No dataset matching 'true_color_reproduction' found`
 
 Satpy cannot find the AHI true color reproduction composite. This is usually

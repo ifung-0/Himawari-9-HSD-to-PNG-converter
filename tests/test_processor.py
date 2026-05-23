@@ -435,7 +435,7 @@ class ProcessorTests(unittest.TestCase):
         self,
         mock_download,
         mock_scene_class,
-        _mock_cleanup,
+        mock_cleanup,
         mock_native_area,
     ):
         events = []
@@ -459,6 +459,7 @@ class ProcessorTests(unittest.TestCase):
         self.assertIs(mock_download.call_args.kwargs["progress"], progress)
         self.assertTrue(events)
         self.assertEqual(events[0][0], "Downloading B13 scan segments for common area")
+        mock_cleanup.assert_not_called()
 
     @mock.patch("himawari_lowram_processor.process_frame", return_value=None)
     @mock.patch("himawari_lowram_processor.validate_runtime_dependencies")
