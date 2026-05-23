@@ -107,6 +107,124 @@ Custom lazy composites:
 - `B03 and B13 at night`
 - `Heavy Rainfall Potential`
 
+## Common Errors and Fixes
+
+### `No dataset matching 'true_color_reproduction' found`
+
+Satpy cannot find the AHI true color reproduction composite. This is usually
+an old Satpy install, a broken Satpy config install, or the GUI running with a
+different Python than the one where requirements were installed.
+
+Fix:
+
+```powershell
+python check_environment.py
+python check_environment.py --fix
+```
+
+If it still fails, check that the reported Python executable is the same one
+used to launch `himawari_lowram_processor.py`.
+
+### True color says `pyspectral` is missing
+
+The official-looking true color composites need `pyspectral`.
+
+Fix:
+
+```powershell
+python install_requirements.py --upgrade
+python check_environment.py
+```
+
+As a temporary workaround, enable the lower-quality fallback checkbox or choose
+`B13 (Infrared Window)`.
+
+### Full-disk PNG changes to GeoTIFF
+
+This is expected for very large outputs, especially 500 m full-disk true color.
+PNG/Pillow has to build a huge image in memory, so the app switches to chunked
+GeoTIFF for low-RAM writing.
+
+Fix: install `rasterio` if GeoTIFF output fails.
+
+```powershell
+python check_environment.py --fix
+```
+
+### Timelapse finishes with no GIF/MP4
+
+This usually means all frames failed or were unavailable. Check the log panel
+for the first frame error. Common causes are invalid timestamps, missing NOAA
+segments, or unsupported composites in the active Satpy environment.
+
+Fix:
+
+```powershell
+python check_environment.py
+```
+
+Then try a simple timelapse with `B13 (Infrared Window)`, `gif`, and a short
+time range before using heavier true color products.
+
+### `Aggregation factors are not integers` or `Expand factor must be a whole number`
+
+Use the latest app version. Timelapse target areas are now snapped to a native
+B13 grid before Satpy native resampling. Avoid changing the resampler to
+bilinear for full-disk low-RAM work.
+
+Fix:
+
+```powershell
+git pull
+python -m unittest discover -s tests
+```
+
+### Downloads are slow, stuck, or partially written
+
+Large full-disk products need many compressed NOAA segments. Use `Stop
+Download` to cancel safely. Partial `.part` files are cleaned up automatically.
+
+Fix: retry the same timestamp, lower the download worker count if the network
+is unstable, or test with a single low-resolution band like `B13`.
+
+### Border overlays do not draw
+
+Overlay rendering needs `pycoast`, `aggdraw`, and compatible coastline/border
+shapefiles. The Python packages are installed by requirements, but shapefile
+data may still need to be placed under `overlays/`.
+
+Fix:
+
+```powershell
+python check_environment.py --fix
+```
+
+Then add pycoast-compatible coastline/border data to the project `overlays/`
+folder.
+
+### MP4 output falls back to GIF
+
+MP4 writing needs `imageio-ffmpeg`. If it is missing, the app logs a warning
+and writes a GIF instead.
+
+Fix:
+
+```powershell
+python check_environment.py --fix
+```
+
+### `URL not recognised`
+
+The app expects a NOAA AWS AHI object URL or NOAA AWS index URL. Make sure the
+URL includes an AHI-L1b area (`FLDK`, `Target`, or `Japan`), timestamp, band,
+resolution, and segment pattern.
+
+Example object URL:
+
+```text
+https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/2024/07/25/0400/HS_H09_20240725_0400_B01_FLDK_R10_S0110.DAT.bz2
+```
+
 ## Verification
 
 Run the local checks:
