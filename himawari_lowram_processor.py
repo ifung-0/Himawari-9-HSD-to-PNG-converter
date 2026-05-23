@@ -205,6 +205,7 @@ NIGHT_FALLBACK_MAP = {
 }
 
 CUSTOM_DATASET_NAMES = {
+    "True Color Reproduction Image": "custom_true_color_reproduction_rgb",
     "Sandwich (B03 + B13)": "custom_sandwich_b03_b13",
     "B03 and B13 at night": "custom_b03_b13_night",
     "Heavy Rainfall Potential": "custom_heavy_rainfall_potential",
@@ -727,11 +728,44 @@ def create_day_snow_fog_rgb(b03: xr.DataArray, b05: xr.DataArray, b13: xr.DataAr
     )
 
 
+def create_true_color_reproduction_fallback(
+    b01: xr.DataArray,
+    b02: xr.DataArray,
+    b03: xr.DataArray,
+    b04: xr.DataArray,
+) -> xr.DataArray:
+    red = scale_reflectance(b03, max_value=100.0, gamma=1.25)
+    green = xr_clip(
+        scale_reflectance(b02, max_value=100.0, gamma=1.18) * 0.58
+        + scale_reflectance(b03, max_value=100.0, gamma=1.2) * 0.30
+        + scale_reflectance(b04, max_value=100.0, gamma=1.15) * 0.12,
+        0.0,
+        1.0,
+    )
+    blue = scale_reflectance(b01, max_value=100.0, gamma=1.2)
+    return rgb_dataarray(
+        red,
+        green,
+        blue,
+        name=CUSTOM_DATASET_NAMES["True Color Reproduction Image"],
+        standard_name="custom_true_color_reproduction_rgb",
+    )
+
+
 def build_custom_composite(scene: Scene, composite_choice: str, is_night: bool) -> tuple[str, xr.DataArray]:
     if composite_choice in SINGLE_BAND_LABELS:
         band = SINGLE_BAND_LABELS[composite_choice]
         dataset_name = f"custom_{band.lower()}_rgb"
         return dataset_name, single_band_to_rgb(scene[band], band, dataset_name)
+
+    if composite_choice == "True Color Reproduction Image":
+        dataset = create_true_color_reproduction_fallback(
+            scene["B01"],
+            scene["B02"],
+            scene["B03"],
+            scene["B04"],
+        )
+        return dataset.attrs["name"], dataset
 
     if composite_choice == "Sandwich (B03 + B13)":
         dataset = create_sandwich_composite(scene["B03"], scene["B13"])
@@ -1004,7 +1038,7 @@ def common_area_from_frames(
 ) -> AreaDefinition:
     config = config or default_config()
     LOG.info("Scanning frames for common native area")
-    emit_progress(progress, "Scanning common area", 0, len(steps))
+    emit_progress(progress, "Downloading B13 scan segments for common area", 0, len(steps))
     areas = []
     downloaded = []
 
@@ -1081,6 +1115,17 @@ def missing_optional_dependency(exc: BaseException, module_name: str) -> bool:
     return False
 
 
+def missing_satpy_dataset(exc: BaseException, dataset_name: str) -> bool:
+    dataset_pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(dataset_name)}(?![A-Za-z0-9_])")
+    current: BaseException | None = exc
+    while current is not None:
+        message = str(current)
+        if "No dataset matching" in message and dataset_pattern.search(message):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def missing_pyspectral_message(composite_name: str) -> str:
     return (
         f"{composite_name} needs the optional package pyspectral for the official-looking "
@@ -1129,6 +1174,44 @@ def save_dataset_with_optional_overlay(
             scene.save_dataset(dataset_name, **save_kwargs)
             return fallback_path
         raise
+    return output_path
+
+
+def save_custom_composite_output(
+    scene: Scene,
+    active: str,
+    master_area: AreaDefinition,
+    output_path: Path,
+    config: ProcessorConfig,
+    is_night: bool,
+    overlay_options: dict | None,
+    progress: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
+) -> Path:
+    custom_bands = COMPOSITE_BANDS[active]
+    emit_progress(progress, f"Loading {active}", None, None)
+    load_bands(scene, custom_bands)
+    log_memory("after load", config)
+    check_cancel(cancel_event)
+    emit_progress(progress, "Resampling", None, None)
+    resampled = resample_scene_low_ram(scene, master_area, config, datasets=custom_bands)
+    log_memory("after resample", config)
+    check_cancel(cancel_event)
+    emit_progress(progress, f"Building {active}", None, None)
+    dataset_name, dataset = build_custom_composite(resampled, active, is_night)
+    resampled[dataset_name] = dataset
+    check_cancel(cancel_event)
+    emit_progress(progress, f"Saving {output_path.name}", None, None)
+    output_path = save_dataset_with_optional_overlay(
+        resampled,
+        dataset_name,
+        output_path,
+        writer_for_output(output_path),
+        enhance=False,
+        fill_value=0,
+        overlay=overlay_options,
+    )
+    log_memory("after save", config)
     return output_path
 
 
@@ -1203,6 +1286,22 @@ def process_frame(
             try:
                 scene.load([satpy_name])
             except Exception as exc:
+                if active == "True Color Reproduction Image" and missing_satpy_dataset(exc, satpy_name):
+                    message = "Satpy true_color_reproduction unavailable; using custom low-RAM fallback"
+                    LOG.warning("%s.", message)
+                    emit_progress(progress, message, None, None)
+                    scene = Scene(filenames=[str(path) for path in local_files], reader="ahi_hsd")
+                    return save_custom_composite_output(
+                        scene,
+                        active,
+                        master_area,
+                        output_path,
+                        config,
+                        is_night,
+                        overlay_options,
+                        progress=progress,
+                        cancel_event=cancel_event,
+                    )
                 if (
                     active in QUALITY_CRITICAL_COMPOSITES
                     and not config.allow_quality_fallback
@@ -1240,31 +1339,17 @@ def process_frame(
             log_memory("after save", config)
             return output_path
 
-        custom_bands = COMPOSITE_BANDS[active]
-        emit_progress(progress, f"Loading {active}", None, None)
-        load_bands(scene, custom_bands)
-        log_memory("after load", config)
-        check_cancel(cancel_event)
-        emit_progress(progress, "Resampling", None, None)
-        resampled = resample_scene_low_ram(scene, master_area, config, datasets=custom_bands)
-        log_memory("after resample", config)
-        check_cancel(cancel_event)
-        emit_progress(progress, f"Building {active}", None, None)
-        dataset_name, dataset = build_custom_composite(resampled, active, is_night)
-        resampled[dataset_name] = dataset
-        check_cancel(cancel_event)
-        emit_progress(progress, f"Saving {output_path.name}", None, None)
-        output_path = save_dataset_with_optional_overlay(
-            resampled,
-            dataset_name,
+        return save_custom_composite_output(
+            scene,
+            active,
+            master_area,
             output_path,
-            writer_for_output(output_path),
-            enhance=False,
-            fill_value=0,
-            overlay=overlay_options,
+            config,
+            is_night,
+            overlay_options,
+            progress=progress,
+            cancel_event=cancel_event,
         )
-        log_memory("after save", config)
-        return output_path
     except ProcessingCancelled:
         LOG.info("Frame canceled.")
         raise
@@ -1432,8 +1517,9 @@ def run(
 
     if config.mode == "Single Image" and outputs:
         LOG.info("Saved: %s", outputs[0])
-    else:
-        LOG.warning("No frames processed.")
+        return outputs
+    if config.mode == "Single Image":
+        raise RuntimeError("Single image failed: no output was created. Check the log for the frame error.")
     return outputs
 
 

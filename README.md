@@ -118,6 +118,15 @@ Satpy cannot find the AHI true color reproduction composite. This is usually
 an old Satpy install, a broken Satpy config install, or the GUI running with a
 different Python than the one where requirements were installed.
 
+The app now falls back automatically to a custom low-RAM RGB approximation and
+continues writing an output. The log will say:
+
+```text
+Satpy true_color_reproduction unavailable; using custom low-RAM fallback
+```
+
+Use the checker below if you want to repair the official Satpy composite.
+
 Fix:
 
 ```powershell
@@ -171,6 +180,16 @@ python check_environment.py
 
 Then try a simple timelapse with `B13 (Infrared Window)`, `gif`, and a short
 time range before using heavier true color products.
+
+### Single image says failed and no output was created
+
+Older builds could show a final "Done" dialog with an empty output list after
+the only frame failed. Current builds report this as a failure. Check the log
+panel for the first `Frame failed` message, then run:
+
+```powershell
+python check_environment.py --auto
+```
 
 ### `Aggregation factors are not integers` or `Expand factor must be a whole number`
 

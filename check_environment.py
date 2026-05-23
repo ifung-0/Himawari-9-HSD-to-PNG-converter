@@ -246,7 +246,15 @@ def check_satpy_ahi_configs() -> list[CheckResult]:
         CheckResult(
             "AHI true_color_reproduction composite",
             has_reproduction,
-            str(composite_config) if has_reproduction else f"{TRUE_COLOR_REPRODUCTION!r} not found in {composite_config}",
+            (
+                str(composite_config)
+                if has_reproduction
+                else (
+                    f"{TRUE_COLOR_REPRODUCTION!r} not found in {composite_config}; "
+                    "run --auto/--fix to repair Satpy. The app can use a custom low-RAM fallback."
+                )
+            ),
+            critical=False,
         )
     )
     return results
@@ -259,12 +267,17 @@ def check_project_import() -> CheckResult:
         return CheckResult("project import", False, f"failed to import himawari_lowram_processor: {exc}")
 
     mapped_name = app.SATPY_COMPOSITE_NAMES.get("True Color Reproduction Image")
-    if mapped_name == TRUE_COLOR_REPRODUCTION:
-        return CheckResult("project true color mapping", True, f"maps to {mapped_name!r}")
+    has_fallback = "True Color Reproduction Image" in app.CUSTOM_DATASET_NAMES
+    if mapped_name == TRUE_COLOR_REPRODUCTION and has_fallback:
+        return CheckResult(
+            "project true color mapping",
+            True,
+            f"maps to {mapped_name!r}; custom fallback available",
+        )
     return CheckResult(
         "project true color mapping",
         False,
-        f"expected {TRUE_COLOR_REPRODUCTION!r}, found {mapped_name!r}",
+        f"expected {TRUE_COLOR_REPRODUCTION!r} with custom fallback, found {mapped_name!r}",
     )
 
 

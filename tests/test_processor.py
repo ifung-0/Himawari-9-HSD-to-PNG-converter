@@ -125,6 +125,24 @@ class ProcessorTests(unittest.TestCase):
             coords={"y": y, "x": x},
             attrs=attrs,
         )
+        b01 = xr.DataArray(
+            da.ones((4, 4), chunks=(2, 2)) * 35,
+            dims=("y", "x"),
+            coords={"y": y, "x": x},
+            attrs=attrs,
+        )
+        b02 = xr.DataArray(
+            da.ones((4, 4), chunks=(2, 2)) * 45,
+            dims=("y", "x"),
+            coords={"y": y, "x": x},
+            attrs=attrs,
+        )
+        b04 = xr.DataArray(
+            da.ones((4, 4), chunks=(2, 2)) * 55,
+            dims=("y", "x"),
+            coords={"y": y, "x": x},
+            attrs=attrs,
+        )
         b08 = xr.DataArray(
             da.ones((4, 4), chunks=(2, 2)) * 230,
             dims=("y", "x"),
@@ -147,17 +165,22 @@ class ProcessorTests(unittest.TestCase):
         sandwich = h.create_sandwich_composite(b03, b13)
         heavy = h.create_heavy_rainfall_rgb(b08, b13, b15)
         snow_fog = h.create_day_snow_fog_rgb(b03, b03, b13)
+        true_color_repro = h.create_true_color_reproduction_fallback(b01, b02, b03, b04)
         self.assertIsInstance(sandwich.data, da.Array)
         self.assertIsInstance(heavy.data, da.Array)
         self.assertIsInstance(snow_fog.data, da.Array)
+        self.assertIsInstance(true_color_repro.data, da.Array)
         self.assertEqual(sandwich.dtype, h.np.uint8)
         self.assertEqual(heavy.dtype, h.np.uint8)
         self.assertEqual(snow_fog.dtype, h.np.uint8)
+        self.assertEqual(true_color_repro.dtype, h.np.uint8)
         self.assertEqual(sandwich.attrs["mode"], "RGB")
+        self.assertEqual(true_color_repro.attrs["mode"], "RGB")
         self.assertNotIn("calibration", sandwich.attrs)
         self.assertEqual(sandwich.dims[0], "bands")
         self.assertEqual(heavy.shape, (3, 4, 4))
         self.assertEqual(snow_fog.shape, (3, 4, 4))
+        self.assertEqual(true_color_repro.shape, (3, 4, 4))
 
     def test_all_single_band_products_build_lazy_uint8_rgb(self):
         attrs = {"area": "dummy", "sensor": "ahi"}
@@ -314,6 +337,61 @@ class ProcessorTests(unittest.TestCase):
         self.assertFalse(h.missing_optional_dependency(exc, "not_pyspectral"))
         self.assertIn("pyspectral", h.missing_pyspectral_message("True Color Reproduction Image"))
 
+    def test_missing_satpy_dataset_detection(self):
+        exc = KeyError("\"No dataset matching 'DataQuery(name='true_color_reproduction')' found\"")
+
+        self.assertTrue(h.missing_satpy_dataset(exc, "true_color_reproduction"))
+        self.assertFalse(h.missing_satpy_dataset(exc, "true_color"))
+
+    @mock.patch("himawari_lowram_processor.cleanup_paths")
+    @mock.patch("himawari_lowram_processor.save_dataset_with_optional_overlay")
+    @mock.patch("himawari_lowram_processor.resample_scene_low_ram")
+    @mock.patch("himawari_lowram_processor.download_segments")
+    @mock.patch("himawari_lowram_processor.Scene")
+    def test_true_color_reproduction_missing_satpy_composite_uses_custom_fallback(
+        self,
+        mock_scene_class,
+        mock_download,
+        mock_resample,
+        mock_save,
+        _mock_cleanup,
+    ):
+        attrs = {"area": "dummy", "sensor": "ahi"}
+        bands = {
+            band: xr.DataArray(da.ones((4, 4), chunks=(2, 2)) * 50, dims=("y", "x"), attrs=attrs)
+            for band in ("B01", "B02", "B03", "B04")
+        }
+        original_scene = mock.Mock()
+        original_scene.load.side_effect = KeyError(
+            "\"No dataset matching 'DataQuery(name='true_color_reproduction')' found\""
+        )
+        fallback_scene = mock.MagicMock()
+        fallback_scene.__getitem__.side_effect = lambda key: bands[key]
+        fallback_scene.load.return_value = None
+        mock_scene_class.side_effect = [original_scene, fallback_scene]
+        mock_resample.return_value = fallback_scene
+        mock_save.return_value = h.Path("out.png")
+        mock_download.return_value = [h.Path(f"segment-{idx}.dat") for idx in range(40)]
+        events = []
+
+        def progress(message, current, total):
+            events.append((message, current, total))
+
+        config = h.default_config()
+        config.composite_choice = "True Color Reproduction Image"
+        config.use_night_fallback = False
+        config.allow_quality_fallback = False
+        info = h.parse_url(h.USER_URL)
+        dt = h.datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
+
+        result = h.process_frame(dt, info, mock.Mock(width=10, height=10), 0, 1, config=config, progress=progress)
+
+        self.assertEqual(result, h.Path("out.png"))
+        mock_save.assert_called_once()
+        self.assertEqual(mock_save.call_args.args[1], h.CUSTOM_DATASET_NAMES["True Color Reproduction Image"])
+        self.assertFalse(mock_save.call_args.kwargs["enhance"])
+        self.assertTrue(any("custom low-RAM fallback" in message for message, _current, _total in events))
+
     def test_download_segments_progress_for_existing_files(self):
         events = []
 
@@ -380,6 +458,19 @@ class ProcessorTests(unittest.TestCase):
         self.assertIs(result, fake_area)
         self.assertIs(mock_download.call_args.kwargs["progress"], progress)
         self.assertTrue(events)
+        self.assertEqual(events[0][0], "Downloading B13 scan segments for common area")
+
+    @mock.patch("himawari_lowram_processor.process_frame", return_value=None)
+    @mock.patch("himawari_lowram_processor.validate_runtime_dependencies")
+    @mock.patch("himawari_lowram_processor.common_area_from_frames")
+    def test_single_image_raises_when_no_frame_processes(self, mock_common_area, _mock_validate, _mock_process):
+        config = h.default_config()
+        config.mode = "Single Image"
+        mock_common_area.return_value = mock.Mock(width=10, height=10)
+
+        with self.assertRaisesRegex(RuntimeError, "no output was created"):
+            h.run(config)
+
 
     @mock.patch("himawari_lowram_processor.process_frame", return_value=None)
     @mock.patch("himawari_lowram_processor.validate_runtime_dependencies")
