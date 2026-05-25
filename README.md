@@ -78,17 +78,24 @@ composite, switch between single-image and timelapse modes, set timelapse
 hours/interval/FPS, choose PNG or GeoTIFF output, cap download and Dask workers,
 choose the low-memory resampler, toggle night fallback, and pick output/temp
 folders.
+Use `Latest FLDK` to fill the URL from the most recent NOAA AWS full-disk scan
+the app can find. Safe presets are available for a balanced true-color image,
+a quick B13 infrared check, and a lower-RAM B13 timelapse.
 It also has optional coastline/country border overlays with a user-selected
 line color. The default border color is green.
 Overlay rendering uses Satpy/pycoast, so install requirements first and place
 pycoast-compatible coastline/border shapefiles under the project `overlays/`
-folder if your environment does not already provide them.
+folder if your environment does not already provide them. `Check Overlay Setup`
+reports missing packages or missing shapefile data without downloading data.
 
 The progress bar advances while segment downloads and timelapse frame assembly
 run, and the live log panel shows memory checkpoints and processing stages.
 Use `Stop Processing` to cancel the current run, including active segment
-downloads and pending frames. Use `Check Environment` to open the diagnostic
-checker from the app.
+downloads and pending frames. `Check Env` runs the diagnostic checker inline;
+`Quick Fix` opens the repair command in a separate console. Before processing,
+the GUI shows a run summary with source, frames, bands, segment estimate, output
+behavior, warnings, and blocking setup errors. After completion, use `Open Last`
+and `Copy Paths`; after a failure, use `Copy Error` for a support report.
 
 Launch the terminal interface:
 
@@ -138,8 +145,13 @@ COMPOSITE_CHOICE = "True Color Reproduction Image"
 IMAGE_FORMAT = "png"
 ```
 
+GUI settings are saved in `himawari_gui_settings.json` and loaded on startup.
 Outputs are written to `outputs/`. Downloaded `.DAT` files are cached under
 `temp/` for retry reuse. Incomplete `.part` files are cleaned after each frame.
+Timelapse frame images are written under `outputs/frames/<run_id>/`, with a
+manifest under `outputs/manifests/`. Retrying the same timelapse automatically
+reuses completed frame images recorded by the manifest before assembling the
+GIF or MP4.
 
 Cancellation is cooperative. Downloads stop at the next streamed chunk or
 request timeout, while Satpy load/resample/save calls finish their current call

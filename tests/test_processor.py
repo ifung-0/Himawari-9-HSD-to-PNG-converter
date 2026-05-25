@@ -30,6 +30,21 @@ class FakeVar:
         return self.value
 
 
+class FakeRoot:
+    def __init__(self):
+        self.clipboard = ""
+        self.updated = False
+
+    def clipboard_clear(self):
+        self.clipboard = ""
+
+    def clipboard_append(self, text):
+        self.clipboard += text
+
+    def update_idletasks(self):
+        self.updated = True
+
+
 class ProcessorTests(unittest.TestCase):
     def test_app_version_label(self):
         self.assertRegex(h.APP_VERSION, r"^\d{4}\.\d{2}\.\d{2}\.\d+$")
@@ -51,6 +66,55 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(info.timestamp, "20250711_0050")
         self.assertEqual(info.area, "FLDK")
         self.assertEqual(info.total_segments, 10)
+
+    def test_latest_fldk_url_from_listing_uses_first_b01_segment(self):
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+        <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+          <Contents><Key>AHI-L1b-FLDK/2026/05/25/0400/HS_H09_20260525_0400_B01_FLDK_R10_S0110.DAT.bz2</Key></Contents>
+          <Contents><Key>AHI-L1b-FLDK/2026/05/25/0400/HS_H09_20260525_0400_B02_FLDK_R10_S0110.DAT.bz2</Key></Contents>
+        </ListBucketResult>
+        """
+
+        url = h.latest_fldk_url_from_listing(xml)
+
+        self.assertEqual(
+            url,
+            "https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/2026/05/25/0400/HS_H09_20260525_0400_B01_FLDK_R10_S0110.DAT.bz2",
+        )
+
+    def test_latest_fldk_url_from_listing_returns_none_without_scan_key(self):
+        xml = """<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></ListBucketResult>"""
+
+        self.assertIsNone(h.latest_fldk_url_from_listing(xml))
+
+    def test_find_latest_fldk_url_continues_after_network_failure(self):
+        xml = """<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+          <Contents><Key>AHI-L1b-FLDK/2026/05/25/0400/HS_H09_20260525_0400_B01_FLDK_R10_S0110.DAT.bz2</Key></Contents>
+        </ListBucketResult>"""
+        calls = []
+
+        def fetch(prefix):
+            calls.append(prefix)
+            if len(calls) == 1:
+                raise h.requests.RequestException("temporary")
+            return xml
+
+        url = h.find_latest_fldk_url(
+            now=h.datetime(2026, 5, 25, 4, 10),
+            lookback_hours=1,
+            fetch_listing=fetch,
+        )
+
+        self.assertTrue(url.endswith("_B01_FLDK_R10_S0110.DAT.bz2"))
+        self.assertGreaterEqual(len(calls), 2)
+
+    def test_find_latest_fldk_url_reports_no_scan_found(self):
+        with self.assertRaisesRegex(RuntimeError, "No FLDK scans found"):
+            h.find_latest_fldk_url(
+                now=h.datetime(2026, 5, 25, 4, 10),
+                lookback_hours=1,
+                fetch_listing=lambda _prefix: "<ListBucketResult />",
+            )
 
     def test_all_band_resolution_mapping(self):
         self.assertEqual(tuple(h.BAND_RESOLUTION), h.BAND_NAMES)
@@ -373,6 +437,80 @@ class ProcessorTests(unittest.TestCase):
         status = h.build_setup_status(config, h.Path("C:/Users/Isaac/OneDrive/out"), h.Path("C:/Himawari/temp"))
 
         self.assertTrue(any("Cloud-sync path detected" in warning for warning in status.warnings))
+
+    def test_overlay_status_reports_missing_data(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            status = h.overlay_status(h.Path(tmp_dir), module_checker=lambda _module: True)
+
+        self.assertFalse(status.ok)
+        self.assertTrue(any("overlays" in item for item in status.missing_data))
+
+    def test_overlay_status_ready_when_packages_and_shape_exist(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            overlays = h.Path(tmp_dir) / "overlays"
+            overlays.mkdir()
+            (overlays / "coast.shp").write_text("fake")
+
+            status = h.overlay_status(h.Path(tmp_dir), module_checker=lambda _module: True)
+
+        self.assertTrue(status.ok)
+
+    def test_build_run_summary_counts_frames_bands_and_segments(self):
+        config = h.default_config()
+        config.mode = "Timelapse"
+        config.hours_back = 1
+        config.interval_minutes = 30
+        config.composite_choice = "B13 (Infrared Window)"
+
+        summary = h.build_run_summary(config)
+
+        self.assertEqual(summary.frames, 2)
+        self.assertEqual(summary.bands, ("B13",))
+        self.assertEqual(summary.total_segments, 20)
+        self.assertIn("B13", summary.display_text())
+
+    def test_preflight_blocks_invalid_url(self):
+        config = h.default_config()
+        config.user_url = "bad"
+
+        result = h.preflight_run(config)
+
+        self.assertFalse(result.ok)
+        self.assertTrue(any("URL not recognised" in error for error in result.errors))
+
+    def test_preset_config_values_are_safe(self):
+        fast = h.preset_config("Fast IR Check")
+        timelapse = h.preset_config("Low-RAM Timelapse")
+
+        self.assertEqual(fast.composite_choice, "B13 (Infrared Window)")
+        self.assertEqual(fast.download_workers, 2)
+        self.assertEqual(timelapse.mode, "Timelapse")
+        self.assertEqual(timelapse.dask_num_workers, 1)
+        self.assertEqual(timelapse.resampler, "native")
+
+    def test_gui_settings_round_trip_ignores_unknown_fields(self):
+        config = h.default_config()
+        config.composite_choice = "B13 (Infrared Window)"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            settings_path = h.Path(tmp_dir) / "settings.json"
+            data = h.serialize_gui_settings(config, h.Path("C:/out"), h.Path("C:/tmp"))
+            data["config"]["unknown"] = "ignored"
+            settings_path.write_text(h.json.dumps(data), encoding="utf-8")
+
+            loaded = h.load_gui_settings(settings_path)
+
+        self.assertIsNotNone(loaded)
+        loaded_config, output_dir, temp_dir = loaded
+        self.assertEqual(loaded_config.composite_choice, "B13 (Infrared Window)")
+        self.assertEqual(output_dir, h.Path("C:/out").resolve())
+        self.assertEqual(temp_dir, h.Path("C:/tmp").resolve())
+
+    def test_gui_settings_corrupt_file_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            settings_path = h.Path(tmp_dir) / "settings.json"
+            settings_path.write_text("{bad", encoding="utf-8")
+
+            self.assertIsNone(h.load_gui_settings(settings_path))
 
     def test_low_ram_resampler_rejects_bilinear(self):
         config = h.default_config()
@@ -1037,6 +1175,40 @@ class ProcessorTests(unittest.TestCase):
         glob_arg = mock_cleanup.call_args.args[0]
         self.assertTrue(all(path.suffix == ".part" for path in glob_arg))
 
+    def test_timelapse_manifest_tracks_frames_and_resume_paths(self):
+        config = h.default_config()
+        config.mode = "Timelapse"
+        info = h.parse_url(h.USER_URL)
+        steps = [h.datetime(2024, 7, 25, 3, 40), h.datetime(2024, 7, 25, 4, 0)]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            frame_dir = h.Path(tmp_dir) / "frames"
+            run_id = h.stable_run_id(config, info, steps)
+            manifest = h.build_timelapse_manifest(run_id, config, info, steps, frame_dir)
+            frame_path = frame_dir / "frame_0000.png"
+            frame_path.parent.mkdir(parents=True)
+            frame_path.write_text("done")
+            h.update_manifest_frame(manifest, 0, frame_path, "complete")
+
+            self.assertEqual(h.resume_frame_path(manifest, 0), frame_path)
+            self.assertIsNone(h.resume_frame_path(manifest, 1))
+
+    def test_load_or_create_timelapse_manifest_reuses_existing(self):
+        config = h.default_config()
+        config.mode = "Timelapse"
+        info = h.parse_url(h.USER_URL)
+        steps = [h.datetime(2024, 7, 25, 4, 0)]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "manifest.json"
+            frame_dir = h.Path(tmp_dir) / "frames"
+            run_id = h.stable_run_id(config, info, steps)
+            manifest = h.load_or_create_timelapse_manifest(path, run_id, config, info, steps, frame_dir)
+            manifest["movie"] = "movie.gif"
+            h.save_timelapse_manifest(path, manifest)
+
+            loaded = h.load_or_create_timelapse_manifest(path, run_id, config, info, steps, frame_dir)
+
+        self.assertEqual(loaded["movie"], "movie.gif")
+
     @mock.patch("himawari_lowram_processor.cleanup_paths")
     def test_assemble_timelapse_deletes_frame_paths_when_configured(self, mock_cleanup):
         writer = mock.Mock()
@@ -1291,18 +1463,54 @@ class ProcessorTests(unittest.TestCase):
         mock_assemble.assert_called_once()
         self.assertTrue(any("successful frames" in message for message, _current, _total in events))
 
-    @mock.patch("himawari_lowram_processor.subprocess.Popen")
-    def test_gui_environment_check_uses_current_python_with_plain_output(self, mock_popen):
-        app = object.__new__(h.HimawariProcessorApp)
-        app._append_log = mock.Mock()
+    @mock.patch("himawari_lowram_processor.assemble_timelapse", return_value=h.Path("movie.gif"))
+    @mock.patch("himawari_lowram_processor.process_frame")
+    @mock.patch("himawari_lowram_processor.validate_runtime_dependencies")
+    @mock.patch("himawari_lowram_processor.common_area_from_frames")
+    def test_run_reuses_existing_manifest_frame(
+        self,
+        mock_common_area,
+        _mock_validate,
+        mock_process,
+        _mock_assemble,
+    ):
+        config = h.default_config()
+        config.mode = "Timelapse"
+        config.hours_back = 1
+        config.interval_minutes = 60
+        info = h.parse_url(config.user_url)
+        steps = h.frame_datetimes(h.datetime.strptime(info.timestamp, "%Y%m%d_%H%M"), config.mode, 1, 60)
+        mock_common_area.return_value = mock.Mock(width=10, height=10)
+        original_output = h.OUTPUT_DIR
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                h.OUTPUT_DIR = h.Path(tmp_dir)
+                run_id = h.stable_run_id(config, info, steps)
+                frame_dir = h.timelapse_frame_dir(run_id, h.OUTPUT_DIR)
+                frame = frame_dir / "frame_0000.png"
+                frame.parent.mkdir(parents=True)
+                frame.write_text("done")
+                manifest = h.build_timelapse_manifest(run_id, config, info, steps, frame_dir)
+                h.update_manifest_frame(manifest, 0, frame, "complete")
+                h.save_timelapse_manifest(h.timelapse_manifest_path(run_id, h.OUTPUT_DIR), manifest)
 
-        h.HimawariProcessorApp._open_environment_check(app)
+                result = h.run(config)
 
-        command = mock_popen.call_args.args[0]
-        self.assertIn(h.sys.executable, command)
-        self.assertIn(str(h.PROJECT_DIR / "check_environment.py"), command)
-        self.assertIn("--plain", command)
-        app._append_log.assert_called_once()
+            self.assertEqual(result, [h.Path("movie.gif")])
+            mock_process.assert_not_called()
+        finally:
+            h.OUTPUT_DIR = original_output
+
+    def test_format_environment_results_and_error_report(self):
+        result = mock.Mock(ok=False, critical=False, detail="missing")
+        result.name = "psutil"
+
+        text = h.format_environment_results([result])
+        report = h.build_error_report("boom", h.default_config(), "log line", [h.Path("out.png")])
+
+        self.assertIn("[WARN] psutil: missing", text)
+        self.assertIn("boom", report)
+        self.assertIn("out.png", report)
 
     @mock.patch("himawari_lowram_processor.subprocess.Popen")
     def test_gui_environment_fix_uses_current_python_with_fix_flag(self, mock_popen):
@@ -1316,6 +1524,31 @@ class ProcessorTests(unittest.TestCase):
         self.assertIn(str(h.PROJECT_DIR / "check_environment.py"), command)
         self.assertIn("--fix", command)
         app._append_log.assert_called_once()
+
+    def test_gui_copy_output_paths_uses_clipboard(self):
+        app = object.__new__(h.HimawariProcessorApp)
+        app.root = FakeRoot()
+        app.last_outputs = [h.Path("out.png")]
+        app._append_log = mock.Mock()
+
+        h.HimawariProcessorApp._copy_output_paths(app)
+
+        self.assertEqual(app.root.clipboard, "out.png")
+        app._append_log.assert_called_once()
+
+    def test_gui_copy_error_report_generates_report(self):
+        app = object.__new__(h.HimawariProcessorApp)
+        app.root = FakeRoot()
+        app.last_error_report = ""
+        app.last_config = h.default_config()
+        app.last_outputs = []
+        app.log_text = mock.Mock()
+        app.log_text.get.return_value = "log"
+        app._append_log = mock.Mock()
+
+        h.HimawariProcessorApp._copy_error_report(app)
+
+        self.assertIn("No processing error", app.root.clipboard)
 
     def test_gui_running_state_disables_mutable_controls(self):
         app = object.__new__(h.HimawariProcessorApp)

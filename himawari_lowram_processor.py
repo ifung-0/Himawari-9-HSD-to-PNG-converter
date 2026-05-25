@@ -3,7 +3,9 @@ from __future__ import annotations
 import bz2
 import concurrent.futures
 import gc
+import hashlib
 import importlib.util
+import json
 import logging
 import os
 import queue
@@ -13,8 +15,9 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, fields
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, ttk
 from typing import Callable, Iterable
@@ -64,6 +67,10 @@ OUTPUT_DIR = PROJECT_DIR / "outputs"
 TEMP_DIR = PROJECT_DIR / "temp"
 CLOUD_SYNC_PREFIXES = ("onedrive", "dropbox", "google drive", "icloud")
 CLOUD_SYNC_EXACT = ("box",)
+GUI_SETTINGS_FILE = PROJECT_DIR / "himawari_gui_settings.json"
+GUI_SETTINGS_SCHEMA_VERSION = 1
+TIMELAPSE_MANIFEST_SCHEMA_VERSION = 1
+NOAA_HIMAWARI9_BUCKET = "https://noaa-himawari9.s3.amazonaws.com"
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +278,81 @@ class ProcessorConfig:
 ProgressCallback = Callable[[str, int | None, int | None], None]
 
 
+@dataclass(frozen=True)
+class OverlayStatus:
+    ok: bool
+    details: tuple[str, ...]
+    missing_packages: tuple[str, ...]
+    missing_data: tuple[str, ...]
+
+    def display_text(self) -> str:
+        lines = list(self.details)
+        if self.missing_packages:
+            lines.append("Missing package(s): " + ", ".join(self.missing_packages))
+        if self.missing_data:
+            lines.extend(self.missing_data)
+        if self.ok:
+            lines.append("Overlay setup looks ready.")
+        else:
+            lines.append(
+                "Install requirements with Quick Fix and place pycoast-compatible "
+                "GSHHS/WDBII data under overlays/."
+            )
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class RunSummary:
+    source: str
+    product: str
+    frames: int
+    bands: tuple[str, ...]
+    total_segments: int
+    output: str
+    warnings: tuple[str, ...]
+
+    def display_text(self) -> str:
+        frame_word = "frame" if self.frames == 1 else "frames"
+        segment_word = "segment" if self.total_segments == 1 else "segments"
+        lines = [
+            f"Source: {self.source}",
+            f"Product: {self.product}",
+            f"Frames: {self.frames} {frame_word}",
+            f"Bands: {', '.join(self.bands)}",
+            f"Downloads: {self.total_segments} {segment_word}",
+            f"Output: {self.output}",
+        ]
+        if self.warnings:
+            lines.append("")
+            lines.append("Warnings:")
+            lines.extend(f"- {warning}" for warning in self.warnings)
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class PreflightResult:
+    ok: bool
+    summary: RunSummary | None
+    warnings: tuple[str, ...]
+    errors: tuple[str, ...]
+
+    def display_text(self) -> str:
+        lines: list[str] = []
+        if self.summary:
+            lines.append(self.summary.display_text())
+        if self.errors:
+            if lines:
+                lines.append("")
+            lines.append("Fix before starting:")
+            lines.extend(f"- {error}" for error in self.errors)
+        if self.warnings:
+            if lines:
+                lines.append("")
+            lines.append("Check before long runs:")
+            lines.extend(f"- {warning}" for warning in self.warnings)
+        return "\n".join(lines)
+
+
 class ProcessingCancelled(RuntimeError):
     """Raised when the user requests cancellation from the GUI."""
 
@@ -282,6 +364,10 @@ def check_cancel(cancel_event: threading.Event | None) -> None:
 
 def default_config() -> ProcessorConfig:
     return ProcessorConfig()
+
+
+def processor_config_field_names() -> set[str]:
+    return {field.name for field in fields(ProcessorConfig)}
 
 
 def app_version_label() -> str:
@@ -413,6 +499,78 @@ def parse_url(url: str) -> UrlInfo:
         )
 
     raise ValueError(f"URL not recognised: {url}")
+
+
+def noaa_scan_prefix(dt: datetime, area: str = "FLDK") -> str:
+    return f"AHI-L1b-{area}/{dt:%Y/%m/%d/%H%M}/"
+
+
+def parse_s3_listing_keys(xml_text: str) -> list[str]:
+    root = ET.fromstring(xml_text)
+    keys: list[str] = []
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1] == "Key" and element.text:
+            keys.append(element.text)
+    return keys
+
+
+def object_url_from_s3_key(key: str) -> str:
+    return f"{NOAA_HIMAWARI9_BUCKET}/{key}"
+
+
+def latest_fldk_url_from_listing(xml_text: str) -> str | None:
+    keys = parse_s3_listing_keys(xml_text)
+    candidates = [
+        key
+        for key in keys
+        if key.endswith(".DAT.bz2") and re.search(r"_B01_FLDK_R10_S01\d{2}\.DAT\.bz2$", key)
+    ]
+    if not candidates:
+        return None
+    return object_url_from_s3_key(sorted(candidates)[0])
+
+
+def fetch_s3_prefix_listing(prefix: str, timeout: int = 20) -> str:
+    response = requests.get(
+        NOAA_HIMAWARI9_BUCKET,
+        params={"list-type": "2", "prefix": prefix, "max-keys": "25"},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    return response.text
+
+
+def recent_himawari_scan_datetimes(
+    now: datetime | None = None,
+    lookback_hours: int = 48,
+    interval_minutes: int = 10,
+) -> list[datetime]:
+    current = now or datetime.now(UTC).replace(tzinfo=None)
+    minute = (current.minute // interval_minutes) * interval_minutes
+    aligned = current.replace(minute=minute, second=0, microsecond=0)
+    count = max(1, int(lookback_hours * 60 / interval_minutes) + 1)
+    return [aligned - timedelta(minutes=interval_minutes * idx) for idx in range(count)]
+
+
+def find_latest_fldk_url(
+    now: datetime | None = None,
+    lookback_hours: int = 48,
+    fetch_listing: Callable[[str], str] | None = None,
+) -> str:
+    fetch_listing = fetch_listing or fetch_s3_prefix_listing
+    last_error: Exception | None = None
+    for dt in recent_himawari_scan_datetimes(now=now, lookback_hours=lookback_hours):
+        prefix = noaa_scan_prefix(dt, "FLDK")
+        try:
+            url = latest_fldk_url_from_listing(fetch_listing(prefix))
+        except Exception as exc:
+            last_error = exc
+            continue
+        if url:
+            return url
+    if last_error is not None:
+        raise RuntimeError(f"Could not find a recent FLDK scan: {last_error}") from last_error
+    raise RuntimeError(f"No FLDK scans found in the last {lookback_hours} hour(s).")
 
 
 def frame_datetimes(start: datetime, mode: str, hours_back: int, interval_minutes: int) -> list[datetime]:
@@ -937,12 +1095,14 @@ def output_filename(
     mode: str,
     frame_idx: int,
     image_format: str | None = None,
+    frame_dir: Path | None = None,
 ) -> Path:
     image_format = image_format or IMAGE_FORMAT
     suffix = ".tif" if image_format.lower() in {"tif", "tiff", "geotiff"} else ".png"
     if mode == "Single Image":
         return OUTPUT_DIR / f"{output_stem(info, dt, composite_choice)}{suffix}"
-    return OUTPUT_DIR / f"frame_{frame_idx:04d}{suffix}"
+    base_dir = frame_dir or OUTPUT_DIR
+    return base_dir / f"frame_{frame_idx:04d}{suffix}"
 
 
 def enforce_safe_output_format(path: Path, area: AreaDefinition, config: ProcessorConfig) -> Path:
@@ -958,12 +1118,48 @@ def enforce_safe_output_format(path: Path, area: AreaDefinition, config: Process
     return path
 
 
+def output_behavior_for_config(config: ProcessorConfig, info: UrlInfo, start: datetime) -> str:
+    suffix = ".tif" if config.image_format.lower() in {"tif", "tiff", "geotiff"} else ".png"
+    if (
+        info.area == "FLDK"
+        and suffix == ".png"
+        and target_pixel_size_m(config.composite_choice, config.use_night_fallback) <= 500
+    ):
+        suffix = ".tif"
+        note = "auto-switch likely for full-disk low-RAM writing"
+    else:
+        note = "requested format"
+    if config.mode == "Timelapse":
+        return f"{config.timelapse_format.lower()} movie from frame images ({note}: {suffix})"
+    return f"single image ({note}: {suffix})"
+
+
 def writer_for_output(path: Path) -> str:
     return "geotiff" if path.suffix.lower() in {".tif", ".tiff"} else "simple_image"
 
 
 def has_module(module_name: str) -> bool:
     return importlib.util.find_spec(module_name) is not None
+
+
+def overlay_status(
+    project_dir: Path = PROJECT_DIR,
+    module_checker: Callable[[str], bool] = has_module,
+) -> OverlayStatus:
+    missing_packages = tuple(module for module in ("pycoast", "aggdraw") if not module_checker(module))
+    overlays_dir = project_dir / "overlays"
+    missing_data: list[str] = []
+    details = [f"Overlay folder: {overlays_dir}"]
+    if not overlays_dir.exists():
+        missing_data.append("overlays/ folder not found.")
+    elif not any(overlays_dir.rglob("*.shp")):
+        missing_data.append("No shapefile data found under overlays/.")
+    return OverlayStatus(
+        ok=not missing_packages and not missing_data,
+        details=tuple(details),
+        missing_packages=missing_packages,
+        missing_data=tuple(missing_data),
+    )
 
 
 def require_module(module_name: str, purpose: str) -> None:
@@ -1033,6 +1229,136 @@ def cleanup_paths(paths: Iterable[Path]) -> None:
 def cleanup_partial_downloads(frame_dir: Path) -> None:
     if frame_dir.exists():
         cleanup_paths(list(frame_dir.glob("*.part")))
+
+
+def stable_run_id(config: ProcessorConfig, info: UrlInfo, steps: list[datetime]) -> str:
+    payload = {
+        "schema": TIMELAPSE_MANIFEST_SCHEMA_VERSION,
+        "url": config.user_url,
+        "mode": config.mode,
+        "composite": config.composite_choice,
+        "image_format": config.image_format,
+        "timelapse_format": config.timelapse_format,
+        "night_fallback": config.use_night_fallback,
+        "area": info.area,
+        "timestamp": info.timestamp,
+        "steps": [dt.strftime("%Y%m%d_%H%M") for dt in steps],
+    }
+    text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
+
+
+def timelapse_frame_dir(run_id: str, output_dir: Path = OUTPUT_DIR) -> Path:
+    return output_dir / "frames" / run_id
+
+
+def timelapse_manifest_path(run_id: str, output_dir: Path = OUTPUT_DIR) -> Path:
+    return output_dir / "manifests" / f"{run_id}.json"
+
+
+def frame_manifest_records(steps: list[datetime], frame_dir: Path, image_format: str) -> list[dict[str, object]]:
+    suffix = ".tif" if image_format.lower() in {"tif", "tiff", "geotiff"} else ".png"
+    return [
+        {
+            "index": idx,
+            "timestamp": dt.strftime("%Y%m%d_%H%M"),
+            "path": str(frame_dir / f"frame_{idx:04d}{suffix}"),
+            "status": "pending",
+        }
+        for idx, dt in enumerate(steps)
+    ]
+
+
+def load_json_file(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def write_json_file(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def build_timelapse_manifest(
+    run_id: str,
+    config: ProcessorConfig,
+    info: UrlInfo,
+    steps: list[datetime],
+    frame_dir: Path,
+) -> dict:
+    return {
+        "schema_version": TIMELAPSE_MANIFEST_SCHEMA_VERSION,
+        "run_id": run_id,
+        "app_version": APP_VERSION,
+        "created_at_utc": datetime.now(UTC).replace(tzinfo=None).isoformat(timespec="seconds") + "Z",
+        "mode": config.mode,
+        "composite_choice": config.composite_choice,
+        "image_format": config.image_format,
+        "timelapse_format": config.timelapse_format,
+        "source_url": config.user_url,
+        "source_area": info.area,
+        "source_timestamp": info.timestamp,
+        "frame_dir": str(frame_dir),
+        "frames": frame_manifest_records(steps, frame_dir, config.image_format),
+        "movie": None,
+    }
+
+
+def save_timelapse_manifest(path: Path, manifest: dict) -> None:
+    write_json_file(path, manifest)
+
+
+def manifest_frames(manifest: dict) -> list[dict[str, object]]:
+    frames = manifest.get("frames", [])
+    return frames if isinstance(frames, list) else []
+
+
+def frame_output_from_manifest(manifest: dict, frame_idx: int) -> Path | None:
+    for frame in manifest_frames(manifest):
+        if frame.get("index") == frame_idx and frame.get("path"):
+            return Path(str(frame["path"]))
+    return None
+
+
+def update_manifest_frame(manifest: dict, frame_idx: int, path: Path | None, status: str) -> None:
+    for frame in manifest_frames(manifest):
+        if frame.get("index") == frame_idx:
+            frame["status"] = status
+            if path is not None:
+                frame["path"] = str(path)
+            return
+
+
+def resume_frame_path(manifest: dict, frame_idx: int) -> Path | None:
+    path = frame_output_from_manifest(manifest, frame_idx)
+    if path and path.exists() and path.stat().st_size > 0:
+        return path
+    return None
+
+
+def load_or_create_timelapse_manifest(
+    path: Path,
+    run_id: str,
+    config: ProcessorConfig,
+    info: UrlInfo,
+    steps: list[datetime],
+    frame_dir: Path,
+    resume: bool = True,
+) -> dict:
+    if resume and path.exists():
+        existing = load_json_file(path)
+        if (
+            existing
+            and existing.get("schema_version") == TIMELAPSE_MANIFEST_SCHEMA_VERSION
+            and existing.get("run_id") == run_id
+            and len(manifest_frames(existing)) == len(steps)
+        ):
+            return existing
+    manifest = build_timelapse_manifest(run_id, config, info, steps, frame_dir)
+    save_timelapse_manifest(path, manifest)
+    return manifest
 
 
 def intersect_extents(areas: Iterable[AreaDefinition]) -> tuple[float, float, float, float]:
@@ -1662,6 +1988,7 @@ def process_frame(
     config: ProcessorConfig | None = None,
     progress: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
+    frame_output_dir: Path | None = None,
 ) -> Path | None:
     config = config or default_config()
     check_cancel(cancel_event)
@@ -1714,7 +2041,15 @@ def process_frame(
         log_memory("scene created", config)
         check_cancel(cancel_event)
 
-        output_path = output_filename(info, dt, active, config.mode, frame_idx, config.image_format)
+        output_path = output_filename(
+            info,
+            dt,
+            active,
+            config.mode,
+            frame_idx,
+            config.image_format,
+            frame_dir=frame_output_dir,
+        )
         output_path = enforce_safe_output_format(output_path, master_area, config)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         overlay_options = build_overlay_options(config)
@@ -1925,10 +2260,194 @@ def validate_runtime_dependencies(config: ProcessorConfig, info: UrlInfo, start:
         require_module("rasterio", "GeoTIFF output")
 
 
+def build_run_summary(config: ProcessorConfig) -> RunSummary:
+    info = parse_url(config.user_url)
+    start = datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
+    steps = frame_datetimes(start, config.mode, config.hours_back, config.interval_minutes)
+    bands = required_bands(config.composite_choice, use_night_fallback=config.use_night_fallback)
+    total_segments = len(steps) * len(bands) * info.total_segments
+    warnings: list[str] = []
+    if config.mode == "Timelapse" and config.composite_choice in QUALITY_CRITICAL_COMPOSITES:
+        warnings.append("True color timelapses can be slow and memory-sensitive; IR products are safer.")
+    if config.download_workers > 4:
+        warnings.append("Download workers will be capped to 4.")
+    if config.dask_num_workers > 2:
+        warnings.append("Dask workers will be capped to 2.")
+    return RunSummary(
+        source=f"{info.area} {info.timestamp}",
+        product=config.composite_choice,
+        frames=len(steps),
+        bands=bands,
+        total_segments=total_segments,
+        output=output_behavior_for_config(config, info, start),
+        warnings=tuple(warnings),
+    )
+
+
+def preflight_run(config: ProcessorConfig, output_dir: Path = OUTPUT_DIR, temp_dir: Path = TEMP_DIR) -> PreflightResult:
+    warnings: list[str] = []
+    errors = setup_configuration_errors(config)
+    summary: RunSummary | None = None
+    try:
+        if not errors:
+            validate_configuration(config)
+        summary = build_run_summary(config)
+    except Exception as exc:
+        errors.append(str(exc))
+
+    setup_status = build_setup_status(config, output_dir, temp_dir)
+    warnings.extend(setup_status.warnings)
+    warnings.extend(summary.warnings if summary else ())
+    for error in setup_status.errors:
+        if error not in errors:
+            errors.append(error)
+
+    if config.add_border_lines:
+        status = overlay_status()
+        if not status.ok:
+            warnings.append(status.display_text())
+
+    return PreflightResult(
+        ok=not errors,
+        summary=summary,
+        warnings=tuple(dict.fromkeys(warnings)),
+        errors=tuple(dict.fromkeys(errors)),
+    )
+
+
+def preset_config(name: str, base: ProcessorConfig | None = None) -> ProcessorConfig:
+    values = (base or default_config()).__dict__.copy()
+    if name == "Balanced Single":
+        values.update(
+            mode="Single Image",
+            composite_choice="True Color Reproduction Image",
+            image_format="png",
+            auto_download=True,
+            use_night_fallback=True,
+            download_workers=4,
+            dask_num_workers=1,
+            dask_chunk_size="64MiB",
+            ram_limit_gb=10.0,
+            resampler="native",
+        )
+    elif name == "Fast IR Check":
+        values.update(
+            mode="Single Image",
+            composite_choice="B13 (Infrared Window)",
+            image_format="png",
+            auto_download=True,
+            use_night_fallback=False,
+            download_workers=2,
+            dask_num_workers=1,
+            dask_chunk_size="64MiB",
+            ram_limit_gb=6.0,
+            resampler="native",
+        )
+    elif name == "Low-RAM Timelapse":
+        values.update(
+            mode="Timelapse",
+            composite_choice="B13 (Infrared Window)",
+            hours_back=2,
+            interval_minutes=20,
+            fps=8,
+            image_format="png",
+            timelapse_format="gif",
+            delete_timelapse_frames=False,
+            auto_download=True,
+            use_night_fallback=False,
+            download_workers=2,
+            dask_num_workers=1,
+            dask_chunk_size="32MiB",
+            ram_limit_gb=8.0,
+            resampler="native",
+        )
+    else:
+        raise KeyError(f"Unknown preset: {name}")
+    return ProcessorConfig(**values)
+
+
+def serialize_gui_settings(config: ProcessorConfig, output_dir: Path, temp_dir: Path) -> dict:
+    return {
+        "schema_version": GUI_SETTINGS_SCHEMA_VERSION,
+        "app_version": APP_VERSION,
+        "config": config.__dict__.copy(),
+        "output_dir": str(output_dir),
+        "temp_dir": str(temp_dir),
+    }
+
+
+def save_gui_settings(
+    config: ProcessorConfig,
+    output_dir: Path = OUTPUT_DIR,
+    temp_dir: Path = TEMP_DIR,
+    settings_path: Path = GUI_SETTINGS_FILE,
+) -> None:
+    write_json_file(settings_path, serialize_gui_settings(config, output_dir, temp_dir))
+
+
+def load_gui_settings(settings_path: Path = GUI_SETTINGS_FILE) -> tuple[ProcessorConfig, Path, Path] | None:
+    data = load_json_file(settings_path)
+    if not data or data.get("schema_version") != GUI_SETTINGS_SCHEMA_VERSION:
+        return None
+    raw_config = data.get("config", {})
+    if not isinstance(raw_config, dict):
+        return None
+    values = default_config().__dict__.copy()
+    for key, value in raw_config.items():
+        if key in processor_config_field_names():
+            values[key] = value
+    try:
+        config = ProcessorConfig(**values)
+        if setup_configuration_errors(config):
+            return None
+    except Exception:
+        return None
+    output_dir = Path(str(data.get("output_dir") or OUTPUT_DIR)).expanduser().resolve()
+    temp_dir = Path(str(data.get("temp_dir") or TEMP_DIR)).expanduser().resolve()
+    return config, output_dir, temp_dir
+
+
+def format_environment_results(results: list[object]) -> str:
+    lines: list[str] = []
+    for result in results:
+        ok = bool(getattr(result, "ok", False))
+        critical = bool(getattr(result, "critical", True))
+        label = "OK" if ok else ("FAIL" if critical else "WARN")
+        lines.append(f"[{label}] {getattr(result, 'name', 'check')}: {getattr(result, 'detail', '')}")
+    return "\n".join(lines)
+
+
+def build_error_report(
+    error_message: str,
+    config: ProcessorConfig | None = None,
+    log_text: str = "",
+    outputs: Iterable[Path] | None = None,
+) -> str:
+    lines = [
+        app_version_label(),
+        f"Python: {sys.executable}",
+        f"Project: {PROJECT_DIR}",
+        "",
+        "Error:",
+        error_message,
+    ]
+    if config is not None:
+        lines.extend(["", "Settings:"])
+        for key, value in config.__dict__.items():
+            lines.append(f"{key}: {value}")
+    if outputs:
+        lines.extend(["", "Outputs:"])
+        lines.extend(str(path) for path in outputs)
+    if log_text:
+        lines.extend(["", "Recent log:", log_text.strip()])
+    return "\n".join(lines).strip() + "\n"
+
+
 def run(
     config: ProcessorConfig | None = None,
     progress: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
+    resume_timelapse: bool = True,
 ) -> list[Path]:
     config = config or default_config()
     configure_logging()
@@ -1942,6 +2461,26 @@ def run(
     info = parse_url(config.user_url)
     start = datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
     steps = frame_datetimes(start, config.mode, config.hours_back, config.interval_minutes)
+    run_id: str | None = None
+    frame_dir: Path | None = None
+    manifest_path: Path | None = None
+    manifest: dict | None = None
+    if config.mode == "Timelapse":
+        run_id = stable_run_id(config, info, steps)
+        frame_dir = timelapse_frame_dir(run_id, OUTPUT_DIR)
+        manifest_path = timelapse_manifest_path(run_id, OUTPUT_DIR)
+        frame_dir.mkdir(parents=True, exist_ok=True)
+        manifest = load_or_create_timelapse_manifest(
+            manifest_path,
+            run_id,
+            config,
+            info,
+            steps,
+            frame_dir,
+            resume=resume_timelapse,
+        )
+        LOG.info("Timelapse run id: %s", run_id)
+        LOG.info("Timelapse manifest: %s", manifest_path)
     area_band = area_reference_band(config.composite_choice)
     check_cancel(cancel_event)
     log_memory("startup", config)
@@ -1961,6 +2500,16 @@ def run(
     outputs: list[Path] = []
     for idx, dt in enumerate(steps):
         check_cancel(cancel_event)
+        if manifest is not None and resume_timelapse:
+            resumed = resume_frame_path(manifest, idx)
+            if resumed is not None:
+                LOG.info("Reusing existing timelapse frame %s", resumed)
+                emit_progress(progress, f"Reusing frame {idx + 1}/{len(steps)}", idx + 1, len(steps))
+                outputs.append(resumed)
+                update_manifest_frame(manifest, idx, resumed, "reused")
+                if manifest_path is not None:
+                    save_timelapse_manifest(manifest_path, manifest)
+                continue
         result = process_frame(
             dt,
             info,
@@ -1970,9 +2519,16 @@ def run(
             config=config,
             progress=progress,
             cancel_event=cancel_event,
+            frame_output_dir=frame_dir,
         )
         if result:
             outputs.append(result)
+            if manifest is not None:
+                update_manifest_frame(manifest, idx, result, "complete")
+        elif manifest is not None:
+            update_manifest_frame(manifest, idx, None, "failed")
+        if manifest is not None and manifest_path is not None:
+            save_timelapse_manifest(manifest_path, manifest)
 
     if config.mode == "Timelapse" and outputs:
         if len(outputs) != len(steps):
@@ -1988,6 +2544,10 @@ def run(
                 len(steps),
             )
         movie = assemble_timelapse(outputs, info, config=config, progress=progress, cancel_event=cancel_event)
+        if manifest is not None and manifest_path is not None:
+            manifest["movie"] = str(movie) if movie else None
+            manifest["completed_at_utc"] = datetime.now(UTC).replace(tzinfo=None).isoformat(timespec="seconds") + "Z"
+            save_timelapse_manifest(manifest_path, manifest)
         return [movie] if movie else []
     if config.mode == "Timelapse":
         raise RuntimeError("Timelapse failed: no frames were processed successfully, so no GIF/MP4 was created.")
@@ -2149,6 +2709,13 @@ def build_setup_status(
 
 class HimawariProcessorApp:
     def __init__(self, root: tk.Tk) -> None:
+        loaded_settings = load_gui_settings()
+        initial_config = loaded_settings[0] if loaded_settings else default_config()
+        if loaded_settings:
+            global OUTPUT_DIR, TEMP_DIR
+            OUTPUT_DIR = loaded_settings[1]
+            TEMP_DIR = loaded_settings[2]
+
         self.root = root
         self.root.title(f"{APP_DISPLAY_NAME} v{APP_VERSION}")
         self.root.geometry("1060x800")
@@ -2157,27 +2724,30 @@ class HimawariProcessorApp:
         self.worker: threading.Thread | None = None
         self.is_running = False
         self.cancel_event = threading.Event()
+        self.last_outputs: list[Path] = []
+        self.last_config: ProcessorConfig | None = None
+        self.last_error_report = ""
 
-        self.url_var = tk.StringVar(value=USER_URL)
-        self.mode_var = tk.StringVar(value=MODE)
-        self.composite_var = tk.StringVar(value=COMPOSITE_CHOICE)
-        self.hours_var = tk.StringVar(value=str(HOURS_BACK))
-        self.interval_var = tk.StringVar(value=str(INTERVAL_MINUTES))
-        self.fps_var = tk.StringVar(value=str(FPS))
-        self.download_workers_var = tk.StringVar(value=str(DOWNLOAD_WORKERS))
-        self.dask_workers_var = tk.StringVar(value=str(DASK_NUM_WORKERS))
-        self.chunk_var = tk.StringVar(value=DASK_CHUNK_SIZE)
-        self.ram_limit_var = tk.StringVar(value=str(RAM_LIMIT_GB))
-        self.image_format_var = tk.StringVar(value=IMAGE_FORMAT)
-        self.resampler_var = tk.StringVar(value=RESAMPLER)
-        self.timelapse_format_var = tk.StringVar(value=TIMELAPSE_FORMAT)
-        self.auto_download_var = tk.BooleanVar(value=AUTO_DOWNLOAD)
-        self.night_fallback_var = tk.BooleanVar(value=USE_NIGHT_FALLBACK)
-        self.delete_frames_var = tk.BooleanVar(value=DELETE_TIMELAPSE_FRAMES)
-        self.quality_fallback_var = tk.BooleanVar(value=False)
-        self.border_lines_var = tk.BooleanVar(value=ADD_BORDER_LINES)
-        self.border_color_var = tk.StringVar(value=BORDER_LINE_COLOR)
-        self.border_width_var = tk.StringVar(value=str(BORDER_LINE_WIDTH))
+        self.url_var = tk.StringVar(value=initial_config.user_url)
+        self.mode_var = tk.StringVar(value=initial_config.mode)
+        self.composite_var = tk.StringVar(value=initial_config.composite_choice)
+        self.hours_var = tk.StringVar(value=str(initial_config.hours_back))
+        self.interval_var = tk.StringVar(value=str(initial_config.interval_minutes))
+        self.fps_var = tk.StringVar(value=str(initial_config.fps))
+        self.download_workers_var = tk.StringVar(value=str(initial_config.download_workers))
+        self.dask_workers_var = tk.StringVar(value=str(initial_config.dask_num_workers))
+        self.chunk_var = tk.StringVar(value=initial_config.dask_chunk_size)
+        self.ram_limit_var = tk.StringVar(value=str(initial_config.ram_limit_gb))
+        self.image_format_var = tk.StringVar(value=initial_config.image_format)
+        self.resampler_var = tk.StringVar(value=initial_config.resampler)
+        self.timelapse_format_var = tk.StringVar(value=initial_config.timelapse_format)
+        self.auto_download_var = tk.BooleanVar(value=initial_config.auto_download)
+        self.night_fallback_var = tk.BooleanVar(value=initial_config.use_night_fallback)
+        self.delete_frames_var = tk.BooleanVar(value=initial_config.delete_timelapse_frames)
+        self.quality_fallback_var = tk.BooleanVar(value=initial_config.allow_quality_fallback)
+        self.border_lines_var = tk.BooleanVar(value=initial_config.add_border_lines)
+        self.border_color_var = tk.StringVar(value=initial_config.border_line_color)
+        self.border_width_var = tk.StringVar(value=str(initial_config.border_line_width))
         self.status_var = tk.StringVar(value="Ready")
         self.progress_var = tk.DoubleVar(value=0)
         self.setup_status_var = tk.StringVar(value="")
@@ -2236,36 +2806,46 @@ class HimawariProcessorApp:
         source_frame.columnconfigure(0, weight=1)
         ttk.Label(source_frame, text="NOAA AWS Himawari URL").grid(row=0, column=0, sticky="w")
         ttk.Entry(source_frame, textvariable=self.url_var).grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        self.latest_url_button = ttk.Button(source_frame, text="Latest FLDK", command=self._fill_latest_fldk_url)
+        self.latest_url_button.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(2, 0))
 
         product_frame = ttk.LabelFrame(settings, text="Product", style="Section.TLabelframe")
         product_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(0, 10))
         product_frame.columnconfigure(0, weight=1)
         product_frame.columnconfigure(1, weight=1)
-        ttk.Label(product_frame, text="Output Mode").grid(row=0, column=0, sticky="w")
+        ttk.Label(product_frame, text="Safe Preset").grid(row=0, column=0, sticky="w")
+        preset_box = ttk.Combobox(
+            product_frame,
+            values=("Balanced Single", "Fast IR Check", "Low-RAM Timelapse"),
+            state="readonly",
+        )
+        preset_box.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 10))
+        preset_box.bind("<<ComboboxSelected>>", lambda _event: self._apply_preset(preset_box.get()))
         mode_box = ttk.Combobox(
             product_frame,
             textvariable=self.mode_var,
             values=("Single Image", "Timelapse"),
             state="readonly",
         )
-        mode_box.grid(row=1, column=0, sticky="ew", pady=(2, 10), padx=(0, 8))
+        ttk.Label(product_frame, text="Output Mode").grid(row=2, column=0, sticky="w")
+        mode_box.grid(row=3, column=0, sticky="ew", pady=(2, 10), padx=(0, 8))
         mode_box.bind("<<ComboboxSelected>>", lambda _event: self._refresh_mode_state())
 
-        ttk.Label(product_frame, text="Image Format").grid(row=0, column=1, sticky="w")
+        ttk.Label(product_frame, text="Image Format").grid(row=2, column=1, sticky="w")
         ttk.Combobox(
             product_frame,
             textvariable=self.image_format_var,
             values=("png", "tif"),
             state="readonly",
-        ).grid(row=1, column=1, sticky="ew", pady=(2, 10))
+        ).grid(row=3, column=1, sticky="ew", pady=(2, 10))
 
-        ttk.Label(product_frame, text="Composite / Band").grid(row=2, column=0, columnspan=2, sticky="w")
+        ttk.Label(product_frame, text="Composite / Band").grid(row=4, column=0, columnspan=2, sticky="w")
         ttk.Combobox(
             product_frame,
             textvariable=self.composite_var,
             values=tuple(sorted(COMPOSITE_BANDS)),
             state="readonly",
-        ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+        ).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(2, 0))
 
         timing_frame = ttk.LabelFrame(settings, text="Timelapse", style="Section.TLabelframe")
         timing_frame.grid(row=1, column=1, sticky="nsew", padx=(8, 0), pady=(0, 10))
@@ -2320,9 +2900,11 @@ class HimawariProcessorApp:
             text="Draw coastline and country border lines",
             variable=self.border_lines_var,
         ).grid(row=2, column=0, sticky="w", pady=(4, 4))
-        ttk.Label(options_frame, text="Border Color").grid(row=2, column=1, sticky="w", padx=(0, 8))
+        self.overlay_check_button = ttk.Button(options_frame, text="Check Overlay Setup", command=self._check_overlays)
+        self.overlay_check_button.grid(row=2, column=1, sticky="e", padx=(0, 8), pady=(4, 4))
+        ttk.Label(options_frame, text="Border Color").grid(row=3, column=1, sticky="w", padx=(0, 8))
         color_row = ttk.Frame(options_frame)
-        color_row.grid(row=3, column=1, sticky="ew")
+        color_row.grid(row=4, column=1, sticky="ew")
         color_row.columnconfigure(0, weight=1)
         ttk.Entry(color_row, textvariable=self.border_color_var, width=14).grid(row=0, column=0, sticky="ew")
         ttk.Button(color_row, text="Pick", command=self._choose_border_color).grid(row=0, column=1, padx=(8, 0))
@@ -2450,7 +3032,13 @@ class HimawariProcessorApp:
         self.quick_fix_button.grid(
             row=0, column=5, padx=(0, 8)
         )
-        ttk.Button(buttons, text="Close", command=self._terminate_app).grid(row=0, column=6)
+        self.open_last_button = ttk.Button(buttons, text="Open Last", command=self._open_last_output)
+        self.open_last_button.grid(row=0, column=6, padx=(0, 8))
+        self.copy_paths_button = ttk.Button(buttons, text="Copy Paths", command=self._copy_output_paths)
+        self.copy_paths_button.grid(row=0, column=7, padx=(0, 8))
+        self.copy_error_button = ttk.Button(buttons, text="Copy Error", command=self._copy_error_report)
+        self.copy_error_button.grid(row=0, column=8, padx=(0, 8))
+        ttk.Button(buttons, text="Close", command=self._terminate_app).grid(row=0, column=9)
 
     def _install_setup_watchers(self) -> None:
         watched_vars = (
@@ -2492,6 +3080,46 @@ class HimawariProcessorApp:
         self.output_dir_var.set(str(OUTPUT_DIR))
         self.temp_dir_var.set(str(TEMP_DIR))
 
+    def _write_current_settings(self) -> None:
+        try:
+            save_gui_settings(self._read_config(), OUTPUT_DIR, TEMP_DIR)
+        except Exception as exc:
+            self._append_log(f"Could not save settings: {exc}")
+
+    def _set_config_vars(self, config: ProcessorConfig) -> None:
+        self.url_var.set(config.user_url)
+        self.mode_var.set(config.mode)
+        self.composite_var.set(config.composite_choice)
+        self.hours_var.set(str(config.hours_back))
+        self.interval_var.set(str(config.interval_minutes))
+        self.fps_var.set(str(config.fps))
+        self.download_workers_var.set(str(config.download_workers))
+        self.dask_workers_var.set(str(config.dask_num_workers))
+        self.chunk_var.set(config.dask_chunk_size)
+        self.ram_limit_var.set(str(config.ram_limit_gb))
+        self.image_format_var.set(config.image_format)
+        self.resampler_var.set(config.resampler)
+        self.timelapse_format_var.set(config.timelapse_format)
+        self.auto_download_var.set(config.auto_download)
+        self.night_fallback_var.set(config.use_night_fallback)
+        self.delete_frames_var.set(config.delete_timelapse_frames)
+        self.quality_fallback_var.set(config.allow_quality_fallback)
+        self.border_lines_var.set(config.add_border_lines)
+        self.border_color_var.set(config.border_line_color)
+        self.border_width_var.set(str(config.border_line_width))
+        self._refresh_mode_state()
+        self._update_setup_status()
+
+    def _apply_preset(self, name: str) -> None:
+        try:
+            config = preset_config(name, self._read_config())
+        except Exception as exc:
+            messagebox.showerror("Preset failed", str(exc))
+            return
+        self._set_config_vars(config)
+        self._write_current_settings()
+        self._append_log(f"Applied preset: {name}")
+
     def _refresh_mode_state(self) -> None:
         is_timelapse = self.mode_var.get() == "Timelapse"
         state = "normal" if is_timelapse and not self.is_running else "disabled"
@@ -2509,6 +3137,11 @@ class HimawariProcessorApp:
             getattr(self, "open_output_button", None),
             getattr(self, "check_env_button", None),
             getattr(self, "quick_fix_button", None),
+            getattr(self, "latest_url_button", None),
+            getattr(self, "overlay_check_button", None),
+            getattr(self, "open_last_button", None),
+            getattr(self, "copy_paths_button", None),
+            getattr(self, "copy_error_button", None),
         ):
             if widget is not None:
                 widget.configure(state=mutable_state)
@@ -2521,6 +3154,7 @@ class HimawariProcessorApp:
             OUTPUT_DIR = Path(selected).expanduser().resolve()
             self._refresh_path_fields()
             self._update_setup_status()
+            self._write_current_settings()
             self._append_log(f"Output folder set to {OUTPUT_DIR}")
 
     def _choose_temp_dir(self) -> None:
@@ -2530,6 +3164,7 @@ class HimawariProcessorApp:
             TEMP_DIR = Path(selected).expanduser().resolve()
             self._refresh_path_fields()
             self._update_setup_status()
+            self._write_current_settings()
             self._append_log(f"Temp folder set to {TEMP_DIR}")
 
     def _open_output_folder(self) -> None:
@@ -2545,6 +3180,43 @@ class HimawariProcessorApp:
             os.startfile(str(TEMP_DIR))
         else:
             messagebox.showinfo("Temp folder", str(TEMP_DIR))
+
+    def _open_path(self, path: Path) -> None:
+        target = path.parent if path.is_file() else path
+        if os.name == "nt":
+            os.startfile(str(target))
+        else:
+            messagebox.showinfo("Path", str(target))
+
+    def _open_last_output(self) -> None:
+        if not self.last_outputs:
+            messagebox.showinfo("Open last output", "No completed output is available yet.")
+            return
+        self._open_path(self.last_outputs[-1])
+
+    def _copy_to_clipboard(self, text: str) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update_idletasks()
+
+    def _copy_output_paths(self) -> None:
+        if not self.last_outputs:
+            messagebox.showinfo("Copy paths", "No completed output paths are available yet.")
+            return
+        text = "\n".join(str(path) for path in self.last_outputs)
+        self._copy_to_clipboard(text)
+        self._append_log("Output path(s) copied to clipboard.")
+
+    def _copy_error_report(self) -> None:
+        if not self.last_error_report:
+            self.last_error_report = build_error_report(
+                "No processing error has been recorded.",
+                self.last_config,
+                self.log_text.get("1.0", "end"),
+                self.last_outputs,
+            )
+        self._copy_to_clipboard(self.last_error_report)
+        self._append_log("Error report copied to clipboard.")
 
     def _open_environment_command(self, args: list[str], label: str) -> None:
         command = [sys.executable, str(PROJECT_DIR / "check_environment.py"), *args]
@@ -2562,10 +3234,43 @@ class HimawariProcessorApp:
             messagebox.showerror(f"{label} failed", str(exc))
 
     def _open_environment_check(self) -> None:
-        self._open_environment_command(["--plain"], "Environment check")
+        self.status_var.set("Checking environment")
+        self._append_log("Running environment check inline.")
+
+        def worker() -> None:
+            try:
+                import check_environment
+
+                results = check_environment.run_checks()
+                self.messages.put(("env_results", results))
+            except Exception as exc:
+                self.messages.put(("env_error", str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _open_environment_fix(self) -> None:
         self._open_environment_command(["--fix"], "Environment quick fix")
+
+    def _check_overlays(self) -> None:
+        status = overlay_status()
+        self._append_log(status.display_text())
+        if status.ok:
+            messagebox.showinfo("Overlay setup", status.display_text())
+        else:
+            messagebox.showwarning("Overlay setup", status.display_text())
+
+    def _fill_latest_fldk_url(self) -> None:
+        self.status_var.set("Finding latest FLDK")
+        self.latest_url_button.configure(state="disabled")
+        self._append_log("Looking for latest FLDK scan on NOAA AWS.")
+
+        def worker() -> None:
+            try:
+                self.messages.put(("latest_url", find_latest_fldk_url()))
+            except Exception as exc:
+                self.messages.put(("latest_url_error", str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _choose_border_color(self) -> None:
         initial = self.border_color_var.get()
@@ -2609,16 +3314,27 @@ class HimawariProcessorApp:
             setup_status = self._update_setup_status()
             if not setup_status.ok:
                 raise ValueError("\n".join(setup_status.errors))
+            preflight = preflight_run(config, OUTPUT_DIR, TEMP_DIR)
+            if not preflight.ok:
+                raise ValueError("\n".join(preflight.errors))
         except Exception as exc:
             self._append_log(f"Invalid settings: {exc}")
             messagebox.showerror("Invalid settings", str(exc))
+            return
+
+        if not messagebox.askokcancel("Run summary", preflight.display_text() + "\n\nStart processing?"):
+            self._append_log("Run canceled before processing.")
             return
 
         self.progress_var.set(0)
         self.status_var.set("Starting")
         self.cancel_event.clear()
         self._set_running(True)
+        self.last_config = config
+        self.last_error_report = ""
+        self._write_current_settings()
         self._append_log(f"Starting processing - version {APP_VERSION}")
+        self._append_log(preflight.display_text())
 
         self.worker = threading.Thread(target=self._run_worker, args=(config,), daemon=True)
         self.worker.start()
@@ -2666,12 +3382,35 @@ class HimawariProcessorApp:
                     self.progress_var.set(min(100.0, (float(current) / float(total)) * 100.0))
             elif kind == "done":
                 outputs = payload
+                self.last_outputs = list(outputs)
                 self._set_running(False)
                 self.progress_var.set(100)
                 self.status_var.set("Done")
                 output_lines = "\n".join(str(path) for path in outputs) if outputs else "No output paths returned."
                 self._append_log("Finished. Outputs:\n" + output_lines)
                 messagebox.showinfo("Done", f"Processing finished.\n\nOutputs:\n{output_lines}")
+            elif kind == "env_results":
+                results = payload
+                text = format_environment_results(results)
+                self.status_var.set("Environment checked")
+                self._append_log("Environment check results:\n" + text)
+                messagebox.showinfo("Environment check", text)
+            elif kind == "env_error":
+                self.status_var.set("Environment check failed")
+                self._append_log(f"Environment check failed: {payload}")
+                messagebox.showerror("Environment check failed", str(payload))
+            elif kind == "latest_url":
+                self.latest_url_button.configure(state="normal" if not self.is_running else "disabled")
+                self.url_var.set(str(payload))
+                self.status_var.set("Latest FLDK selected")
+                self._update_setup_status()
+                self._write_current_settings()
+                self._append_log(f"Latest FLDK URL set: {payload}")
+            elif kind == "latest_url_error":
+                self.latest_url_button.configure(state="normal" if not self.is_running else "disabled")
+                self.status_var.set("Latest FLDK failed")
+                self._append_log(f"Latest FLDK lookup failed: {payload}")
+                messagebox.showerror("Latest FLDK failed", str(payload))
             elif kind == "canceled":
                 self._set_running(False)
                 self.status_var.set("Canceled")
@@ -2680,6 +3419,12 @@ class HimawariProcessorApp:
             elif kind == "error":
                 self._set_running(False)
                 self.status_var.set("Failed")
+                self.last_error_report = build_error_report(
+                    str(payload),
+                    self.last_config,
+                    self.log_text.get("1.0", "end"),
+                    self.last_outputs,
+                )
                 messagebox.showerror("Processing failed", str(payload))
 
         self.root.after(100, self._poll_messages)
