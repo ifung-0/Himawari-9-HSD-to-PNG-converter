@@ -592,6 +592,18 @@ class ProcessorTests(unittest.TestCase):
             )
         )
 
+    def test_satpy_resample_datasets_for_composite(self):
+        self.assertIsNone(
+            h.satpy_resample_datasets_for_composite(
+                "True Color Reproduction Image",
+                "true_color_reproduction",
+            )
+        )
+        self.assertEqual(
+            h.satpy_resample_datasets_for_composite("True Color RGB (Enhanced)", "true_color"),
+            ["true_color"],
+        )
+
     @mock.patch("himawari_lowram_processor.cleanup_paths")
     @mock.patch("himawari_lowram_processor.save_dataset_with_optional_overlay")
     @mock.patch("himawari_lowram_processor.resample_scene_low_ram")
@@ -642,6 +654,43 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(mock_save.call_args.args[1], h.CUSTOM_DATASET_NAMES["True Color Reproduction Image"])
         self.assertFalse(mock_save.call_args.kwargs["enhance"])
         self.assertTrue(any("custom low-RAM fallback" in message for message, _current, _total in events))
+
+    @mock.patch("himawari_lowram_processor.cleanup_paths")
+    @mock.patch("himawari_lowram_processor.save_custom_satpy_missing_dataset_fallback")
+    @mock.patch("himawari_lowram_processor.save_dataset_with_optional_overlay")
+    @mock.patch("himawari_lowram_processor.resample_scene_low_ram")
+    @mock.patch("himawari_lowram_processor.download_segments")
+    @mock.patch("himawari_lowram_processor.Scene")
+    def test_true_color_reproduction_resamples_without_dataset_filter(
+        self,
+        mock_scene_class,
+        mock_download,
+        mock_resample,
+        mock_save,
+        mock_fallback,
+        _mock_cleanup,
+    ):
+        original_scene = mock.Mock()
+        original_scene.load.return_value = None
+        mock_scene_class.return_value = original_scene
+        resampled_scene = mock.Mock()
+        mock_resample.return_value = resampled_scene
+        mock_save.return_value = h.Path("out.png")
+        mock_download.return_value = [h.Path(f"segment-{idx}.dat") for idx in range(40)]
+        config = h.default_config()
+        config.composite_choice = "True Color Reproduction Image"
+        config.use_night_fallback = False
+        info = h.parse_url(h.USER_URL)
+        dt = h.datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
+
+        result = h.process_frame(dt, info, mock.Mock(width=10, height=10), 0, 1, config=config)
+
+        self.assertEqual(result, h.Path("out.png"))
+        mock_resample.assert_called_once_with(original_scene, mock.ANY, config, datasets=None)
+        mock_save.assert_called_once()
+        self.assertIs(mock_save.call_args.args[0], resampled_scene)
+        self.assertEqual(mock_save.call_args.args[1], "true_color_reproduction")
+        mock_fallback.assert_not_called()
 
     @mock.patch("himawari_lowram_processor.cleanup_paths")
     @mock.patch("himawari_lowram_processor.save_custom_satpy_missing_dataset_fallback")
@@ -1154,6 +1203,17 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(result, [h.Path("movie.gif")])
         mock_assemble.assert_called_once()
         self.assertTrue(any("successful frames" in message for message, _current, _total in events))
+
+    @mock.patch("himawari_lowram_processor.subprocess.Popen")
+    def test_gui_environment_check_uses_current_python(self, mock_popen):
+        app = object.__new__(h.HimawariProcessorApp)
+        app._append_log = mock.Mock()
+
+        h.HimawariProcessorApp._open_environment_check(app)
+
+        command = mock_popen.call_args.args[0]
+        self.assertIn(str(h.PROJECT_DIR / "check_environment.py"), command)
+        app._append_log.assert_called_once()
 
 
 if __name__ == "__main__":

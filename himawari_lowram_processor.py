@@ -9,6 +9,7 @@ import os
 import queue
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import tkinter as tk
@@ -1436,6 +1437,14 @@ def resample_scene_low_ram(
     raise ValueError(f"Unsupported resampler: {config.resampler}")
 
 
+def satpy_resample_datasets_for_composite(active: str, satpy_name: str) -> list[str] | None:
+    # Satpy builds true_color_reproduction during resampling from loaded prerequisites.
+    # Filtering to that final dataset before resampling prevents Satpy from creating it.
+    if active == "True Color Reproduction Image":
+        return None
+    return [satpy_name]
+
+
 def missing_optional_dependency(exc: BaseException, module_name: str) -> bool:
     current: BaseException | None = exc
     while current is not None:
@@ -1470,6 +1479,15 @@ def use_custom_satpy_missing_dataset_fallback(exc: BaseException, active: str, s
 
 def use_true_color_reproduction_fallback(exc: BaseException, active: str, satpy_name: str) -> bool:
     return use_custom_satpy_missing_dataset_fallback(exc, active, satpy_name)
+
+
+def satpy_missing_dataset_fallback_message(active: str, satpy_name: str) -> str:
+    if active == "True Color Reproduction Image":
+        return (
+            "Satpy true_color_reproduction unavailable; using custom low-RAM fallback approximation "
+            "(not official Satpy/JMA true color reproduction)"
+        )
+    return f"Satpy {satpy_name} unavailable; using custom low-RAM fallback"
 
 
 def missing_pyspectral_message(composite_name: str) -> str:
@@ -1586,7 +1604,7 @@ def save_custom_satpy_missing_dataset_fallback(
     progress: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
 ) -> Path:
-    message = f"Satpy {satpy_name} unavailable; using custom low-RAM fallback"
+    message = satpy_missing_dataset_fallback_message(active, satpy_name)
     LOG.warning("%s.", message)
     emit_progress(progress, message, None, None)
     scene = Scene(filenames=[str(path) for path in local_files], reader="ahi_hsd")
@@ -1737,7 +1755,8 @@ def process_frame(
             check_cancel(cancel_event)
             emit_progress(progress, "Resampling", None, None)
             try:
-                resampled = resample_scene_low_ram(scene, master_area, config, datasets=[satpy_name])
+                resample_datasets = satpy_resample_datasets_for_composite(active, satpy_name)
+                resampled = resample_scene_low_ram(scene, master_area, config, datasets=resample_datasets)
                 log_memory("after resample", config)
                 check_cancel(cancel_event)
                 emit_progress(progress, f"Saving {output_path.name}", None, None)
@@ -1985,7 +2004,8 @@ class HimawariProcessorApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Himawari-9 Low-RAM Processor")
-        self.root.geometry("980x760")
+        self.root.geometry("1060x800")
+        self.root.minsize(920, 680)
         self.messages: queue.Queue[tuple[str, object]] = queue.Queue()
         self.worker: threading.Thread | None = None
         self.is_running = False
@@ -2026,151 +2046,184 @@ class HimawariProcessorApp:
         LOG.addHandler(handler)
 
     def _build_ui(self) -> None:
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("Title.TLabel", font=("Segoe UI", 17, "bold"))
+        style.configure("Section.TLabelframe", padding=12)
+        style.configure("Section.TLabelframe.Label", font=("Segoe UI", 10, "bold"))
+        style.configure("Primary.TButton", font=("Segoe UI", 10, "bold"))
+
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(2, weight=1)
 
         title = ttk.Label(
             self.root,
             text="Himawari-9 Low-RAM Imagery Processor",
-            font=("Segoe UI", 16, "bold"),
+            style="Title.TLabel",
         )
         title.grid(row=0, column=0, sticky="w", padx=16, pady=(14, 6))
 
         notebook = ttk.Notebook(self.root)
         notebook.grid(row=1, column=0, sticky="nsew", padx=16, pady=8)
 
-        settings = ttk.Frame(notebook, padding=12)
-        advanced = ttk.Frame(notebook, padding=12)
-        notebook.add(settings, text="Settings")
+        settings = ttk.Frame(notebook, padding=(12, 10))
+        advanced = ttk.Frame(notebook, padding=(12, 10))
+        notebook.add(settings, text="Run Setup")
         notebook.add(advanced, text="Advanced")
 
-        for col in (0, 1, 2, 3):
+        for col in (0, 1):
             settings.columnconfigure(col, weight=1)
             advanced.columnconfigure(col, weight=1)
 
-        ttk.Label(settings, text="Himawari URL").grid(row=0, column=0, sticky="w")
-        ttk.Entry(settings, textvariable=self.url_var).grid(
-            row=1, column=0, columnspan=4, sticky="ew", pady=(2, 10)
-        )
+        source_frame = ttk.LabelFrame(settings, text="Source", style="Section.TLabelframe")
+        source_frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        source_frame.columnconfigure(0, weight=1)
+        ttk.Label(source_frame, text="NOAA AWS Himawari URL").grid(row=0, column=0, sticky="w")
+        ttk.Entry(source_frame, textvariable=self.url_var).grid(row=1, column=0, sticky="ew", pady=(2, 0))
 
-        ttk.Label(settings, text="Output Mode").grid(row=2, column=0, sticky="w")
+        product_frame = ttk.LabelFrame(settings, text="Product", style="Section.TLabelframe")
+        product_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(0, 10))
+        product_frame.columnconfigure(0, weight=1)
+        product_frame.columnconfigure(1, weight=1)
+        ttk.Label(product_frame, text="Output Mode").grid(row=0, column=0, sticky="w")
         mode_box = ttk.Combobox(
-            settings,
+            product_frame,
             textvariable=self.mode_var,
             values=("Single Image", "Timelapse"),
             state="readonly",
         )
-        mode_box.grid(row=3, column=0, sticky="ew", pady=(2, 10), padx=(0, 8))
+        mode_box.grid(row=1, column=0, sticky="ew", pady=(2, 10), padx=(0, 8))
         mode_box.bind("<<ComboboxSelected>>", lambda _event: self._refresh_mode_state())
 
-        ttk.Label(settings, text="Composite / Band").grid(row=2, column=1, sticky="w")
+        ttk.Label(product_frame, text="Image Format").grid(row=0, column=1, sticky="w")
         ttk.Combobox(
-            settings,
-            textvariable=self.composite_var,
-            values=tuple(sorted(COMPOSITE_BANDS)),
-            state="readonly",
-        ).grid(row=3, column=1, columnspan=3, sticky="ew", pady=(2, 10))
-
-        ttk.Label(settings, text="Hours Back").grid(row=4, column=0, sticky="w")
-        self.hours_spin = ttk.Spinbox(settings, from_=1, to=240, textvariable=self.hours_var, width=8)
-        self.hours_spin.grid(row=5, column=0, sticky="ew", padx=(0, 8), pady=(2, 10))
-
-        ttk.Label(settings, text="Interval Minutes").grid(row=4, column=1, sticky="w")
-        self.interval_spin = ttk.Spinbox(settings, from_=1, to=120, textvariable=self.interval_var, width=8)
-        self.interval_spin.grid(row=5, column=1, sticky="ew", padx=(0, 8), pady=(2, 10))
-
-        ttk.Label(settings, text="FPS").grid(row=4, column=2, sticky="w")
-        self.fps_spin = ttk.Spinbox(settings, from_=1, to=60, textvariable=self.fps_var, width=8)
-        self.fps_spin.grid(row=5, column=2, sticky="ew", padx=(0, 8), pady=(2, 10))
-
-        ttk.Label(settings, text="Image Format").grid(row=4, column=3, sticky="w")
-        ttk.Combobox(
-            settings,
+            product_frame,
             textvariable=self.image_format_var,
             values=("png", "tif"),
             state="readonly",
-        ).grid(row=5, column=3, sticky="ew", pady=(2, 10))
+        ).grid(row=1, column=1, sticky="ew", pady=(2, 10))
 
-        ttk.Checkbutton(
-            settings,
-            text="Auto-download missing satellite files",
-            variable=self.auto_download_var,
-        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 4))
-        ttk.Checkbutton(
-            settings,
-            text="Use night fallback for day-only products",
-            variable=self.night_fallback_var,
-        ).grid(row=6, column=2, columnspan=2, sticky="w", pady=(4, 4))
-        ttk.Checkbutton(
-            settings,
-            text="Delete frame PNG/TIF files after timelapse assembly",
-            variable=self.delete_frames_var,
-        ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(4, 4))
-        ttk.Checkbutton(
-            settings,
-            text="Allow lower-quality fallback if true color dependencies are missing",
-            variable=self.quality_fallback_var,
-        ).grid(row=8, column=0, columnspan=4, sticky="w", pady=(4, 4))
-        ttk.Checkbutton(
-            settings,
-            text="Draw coastline and country border lines",
-            variable=self.border_lines_var,
-        ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(4, 4))
-        ttk.Label(settings, text="Border Color").grid(row=9, column=2, sticky="e", padx=(0, 8))
-        ttk.Entry(settings, textvariable=self.border_color_var, width=14).grid(
-            row=9, column=3, sticky="ew", pady=(4, 4)
-        )
-        ttk.Button(settings, text="Pick Color", command=self._choose_border_color).grid(
-            row=10, column=2, sticky="ew", padx=(0, 8), pady=(4, 4)
-        )
-        ttk.Spinbox(settings, from_=0.25, to=5.0, increment=0.25, textvariable=self.border_width_var, width=8).grid(
-            row=10, column=3, sticky="ew", pady=(4, 4)
-        )
-
-        ttk.Label(advanced, text="Download Workers (capped at 4)").grid(row=0, column=0, sticky="w")
-        ttk.Spinbox(advanced, from_=1, to=4, textvariable=self.download_workers_var, width=8).grid(
-            row=1, column=0, sticky="ew", padx=(0, 8), pady=(2, 10)
-        )
-
-        ttk.Label(advanced, text="Dask Workers (capped at 2)").grid(row=0, column=1, sticky="w")
-        ttk.Spinbox(advanced, from_=1, to=2, textvariable=self.dask_workers_var, width=8).grid(
-            row=1, column=1, sticky="ew", padx=(0, 8), pady=(2, 10)
-        )
-
-        ttk.Label(advanced, text="Dask Chunk Size").grid(row=0, column=2, sticky="w")
+        ttk.Label(product_frame, text="Composite / Band").grid(row=2, column=0, columnspan=2, sticky="w")
         ttk.Combobox(
-            advanced,
-            textvariable=self.chunk_var,
-            values=("32MiB", "64MiB", "128MiB"),
+            product_frame,
+            textvariable=self.composite_var,
+            values=tuple(sorted(COMPOSITE_BANDS)),
             state="readonly",
-        ).grid(row=1, column=2, sticky="ew", padx=(0, 8), pady=(2, 10))
+        ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(2, 0))
 
-        ttk.Label(advanced, text="RAM Limit GiB").grid(row=0, column=3, sticky="w")
-        ttk.Spinbox(advanced, from_=1, to=64, increment=0.5, textvariable=self.ram_limit_var, width=8).grid(
-            row=1, column=3, sticky="ew", pady=(2, 10)
-        )
+        timing_frame = ttk.LabelFrame(settings, text="Timelapse", style="Section.TLabelframe")
+        timing_frame.grid(row=1, column=1, sticky="nsew", padx=(8, 0), pady=(0, 10))
+        for col in (0, 1, 2):
+            timing_frame.columnconfigure(col, weight=1)
+        ttk.Label(timing_frame, text="Hours Back").grid(row=0, column=0, sticky="w")
+        self.hours_spin = ttk.Spinbox(timing_frame, from_=1, to=240, textvariable=self.hours_var, width=8)
+        self.hours_spin.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(2, 10))
 
-        ttk.Label(advanced, text="Timelapse Format").grid(row=2, column=0, sticky="w")
+        ttk.Label(timing_frame, text="Interval Minutes").grid(row=0, column=1, sticky="w")
+        self.interval_spin = ttk.Spinbox(timing_frame, from_=1, to=120, textvariable=self.interval_var, width=8)
+        self.interval_spin.grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=(2, 10))
+
+        ttk.Label(timing_frame, text="FPS").grid(row=0, column=2, sticky="w")
+        self.fps_spin = ttk.Spinbox(timing_frame, from_=1, to=60, textvariable=self.fps_var, width=8)
+        self.fps_spin.grid(row=1, column=2, sticky="ew", pady=(2, 10))
+
+        ttk.Label(timing_frame, text="Format").grid(row=2, column=0, sticky="w")
         ttk.Combobox(
-            advanced,
+            timing_frame,
             textvariable=self.timelapse_format_var,
             values=("gif", "mp4"),
             state="readonly",
-        ).grid(row=3, column=0, sticky="ew", padx=(0, 8), pady=(2, 10))
+        ).grid(row=3, column=0, sticky="ew", padx=(0, 8), pady=(2, 0))
+        ttk.Checkbutton(
+            timing_frame,
+            text="Delete frame images after assembly",
+            variable=self.delete_frames_var,
+        ).grid(row=3, column=1, columnspan=2, sticky="w", pady=(2, 0))
 
-        ttk.Label(advanced, text="Resampler").grid(row=2, column=1, sticky="w")
+        options_frame = ttk.LabelFrame(settings, text="Options", style="Section.TLabelframe")
+        options_frame.grid(row=2, column=0, columnspan=2, sticky="ew")
+        options_frame.columnconfigure(0, weight=1)
+        options_frame.columnconfigure(1, weight=1)
+        ttk.Checkbutton(
+            options_frame,
+            text="Auto-download missing satellite files",
+            variable=self.auto_download_var,
+        ).grid(row=0, column=0, sticky="w", pady=(2, 4))
+        ttk.Checkbutton(
+            options_frame,
+            text="Use night fallback for day-only products",
+            variable=self.night_fallback_var,
+        ).grid(row=0, column=1, sticky="w", pady=(2, 4))
+        ttk.Checkbutton(
+            options_frame,
+            text="Allow lower-quality fallback if true color dependencies are missing",
+            variable=self.quality_fallback_var,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 4))
+        ttk.Checkbutton(
+            options_frame,
+            text="Draw coastline and country border lines",
+            variable=self.border_lines_var,
+        ).grid(row=2, column=0, sticky="w", pady=(4, 4))
+        ttk.Label(options_frame, text="Border Color").grid(row=2, column=1, sticky="w", padx=(0, 8))
+        color_row = ttk.Frame(options_frame)
+        color_row.grid(row=3, column=1, sticky="ew")
+        color_row.columnconfigure(0, weight=1)
+        ttk.Entry(color_row, textvariable=self.border_color_var, width=14).grid(row=0, column=0, sticky="ew")
+        ttk.Button(color_row, text="Pick", command=self._choose_border_color).grid(row=0, column=1, padx=(8, 0))
+        ttk.Label(options_frame, text="Border Width").grid(row=3, column=0, sticky="w", pady=(4, 4))
+        ttk.Spinbox(
+            options_frame,
+            from_=0.25,
+            to=5.0,
+            increment=0.25,
+            textvariable=self.border_width_var,
+            width=8,
+        ).grid(row=4, column=0, sticky="w", pady=(2, 0))
+
+        performance_frame = ttk.LabelFrame(advanced, text="Performance", style="Section.TLabelframe")
+        performance_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 10))
+        for col in (0, 1):
+            performance_frame.columnconfigure(col, weight=1)
+        ttk.Label(performance_frame, text="Download Workers").grid(row=0, column=0, sticky="w")
+        ttk.Spinbox(performance_frame, from_=1, to=4, textvariable=self.download_workers_var, width=8).grid(
+            row=1, column=0, sticky="ew", padx=(0, 8), pady=(2, 10)
+        )
+        ttk.Label(performance_frame, text="Dask Workers").grid(row=0, column=1, sticky="w")
+        ttk.Spinbox(performance_frame, from_=1, to=2, textvariable=self.dask_workers_var, width=8).grid(
+            row=1, column=1, sticky="ew", pady=(2, 10)
+        )
+        ttk.Label(performance_frame, text="Dask Chunk Size").grid(row=2, column=0, sticky="w")
         ttk.Combobox(
-            advanced,
+            performance_frame,
+            textvariable=self.chunk_var,
+            values=("32MiB", "64MiB", "128MiB"),
+            state="readonly",
+        ).grid(row=3, column=0, sticky="ew", padx=(0, 8), pady=(2, 0))
+        ttk.Label(performance_frame, text="RAM Limit GiB").grid(row=2, column=1, sticky="w")
+        ttk.Spinbox(performance_frame, from_=1, to=64, increment=0.5, textvariable=self.ram_limit_var, width=8).grid(
+            row=3, column=1, sticky="ew", pady=(2, 0)
+        )
+
+        paths_frame = ttk.LabelFrame(advanced, text="Paths and Resampling", style="Section.TLabelframe")
+        paths_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=(0, 10))
+        paths_frame.columnconfigure(0, weight=1)
+        paths_frame.columnconfigure(1, weight=1)
+        ttk.Label(paths_frame, text="Resampler").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(
+            paths_frame,
             textvariable=self.resampler_var,
             values=("native", "nearest"),
             state="readonly",
-        ).grid(row=3, column=1, sticky="ew", padx=(0, 8), pady=(2, 10))
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 10))
 
-        ttk.Button(advanced, text="Choose Output Folder", command=self._choose_output_dir).grid(
-            row=3, column=2, sticky="ew", padx=(0, 8), pady=(2, 10)
+        ttk.Button(paths_frame, text="Choose Output Folder", command=self._choose_output_dir).grid(
+            row=2, column=0, sticky="ew", padx=(0, 8), pady=(2, 10)
         )
-        ttk.Button(advanced, text="Choose Temp Folder", command=self._choose_temp_dir).grid(
-            row=3, column=3, sticky="ew", padx=(0, 8), pady=(2, 10)
+        ttk.Button(paths_frame, text="Choose Temp Folder", command=self._choose_temp_dir).grid(
+            row=2, column=1, sticky="ew", pady=(2, 10)
         )
         self._refresh_mode_state()
 
@@ -2192,14 +2245,17 @@ class HimawariProcessorApp:
         buttons = ttk.Frame(self.root, padding=(16, 0, 16, 16))
         buttons.grid(row=3, column=0, sticky="ew")
         buttons.columnconfigure(0, weight=1)
-        self.start_button = ttk.Button(buttons, text="Start Processing", command=self._start)
+        self.start_button = ttk.Button(buttons, text="Start Processing", command=self._start, style="Primary.TButton")
         self.start_button.grid(row=0, column=1, padx=(0, 8))
-        self.stop_button = ttk.Button(buttons, text="Stop Download", command=self._stop_current_task)
+        self.stop_button = ttk.Button(buttons, text="Stop Processing", command=self._stop_current_task)
         self.stop_button.grid(row=0, column=2, padx=(0, 8))
         ttk.Button(buttons, text="Open Output Folder", command=self._open_output_folder).grid(
             row=0, column=3, padx=(0, 8)
         )
-        ttk.Button(buttons, text="Terminate", command=self._terminate_app).grid(row=0, column=4)
+        ttk.Button(buttons, text="Check Environment", command=self._open_environment_check).grid(
+            row=0, column=4, padx=(0, 8)
+        )
+        ttk.Button(buttons, text="Close", command=self._terminate_app).grid(row=0, column=5)
 
     def _refresh_mode_state(self) -> None:
         is_timelapse = self.mode_var.get() == "Timelapse"
@@ -2233,6 +2289,21 @@ class HimawariProcessorApp:
             os.startfile(str(OUTPUT_DIR))
         else:
             messagebox.showinfo("Output folder", str(OUTPUT_DIR))
+
+    def _open_environment_check(self) -> None:
+        command = [sys.executable, str(PROJECT_DIR / "check_environment.py")]
+        try:
+            if os.name == "nt":
+                subprocess.Popen(
+                    ["cmd", "/k", *command],
+                    cwd=PROJECT_DIR,
+                    creationflags=subprocess.CREATE_NEW_CONSOLE,
+                )
+            else:
+                subprocess.Popen(command, cwd=PROJECT_DIR)
+            self._append_log("Environment check started in a separate console.")
+        except Exception as exc:
+            messagebox.showerror("Environment check failed", str(exc))
 
     def _choose_border_color(self) -> None:
         initial = self.border_color_var.get()
@@ -2274,6 +2345,7 @@ class HimawariProcessorApp:
             config = self._read_config()
             validate_configuration(config)
         except Exception as exc:
+            self._append_log(f"Invalid settings: {exc}")
             messagebox.showerror("Invalid settings", str(exc))
             return
 
@@ -2332,8 +2404,9 @@ class HimawariProcessorApp:
                 self._set_running(False)
                 self.progress_var.set(100)
                 self.status_var.set("Done")
-                self._append_log(f"Finished. Outputs: {outputs}")
-                messagebox.showinfo("Done", f"Processing finished.\n\nOutputs:\n{outputs}")
+                output_lines = "\n".join(str(path) for path in outputs) if outputs else "No output paths returned."
+                self._append_log("Finished. Outputs:\n" + output_lines)
+                messagebox.showinfo("Done", f"Processing finished.\n\nOutputs:\n{output_lines}")
             elif kind == "canceled":
                 self._set_running(False)
                 self.status_var.set("Canceled")

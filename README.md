@@ -17,9 +17,8 @@ timelapse. The pipeline is designed for a hard 10 GiB memory budget.
   are gone from processing.
 - Full-disk output uses Satpy's `native` resampler by default to avoid
   bilinear KD-tree index arrays that can consume multiple GiB before saving.
-- Timelapse frame areas are snapped to a native-compatible B13 grid before
-  resampling so Satpy's native resampler keeps integer expansion/reduction
-  factors across shifted Target scans.
+- Timelapse frame areas are snapped to the finest native grid needed by the
+  selected product, with compatibility checks across the required bands.
 - Set `IMAGE_FORMAT = "tif"` to use Satpy/rasterio chunked GeoTIFF writing for
   very large full-disk outputs.
 - Full-disk 500 m PNG requests are automatically switched to GeoTIFF because
@@ -55,6 +54,7 @@ Launch the GUI:
 
 ```powershell
 python himawari_lowram_processor.py
+run_gui.bat
 ```
 
 The window lets you edit the Himawari URL, choose any supported band or
@@ -70,9 +70,28 @@ folder if your environment does not already provide them.
 
 The progress bar advances while segment downloads and timelapse frame assembly
 run, and the live log panel shows memory checkpoints and processing stages.
-Use `Stop Download` to cancel the current run, including active segment
-downloads and pending frames. Use `Terminate` to request cancellation and close
-the GUI.
+Use `Stop Processing` to cancel the current run, including active segment
+downloads and pending frames. Use `Check Environment` to open the diagnostic
+checker from the app.
+
+Launch the terminal interface:
+
+```powershell
+python himawari_cli.py --help
+python himawari_cli.py --menu
+run_cli.bat
+```
+
+The CLI uses the same `ProcessorConfig` and processing functions as the GUI.
+Run without arguments, or with `--menu`, for a guided menu. Use `--run` with
+flags for repeatable commands:
+
+```powershell
+python himawari_cli.py --run --composite "B13 (Infrared Window)" --mode "Single Image"
+```
+
+Windows helper launchers prefer `.venv\Scripts\python.exe` when it exists,
+then `py -3.13`, `py -3.12`, and finally `python`.
 
 For official-looking true color and true color reproduction, keep the
 lower-quality fallback checkbox off and make sure `pyspectral` is installed in
@@ -155,24 +174,28 @@ python check_environment.py --fix
 If it still fails, check that the reported Python executable is the same one
 used to launch `himawari_lowram_processor.py`.
 
-### `No dataset matching 'true_color_reproduction' found`
+### `Satpy true_color_reproduction unavailable; using custom low-RAM fallback`
 
-Satpy cannot find the AHI true color reproduction composite. This has the same
-common causes as the `true_color` error above.
+That message means the saved image used the app's approximate RGB fallback, not
+official Satpy/JMA true color reproduction. Older app versions could trigger
+that fallback too early because Satpy often creates `true_color_reproduction`
+during resampling from its prerequisite bands.
 
-The app now falls back automatically to a custom low-RAM RGB approximation and
-continues writing an output. The log will say:
+Update the app first. Current versions let Satpy resample the prerequisites and
+then save the generated `true_color_reproduction` dataset. If Satpy still cannot
+create it, the app falls back automatically and the log will say:
 
 ```text
-Satpy true_color_reproduction unavailable; using custom low-RAM fallback
+Satpy true_color_reproduction unavailable; using custom low-RAM fallback approximation (not official Satpy/JMA true color reproduction)
 ```
 
-Use the checker below if you want to repair the official Satpy composite.
+Use the checker below to verify that `pyspectral` and Satpy's AHI composite
+configuration are available to the same Python used by the app.
 
 Fix:
 
 ```powershell
-python check_environment.py
+python check_environment.py --plain
 python check_environment.py --auto
 python check_environment.py --fix
 ```

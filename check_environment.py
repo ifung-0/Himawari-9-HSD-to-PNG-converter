@@ -21,6 +21,7 @@ TRUE_COLOR = "true_color"
 TRUE_COLOR_UI = "True Color RGB (Enhanced)"
 TRUE_COLOR_REPRODUCTION = "true_color_reproduction"
 TRUE_COLOR_REPRODUCTION_UI = "True Color Reproduction Image"
+GROUP_ORDER = ("Python", "Packages", "Satpy", "Project")
 
 
 @dataclass(frozen=True)
@@ -422,10 +423,94 @@ def has_critical_failures(results: list[CheckResult]) -> bool:
     return any(not result.ok and result.critical for result in results)
 
 
-def print_results(results: list[CheckResult]) -> None:
+def result_group(result: CheckResult) -> str:
+    package_names = {package.import_name for package in PACKAGE_CHECKS}
+    if result.name in {"python executable", "python version", "requirements file"}:
+        return "Python"
+    if result.name in package_names:
+        return "Packages"
+    if result.name.startswith("satpy") or result.name.startswith("Satpy") or "AHI" in result.name:
+        return "Satpy"
+    return "Project"
+
+
+def result_counts(results: list[CheckResult]) -> tuple[int, int, int]:
+    ok = sum(1 for result in results if result.ok)
+    warnings = sum(1 for result in results if not result.ok and not result.critical)
+    failures = sum(1 for result in results if not result.ok and result.critical)
+    return ok, warnings, failures
+
+
+def status_label(result: CheckResult) -> str:
+    if result.ok:
+        return "OK"
+    return "FAIL" if result.critical else "WARN"
+
+
+def print_banner() -> None:
+    print("Himawari-9 processor environment check")
+    print(f"Project: {PROJECT_DIR}")
+    print(f"Python:  {sys.executable}")
+    print()
+
+
+def print_summary(results: list[CheckResult]) -> None:
+    ok, warnings, failures = result_counts(results)
+    print()
+    print(f"Summary: {ok} OK, {warnings} warning(s), {failures} critical failure(s)")
+
+
+def print_results(results: list[CheckResult], grouped: bool = True) -> None:
+    if not grouped:
+        for result in results:
+            print(f"[{status_label(result)}] {result.name}: {result.detail}")
+        print_summary(results)
+        return
+
+    grouped_results: dict[str, list[CheckResult]] = {group: [] for group in GROUP_ORDER}
     for result in results:
-        label = "OK" if result.ok else ("FAIL" if result.critical else "WARN")
-        print(f"[{label}] {result.name}: {result.detail}")
+        grouped_results.setdefault(result_group(result), []).append(result)
+
+    for group in GROUP_ORDER:
+        items = grouped_results.get(group, [])
+        if not items:
+            continue
+        name_width = max(len(result.name) for result in items)
+        print(f"{group}:")
+        for result in items:
+            print(f"  [{status_label(result):4}] {result.name:<{name_width}}  {result.detail}")
+        print()
+    print_summary(results)
+
+
+def print_next_steps(results: list[CheckResult]) -> None:
+    if has_critical_failures(results):
+        failed = [result.name for result in results if not result.ok and result.critical]
+        print()
+        print("Next steps:")
+        print("  Critical checks failed: " + ", ".join(failed))
+        print("  1. Try automatic repair:")
+        print("     " + command_text([sys.executable, str(Path(__file__).resolve()), "--auto"]))
+        print("  2. If that fails, install requirements with:")
+        print("     " + command_text(pip_install_command(upgrade=True)))
+        print("  3. Re-run this checker, then launch the GUI or CLI with the same Python shown above.")
+        return
+
+    if has_failures(results):
+        warnings = [result.name for result in results if not result.ok and not result.critical]
+        print()
+        print("Next steps:")
+        print("  Optional checks need attention: " + ", ".join(warnings))
+        print("  Core processing can still run. Features such as memory reporting,")
+        print("  border overlays, MP4 writing, or official Satpy true color may be limited.")
+        print("  To repair optional helpers, run:")
+        print("     " + command_text([sys.executable, str(Path(__file__).resolve()), "--fix"]))
+        print("  You can also use the custom low-RAM true color fallback from the GUI or CLI.")
+        return
+
+    print()
+    print("Environment looks ready for true color reproduction and low-RAM processing.")
+    print("Use run_gui.bat for the desktop app or run_cli.bat for the terminal interface.")
 
 
 def has_failures(results: list[CheckResult]) -> bool:
@@ -488,14 +573,17 @@ def main() -> int:
             "with Python 3.12/3.13 from the Windows py launcher."
         ),
     )
+    parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="Print compact one-line-per-check output.",
+    )
     args = parser.parse_args()
 
-    print("Himawari-9 processor environment check")
-    print(f"Project: {PROJECT_DIR}")
-    print()
+    print_banner()
 
     results = run_checks()
-    print_results(results)
+    print_results(results, grouped=not args.plain)
 
     if args.auto and has_failures(results):
         print()
@@ -506,7 +594,7 @@ def main() -> int:
         if supported_python_version():
             print("Re-checking after repair...")
             results = run_checks()
-            print_results(results)
+            print_results(results, grouped=not args.plain)
     elif args.fix and has_failures(results):
         print()
         fix_code = run_fix()
@@ -515,24 +603,17 @@ def main() -> int:
         print()
         print("Re-checking after repair...")
         results = run_checks()
-        print_results(results)
+        print_results(results, grouped=not args.plain)
 
     if has_critical_failures(results):
-        print()
-        print("One or more critical checks failed. Try automatic repair with:")
-        print(command_text([sys.executable, str(Path(__file__).resolve()), "--auto"]))
-        print("Or install requirements with:")
-        print(command_text(pip_install_command(upgrade=True)))
+        print_next_steps(results)
         return 1
 
     if has_failures(results):
-        print()
-        print("Only optional checks failed. To install optional helpers too, run:")
-        print(command_text([sys.executable, str(Path(__file__).resolve()), "--fix"]))
+        print_next_steps(results)
         return 0
 
-    print()
-    print("Environment looks ready for true color reproduction and low-RAM processing.")
+    print_next_steps(results)
     return 0
 
 

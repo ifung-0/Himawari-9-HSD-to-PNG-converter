@@ -1,4 +1,5 @@
 import unittest
+from io import StringIO
 from unittest import mock
 
 import check_environment as env
@@ -47,6 +48,56 @@ class EnvironmentCheckTests(unittest.TestCase):
 
         results.append(env.CheckResult("critical missing", False, "missing", critical=True))
         self.assertTrue(env.has_critical_failures(results))
+
+    def test_result_counts_and_grouping(self):
+        results = [
+            env.CheckResult("python version", True, "ok"),
+            env.CheckResult("psutil", False, "missing", critical=False),
+            env.CheckResult("satpy", False, "missing", critical=True),
+        ]
+
+        self.assertEqual(env.result_group(results[0]), "Python")
+        self.assertEqual(env.result_group(results[1]), "Packages")
+        self.assertEqual(env.result_counts(results), (1, 1, 1))
+        self.assertEqual(env.status_label(results[0]), "OK")
+        self.assertEqual(env.status_label(results[1]), "WARN")
+        self.assertEqual(env.status_label(results[2]), "FAIL")
+
+    def test_print_results_groups_output(self):
+        results = [
+            env.CheckResult("python version", True, "3.12 supported"),
+            env.CheckResult("psutil", False, "missing", critical=False),
+        ]
+
+        with mock.patch("sys.stdout", new_callable=StringIO) as stdout:
+            env.print_results(results)
+
+        output = stdout.getvalue()
+        self.assertIn("Python:", output)
+        self.assertIn("Packages:", output)
+        self.assertIn("Summary: 1 OK, 1 warning(s), 0 critical failure(s)", output)
+
+    def test_print_next_steps_for_optional_warnings_mentions_fix_and_cli(self):
+        results = [env.CheckResult("psutil", False, "missing", critical=False)]
+
+        with mock.patch("sys.stdout", new_callable=StringIO) as stdout:
+            env.print_next_steps(results)
+
+        output = stdout.getvalue()
+        self.assertIn("Optional checks need attention: psutil", output)
+        self.assertIn("--fix", output)
+        self.assertIn("GUI or CLI", output)
+
+    def test_print_next_steps_for_ready_environment_mentions_launchers(self):
+        results = [env.CheckResult("python version", True, "ok")]
+
+        with mock.patch("sys.stdout", new_callable=StringIO) as stdout:
+            env.print_next_steps(results)
+
+        output = stdout.getvalue()
+        self.assertIn("Environment looks ready", output)
+        self.assertIn("run_gui.bat", output)
+        self.assertIn("run_cli.bat", output)
 
     @mock.patch("check_environment.metadata.version", return_value="0.59.0")
     def test_satpy_version_requires_minimum(self, _mock_version):
