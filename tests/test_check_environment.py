@@ -1,5 +1,7 @@
 import unittest
 from io import StringIO
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest import mock
 
 import check_environment as env
@@ -20,6 +22,22 @@ class EnvironmentCheckTests(unittest.TestCase):
     def test_version_tuple_parses_numeric_prefix(self):
         self.assertGreaterEqual(env.version_tuple("0.60.0"), (0, 60))
         self.assertEqual(env.version_tuple("1.2.3rc1"), (1, 2, 3))
+
+    def test_minimum_versions_from_requirements_parses_simple_bounds(self):
+        with TemporaryDirectory() as tmp_dir:
+            requirements = Path(tmp_dir) / "requirements.txt"
+            requirements.write_text(
+                "satpy>=0.60\n"
+                "imageio-ffmpeg>=0.4; platform_system != \"Emscripten\"\n"
+                "example[extra]>=1.2,!=1.3\n",
+                encoding="utf-8",
+            )
+
+            minimums = env.minimum_versions_from_requirements(requirements)
+
+        self.assertEqual(minimums["satpy"], "0.60")
+        self.assertEqual(minimums["imageio-ffmpeg"], "0.4")
+        self.assertEqual(minimums["example"], "1.2")
 
     def test_app_version_result_uses_processor_version(self):
         result = env.check_app_version()
@@ -55,6 +73,51 @@ class EnvironmentCheckTests(unittest.TestCase):
         self.assertIn(".venv", str(path))
         self.assertTrue(str(path).endswith("python.exe") or str(path).endswith("python"))
 
+    @mock.patch("check_environment.importlib.import_module", return_value=object())
+    @mock.patch("check_environment.importlib.util.find_spec", return_value=object())
+    @mock.patch("check_environment.package_version", return_value="1.2.0")
+    def test_check_package_reports_supported_minimum_version(self, _mock_version, _mock_spec, _mock_import):
+        package = env.PackageCheck("demo", "demo-dist", "testing")
+
+        result = env.check_package(package, {"demo-dist": "1.0"})
+
+        self.assertTrue(result.ok)
+        self.assertIn("1.2.0 >= 1.0", result.detail)
+
+    @mock.patch("check_environment.importlib.import_module", return_value=object())
+    @mock.patch("check_environment.importlib.util.find_spec", return_value=object())
+    @mock.patch("check_environment.package_version", return_value="0.9.0")
+    def test_check_package_reports_outdated_critical_dependency(self, _mock_version, _mock_spec, _mock_import):
+        package = env.PackageCheck("demo", "demo-dist", "testing")
+
+        result = env.check_package(package, {"demo-dist": "1.0"})
+
+        self.assertFalse(result.ok)
+        self.assertTrue(result.critical)
+        self.assertIn("older than required 1.0", result.detail)
+
+    @mock.patch("check_environment.importlib.import_module", return_value=object())
+    @mock.patch("check_environment.importlib.util.find_spec", return_value=object())
+    @mock.patch("check_environment.package_version", return_value=None)
+    def test_check_package_reports_import_distribution_mismatch(self, _mock_version, _mock_spec, _mock_import):
+        package = env.PackageCheck("demo", "demo-dist", "testing")
+
+        result = env.check_package(package, {})
+
+        self.assertFalse(result.ok)
+        self.assertIn("metadata was not found", result.detail)
+
+    @mock.patch("check_environment.importlib.util.find_spec", return_value=None)
+    @mock.patch("check_environment.package_version", return_value=None)
+    def test_check_package_preserves_optional_warning_classification(self, _mock_version, _mock_spec):
+        package = env.PackageCheck("demo", "demo-dist", "testing", critical=False)
+
+        result = env.check_package(package, {})
+
+        self.assertFalse(result.ok)
+        self.assertFalse(result.critical)
+        self.assertIn("module is not importable", result.detail)
+
     def test_has_critical_failures_ignores_optional_warnings(self):
         results = [
             env.CheckResult("optional", False, "missing", critical=False),
@@ -70,11 +133,13 @@ class EnvironmentCheckTests(unittest.TestCase):
             env.CheckResult("python version", True, "ok"),
             env.CheckResult("psutil", False, "missing", critical=False),
             env.CheckResult("satpy", False, "missing", critical=True),
+            env.CheckResult("default output folder", True, "ok"),
         ]
 
         self.assertEqual(env.result_group(results[0]), "Python")
         self.assertEqual(env.result_group(results[1]), "Packages")
-        self.assertEqual(env.result_counts(results), (1, 1, 1))
+        self.assertEqual(env.result_group(results[3]), "Paths")
+        self.assertEqual(env.result_counts(results), (2, 1, 1))
         self.assertEqual(env.status_label(results[0]), "OK")
         self.assertEqual(env.status_label(results[1]), "WARN")
         self.assertEqual(env.status_label(results[2]), "FAIL")
@@ -83,6 +148,7 @@ class EnvironmentCheckTests(unittest.TestCase):
         results = [
             env.CheckResult("python version", True, "3.12 supported"),
             env.CheckResult("psutil", False, "missing", critical=False),
+            env.CheckResult("default output folder", True, "writable"),
         ]
 
         with mock.patch("sys.stdout", new_callable=StringIO) as stdout:
@@ -91,7 +157,22 @@ class EnvironmentCheckTests(unittest.TestCase):
         output = stdout.getvalue()
         self.assertIn("Python:", output)
         self.assertIn("Packages:", output)
-        self.assertIn("Summary: 1 OK, 1 warning(s), 0 critical failure(s)", output)
+        self.assertIn("Paths:", output)
+        self.assertIn("Summary: 2 OK, 1 warning(s), 0 critical failure(s)", output)
+
+    def test_print_results_plain_output_keeps_one_line_per_check(self):
+        results = [
+            env.CheckResult("python version", True, "3.12 supported"),
+            env.CheckResult("cloud sync location", False, "OneDrive", critical=False),
+        ]
+
+        with mock.patch("sys.stdout", new_callable=StringIO) as stdout:
+            env.print_results(results, grouped=False)
+
+        output = stdout.getvalue()
+        self.assertIn("[OK] python version: 3.12 supported", output)
+        self.assertIn("[WARN] cloud sync location: OneDrive", output)
+        self.assertNotIn("Paths:", output)
 
     def test_print_next_steps_for_optional_warnings_mentions_fix_and_cli(self):
         results = [env.CheckResult("psutil", False, "missing", critical=False)]
@@ -103,6 +184,7 @@ class EnvironmentCheckTests(unittest.TestCase):
         self.assertIn("Optional checks need attention: psutil", output)
         self.assertIn("--fix", output)
         self.assertIn("GUI or CLI", output)
+        self.assertIn("non-synced", output)
 
     def test_print_next_steps_for_ready_environment_mentions_launchers(self):
         results = [env.CheckResult("python version", True, "ok")]
@@ -211,6 +293,31 @@ class EnvironmentCheckTests(unittest.TestCase):
         self.assertIn("parsed AHI compositor registry", result.detail)
         self.assertIn("SATPY_CONFIG_PATH=C:/custom/satpy", result.detail)
 
+    @mock.patch.dict("check_environment.os.environ", {}, clear=True)
+    def test_satpy_config_environment_ok_without_custom_paths(self):
+        result = env.check_satpy_config_environment()
+
+        self.assertTrue(result.ok)
+        self.assertFalse(result.critical)
+        self.assertIn("no custom Satpy", result.detail)
+
+    @mock.patch.dict("check_environment.os.environ", {"SATPY_CONFIG_PATH": "Z:/missing/satpy"}, clear=True)
+    def test_satpy_config_environment_warns_for_missing_path(self):
+        result = env.check_satpy_config_environment()
+
+        self.assertFalse(result.ok)
+        self.assertFalse(result.critical)
+        self.assertIn("SATPY_CONFIG_PATH", result.detail)
+
+    @mock.patch.dict("check_environment.os.environ", {}, clear=True)
+    def test_satpy_config_environment_accepts_existing_paths(self):
+        with TemporaryDirectory() as tmp_dir:
+            with mock.patch.dict("check_environment.os.environ", {"PPP_CONFIG_DIR": tmp_dir}, clear=True):
+                result = env.check_satpy_config_environment()
+
+        self.assertTrue(result.ok)
+        self.assertIn("PPP_CONFIG_DIR", result.detail)
+
     def test_satpy_compositor_names_extracts_data_id_name(self):
         with mock.patch(
             "satpy.composites.config_loader.load_compositor_configs_for_sensors",
@@ -227,6 +334,83 @@ class EnvironmentCheckTests(unittest.TestCase):
         self.assertIn("custom low-RAM fallback", result.detail)
         self.assertIn("true_color", result.detail)
         self.assertIn("true_color_reproduction", result.detail)
+
+    def test_launcher_helpers_ok_when_expected_scripts_are_referenced(self):
+        with TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            for helper, script in env.LAUNCHER_HELPERS.items():
+                (project_dir / helper).write_text(f'python "{script}" %*\n', encoding="utf-8")
+
+            result = env.check_launcher_helpers(project_dir)
+
+        self.assertTrue(result.ok)
+        self.assertFalse(result.critical)
+
+    def test_launcher_helpers_warn_for_missing_or_bad_helpers(self):
+        with TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            (project_dir / "run_gui.bat").write_text("python wrong.py\n", encoding="utf-8")
+            (project_dir / "run_cli.bat").write_text("python himawari_cli.py\n", encoding="utf-8")
+
+            result = env.check_launcher_helpers(project_dir)
+
+        self.assertFalse(result.ok)
+        self.assertFalse(result.critical)
+        self.assertIn("run_gui.bat does not reference", result.detail)
+        self.assertIn("missing check_environment.bat", result.detail)
+
+    def test_check_writable_folder_target_accepts_missing_child_with_writable_parent(self):
+        with TemporaryDirectory() as tmp_dir:
+            target = Path(tmp_dir) / "outputs"
+
+            result = env.check_writable_folder_target("default output folder", target)
+
+        self.assertTrue(result.ok)
+        self.assertIn("can be created", result.detail)
+        self.assertFalse(target.exists())
+
+    def test_check_writable_folder_target_fails_for_file_path(self):
+        with TemporaryDirectory() as tmp_dir:
+            target = Path(tmp_dir) / "outputs"
+            target.write_text("not a folder", encoding="utf-8")
+
+            result = env.check_writable_folder_target("default output folder", target)
+
+        self.assertFalse(result.ok)
+        self.assertIn("not a folder", result.detail)
+
+    @mock.patch("check_environment.tempfile.NamedTemporaryFile", side_effect=PermissionError("denied"))
+    def test_check_writable_folder_target_reports_permission_error(self, _mock_tempfile):
+        with TemporaryDirectory() as tmp_dir:
+            result = env.check_writable_folder_target("default temp folder", Path(tmp_dir))
+
+        self.assertFalse(result.ok)
+        self.assertIn("PermissionError", result.detail)
+
+    @mock.patch.object(env.Path, "resolve", autospec=True)
+    def test_cloud_sync_location_warns_for_onedrive_path(self, mock_resolve):
+        def fake_resolve(path, strict=False):
+            return Path("C:/Users/Isaac/OneDrive/Desktop/project")
+
+        mock_resolve.side_effect = fake_resolve
+
+        result = env.check_cloud_sync_locations([Path("C:/Users/Isaac/OneDrive/Desktop/project")])
+
+        self.assertFalse(result.ok)
+        self.assertFalse(result.critical)
+        self.assertIn("cloud-sync", result.detail)
+        self.assertIn("OneDrive", result.detail)
+
+    @mock.patch.object(env.Path, "resolve", autospec=True)
+    def test_cloud_sync_location_accepts_local_path(self, mock_resolve):
+        def fake_resolve(path, strict=False):
+            return Path("C:/Himawari/project")
+
+        mock_resolve.side_effect = fake_resolve
+
+        result = env.check_cloud_sync_locations([Path("C:/Himawari/project")])
+
+        self.assertTrue(result.ok)
 
 
 if __name__ == "__main__":

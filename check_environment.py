@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import importlib.metadata as metadata
 import importlib.util
 import os
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,7 +24,15 @@ TRUE_COLOR = "true_color"
 TRUE_COLOR_UI = "True Color RGB (Enhanced)"
 TRUE_COLOR_REPRODUCTION = "true_color_reproduction"
 TRUE_COLOR_REPRODUCTION_UI = "True Color Reproduction Image"
-GROUP_ORDER = ("Python", "Packages", "Satpy", "Project")
+GROUP_ORDER = ("Python", "Packages", "Satpy", "Project", "Paths")
+SATPY_CONFIG_ENV_VARS = ("SATPY_CONFIG_PATH", "PPP_CONFIG_DIR")
+CLOUD_SYNC_PREFIXES = ("onedrive", "dropbox", "google drive", "icloud")
+CLOUD_SYNC_EXACT = ("box",)
+LAUNCHER_HELPERS = {
+    "run_gui.bat": "himawari_lowram_processor.py",
+    "run_cli.bat": "himawari_cli.py",
+    "check_environment.bat": "check_environment.py",
+}
 
 
 @dataclass(frozen=True)
@@ -80,8 +90,54 @@ def package_version(distribution_name: str) -> str | None:
         return None
 
 
+def module_import_result(import_name: str) -> tuple[bool, str]:
+    try:
+        if importlib.util.find_spec(import_name) is None:
+            return False, "module is not importable"
+    except Exception as exc:
+        return False, f"module probe failed: {exc.__class__.__name__}: {exc}"
+
+    try:
+        importlib.import_module(import_name)
+    except Exception as exc:
+        return False, f"import failed: {exc.__class__.__name__}: {exc}"
+    return True, "importable"
+
+
 def module_available(import_name: str) -> bool:
-    return importlib.util.find_spec(import_name) is not None
+    return module_import_result(import_name)[0]
+
+
+def normalize_distribution_name(name: str) -> str:
+    return name.lower().replace("_", "-")
+
+
+def minimum_versions_from_requirements(requirements_file: Path = REQUIREMENTS_FILE) -> dict[str, str]:
+    if not requirements_file.exists():
+        return {}
+
+    minimums: dict[str, str] = {}
+    for raw_line in requirements_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line or line.startswith("-"):
+            continue
+        line = line.split(";", 1)[0].strip()
+        if ">=" not in line:
+            continue
+        name, version = line.split(">=", 1)
+        name = name.split("[", 1)[0].strip()
+        version = version.split(",", 1)[0].strip()
+        if name and version:
+            minimums[normalize_distribution_name(name)] = version
+    return minimums
+
+
+def minimum_version_for(package: PackageCheck, minimums: dict[str, str]) -> str | None:
+    return minimums.get(normalize_distribution_name(package.distribution_name))
+
+
+def version_meets_minimum(version: str, minimum: str) -> bool:
+    return version_tuple(version) >= version_tuple(minimum)
 
 
 def supported_python_version(version_info: tuple[int, int] | None = None) -> bool:
@@ -120,7 +176,7 @@ def satpy_config_file(*parts: str) -> Path | None:
 
 def satpy_config_environment_detail() -> str:
     values = []
-    for name in ("SATPY_CONFIG_PATH", "PPP_CONFIG_DIR"):
+    for name in SATPY_CONFIG_ENV_VARS:
         value = os.environ.get(name)
         if value:
             values.append(f"{name}={value}")
@@ -187,30 +243,235 @@ def create_venv(venv_dir: Path = VENV_DIR) -> Path | None:
     return python_path
 
 
+def check_package(package: PackageCheck, minimums: dict[str, str]) -> CheckResult:
+    version = package_version(package.distribution_name)
+    minimum = minimum_version_for(package, minimums)
+    import_ok, import_detail = module_import_result(package.import_name)
+
+    if not import_ok:
+        installed = f"; installed distribution version {version}" if version else ""
+        return CheckResult(
+            package.import_name,
+            False,
+            f"{import_detail}; needed for {package.purpose}{installed}",
+            critical=package.critical,
+        )
+
+    if version is None:
+        return CheckResult(
+            package.import_name,
+            False,
+            (
+                f"importable, but {package.distribution_name} package metadata was not found; "
+                "reinstall requirements with this Python"
+            ),
+            critical=package.critical,
+        )
+
+    if minimum is not None and not version_meets_minimum(version, minimum):
+        return CheckResult(
+            package.import_name,
+            False,
+            f"{version} is older than required {minimum}; needed for {package.purpose}",
+            critical=package.critical,
+        )
+
+    shown_version = f"{version} >= {minimum}" if minimum else version
+    return CheckResult(
+        package.import_name,
+        True,
+        f"{shown_version} ({package.purpose})",
+        critical=package.critical,
+    )
+
+
 def check_packages() -> list[CheckResult]:
+    minimums = minimum_versions_from_requirements()
+    return [check_package(package, minimums) for package in PACKAGE_CHECKS]
+
+
+def satpy_config_env_paths() -> list[tuple[str, Path]]:
+    paths = []
+    for name in SATPY_CONFIG_ENV_VARS:
+        value = os.environ.get(name)
+        if not value:
+            continue
+        for piece in value.split(os.pathsep):
+            if piece.strip():
+                paths.append((name, Path(piece).expanduser()))
+    return paths
+
+
+def check_satpy_config_environment() -> CheckResult:
+    configured = satpy_config_env_paths()
+    if not configured:
+        return CheckResult(
+            "Satpy config environment",
+            True,
+            "no custom Satpy config environment variables",
+            critical=False,
+        )
+
+    invalid = [
+        f"{name}={path}"
+        for name, path in configured
+        if not path.exists() or not path.is_dir()
+    ]
+    if invalid:
+        return CheckResult(
+            "Satpy config environment",
+            False,
+            "missing or not folders: " + ", ".join(invalid),
+            critical=False,
+        )
+
+    return CheckResult(
+        "Satpy config environment",
+        True,
+        "configured paths exist: " + ", ".join(f"{name}={path}" for name, path in configured),
+        critical=False,
+    )
+
+
+def check_launcher_helpers(project_dir: Path = PROJECT_DIR) -> CheckResult:
+    problems = []
+    for helper, expected_script in LAUNCHER_HELPERS.items():
+        path = project_dir / helper
+        if not path.exists():
+            problems.append(f"missing {helper}")
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace").lower()
+        except Exception as exc:
+            problems.append(f"could not read {helper}: {exc}")
+            continue
+        if expected_script.lower() not in text:
+            problems.append(f"{helper} does not reference {expected_script}")
+
+    if problems:
+        return CheckResult(
+            "launcher helpers",
+            False,
+            "; ".join(problems),
+            critical=False,
+        )
+
+    return CheckResult(
+        "launcher helpers",
+        True,
+        ", ".join(LAUNCHER_HELPERS) + " found and point to expected scripts",
+        critical=False,
+    )
+
+
+def nearest_existing_parent(path: Path) -> Path | None:
+    current = path if path.exists() else path.parent
+    while not current.exists():
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+    return current
+
+
+def check_writable_folder_target(name: str, path: Path) -> CheckResult:
+    path = Path(path).expanduser()
+    display_path = path.resolve(strict=False)
+
+    if path.exists() and not path.is_dir():
+        return CheckResult(name, False, f"{display_path} exists but is not a folder")
+
+    probe_dir = path if path.is_dir() else nearest_existing_parent(path)
+    if probe_dir is None:
+        return CheckResult(name, False, f"no existing parent folder for {display_path}")
+    if not probe_dir.is_dir():
+        return CheckResult(name, False, f"nearest existing path is not a folder: {probe_dir}")
+
+    probe_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix=".himawari_env_check_", dir=probe_dir, delete=False) as probe:
+            probe_path = Path(probe.name)
+            probe.write(b"ok")
+    except Exception as exc:
+        return CheckResult(
+            name,
+            False,
+            f"{display_path} is not writable through {probe_dir}: {exc.__class__.__name__}: {exc}",
+        )
+    finally:
+        if probe_path is not None:
+            try:
+                probe_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    if path.exists():
+        detail = f"writable: {display_path}"
+    else:
+        detail = f"{display_path} can be created; nearest existing parent is writable: {probe_dir}"
+    return CheckResult(name, True, detail)
+
+
+def check_default_path_writability() -> list[CheckResult]:
+    try:
+        import himawari_lowram_processor as app
+    except Exception as exc:
+        detail = f"project import failed: {exc}"
+        return [
+            CheckResult("default output folder", False, detail, critical=False),
+            CheckResult("default temp folder", False, detail, critical=False),
+        ]
+
     results = []
-    for package in PACKAGE_CHECKS:
-        version = package_version(package.distribution_name)
-        if module_available(package.import_name):
-            shown_version = version or "version unknown"
-            results.append(
-                CheckResult(
-                    package.import_name,
-                    True,
-                    f"{shown_version} ({package.purpose})",
-                    critical=package.critical,
-                )
-            )
-        else:
-            results.append(
-                CheckResult(
-                    package.import_name,
-                    False,
-                    f"missing; needed for {package.purpose}",
-                    critical=package.critical,
-                )
-            )
+    results.append(check_writable_folder_target("default output folder", Path(app.OUTPUT_DIR)))
+    results.append(check_writable_folder_target("default temp folder", Path(app.TEMP_DIR)))
     return results
+
+
+def cloud_sync_marker(path: Path) -> str | None:
+    for part in path.expanduser().resolve(strict=False).parts:
+        normalized = part.lower()
+        if normalized in CLOUD_SYNC_EXACT:
+            return part
+        if any(normalized.startswith(prefix) for prefix in CLOUD_SYNC_PREFIXES):
+            return part
+    return None
+
+
+def check_cloud_sync_locations(paths: list[Path] | None = None) -> CheckResult:
+    if paths is None:
+        try:
+            import himawari_lowram_processor as app
+
+            paths = [PROJECT_DIR, Path(app.OUTPUT_DIR), Path(app.TEMP_DIR)]
+        except Exception:
+            paths = [PROJECT_DIR]
+
+    matches = []
+    for path in paths:
+        marker = cloud_sync_marker(path)
+        if marker:
+            matches.append(f"{path} ({marker})")
+
+    if matches:
+        return CheckResult(
+            "cloud sync location",
+            False,
+            (
+                "path is under a cloud-sync folder: "
+                + "; ".join(matches)
+                + "; large GeoTIFF/temp writes are safer in local non-synced folders such as "
+                r"C:\Himawari\outputs and C:\Himawari\temp"
+            ),
+            critical=False,
+        )
+
+    return CheckResult(
+        "cloud sync location",
+        True,
+        "project/output/temp paths are not under a known cloud-sync folder",
+        critical=False,
+    )
 
 
 def check_satpy_version() -> CheckResult:
@@ -424,11 +685,15 @@ def run_checks() -> list[CheckResult]:
     ]
     results.extend(check_packages())
     results.append(check_satpy_version())
+    results.append(check_satpy_config_environment())
     results.extend(check_satpy_ahi_configs())
     results.append(check_satpy_true_color_registry())
     results.append(check_app_version())
     results.append(check_project_import())
     results.append(check_project_true_color_fallback_runtime())
+    results.append(check_launcher_helpers())
+    results.extend(check_default_path_writability())
+    results.append(check_cloud_sync_locations())
     return results
 
 
@@ -444,6 +709,13 @@ def result_group(result: CheckResult) -> str:
         return "Packages"
     if result.name.startswith("satpy") or result.name.startswith("Satpy") or "AHI" in result.name:
         return "Satpy"
+    if result.name in {
+        "launcher helpers",
+        "default output folder",
+        "default temp folder",
+        "cloud sync location",
+    }:
+        return "Paths"
     return "Project"
 
 
@@ -524,6 +796,7 @@ def print_next_steps(results: list[CheckResult]) -> None:
         print("  border overlays, MP4 writing, or official Satpy true color may be limited.")
         print("  To repair optional helpers, run:")
         print("     " + command_text([sys.executable, str(Path(__file__).resolve()), "--fix"]))
+        print("  For path warnings, choose local non-synced output/temp folders such as C:\\Himawari\\outputs.")
         print("  You can also use the custom low-RAM true color fallback from the GUI or CLI.")
         return
 
