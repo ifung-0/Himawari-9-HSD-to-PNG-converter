@@ -11,6 +11,25 @@ from pyresample.geometry import AreaDefinition
 import himawari_lowram_processor as h
 
 
+class FakeWidget:
+    def __init__(self):
+        self.configured: dict[str, object] = {}
+
+    def configure(self, **kwargs):
+        self.configured.update(kwargs)
+
+
+class FakeVar:
+    def __init__(self, value=""):
+        self.value = value
+
+    def set(self, value):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+
 class ProcessorTests(unittest.TestCase):
     def test_app_version_label(self):
         self.assertRegex(h.APP_VERSION, r"^\d{4}\.\d{2}\.\d{2}\.\d+$")
@@ -304,6 +323,56 @@ class ProcessorTests(unittest.TestCase):
                 setattr(config, field, value)
                 with self.assertRaisesRegex(ValueError, message):
                     h.validate_configuration(config)
+
+    def test_setup_status_summarizes_valid_fldk_source(self):
+        config = h.default_config()
+
+        status = h.build_setup_status(config, h.Path("C:/Himawari/outputs"), h.Path("C:/Himawari/temp"))
+
+        text = status.display_text()
+        self.assertTrue(status.ok)
+        self.assertIn("Source: FLDK 20240725_0400, 10 segments per band", text)
+        self.assertIn("Download estimate", text)
+
+    def test_setup_status_reports_invalid_url(self):
+        config = h.default_config()
+        config.user_url = "not a himawari url"
+
+        status = h.build_setup_status(config)
+
+        self.assertFalse(status.ok)
+        self.assertTrue(any("URL not recognised" in error for error in status.errors))
+        self.assertIn("Fix before starting", status.display_text())
+
+    def test_setup_status_warns_for_fldk_png_true_color_geotiff_switch(self):
+        config = h.default_config()
+        config.composite_choice = "True Color RGB (Enhanced)"
+        config.image_format = "png"
+
+        status = h.build_setup_status(config, h.Path("C:/Himawari/outputs"), h.Path("C:/Himawari/temp"))
+
+        self.assertTrue(any("auto-switch to GeoTIFF" in warning for warning in status.warnings))
+
+    def test_setup_status_warns_for_border_overlay_requirements(self):
+        config = h.default_config()
+        config.add_border_lines = True
+
+        status = h.build_setup_status(config, h.Path("C:/Himawari/outputs"), h.Path("C:/Himawari/temp"))
+
+        self.assertTrue(any("Border lines require" in warning for warning in status.warnings))
+        self.assertTrue(any("GSHHS/WDBII" in warning for warning in status.warnings))
+
+    @mock.patch.object(h.Path, "resolve", autospec=True)
+    def test_setup_status_warns_for_cloud_sync_paths(self, mock_resolve):
+        def fake_resolve(path, strict=False):
+            return h.Path("C:/Users/Isaac/OneDrive/Desktop/Himawari")
+
+        mock_resolve.side_effect = fake_resolve
+        config = h.default_config()
+
+        status = h.build_setup_status(config, h.Path("C:/Users/Isaac/OneDrive/out"), h.Path("C:/Himawari/temp"))
+
+        self.assertTrue(any("Cloud-sync path detected" in warning for warning in status.warnings))
 
     def test_low_ram_resampler_rejects_bilinear(self):
         config = h.default_config()
@@ -1223,15 +1292,79 @@ class ProcessorTests(unittest.TestCase):
         self.assertTrue(any("successful frames" in message for message, _current, _total in events))
 
     @mock.patch("himawari_lowram_processor.subprocess.Popen")
-    def test_gui_environment_check_uses_current_python(self, mock_popen):
+    def test_gui_environment_check_uses_current_python_with_plain_output(self, mock_popen):
         app = object.__new__(h.HimawariProcessorApp)
         app._append_log = mock.Mock()
 
         h.HimawariProcessorApp._open_environment_check(app)
 
         command = mock_popen.call_args.args[0]
+        self.assertIn(h.sys.executable, command)
         self.assertIn(str(h.PROJECT_DIR / "check_environment.py"), command)
+        self.assertIn("--plain", command)
         app._append_log.assert_called_once()
+
+    @mock.patch("himawari_lowram_processor.subprocess.Popen")
+    def test_gui_environment_fix_uses_current_python_with_fix_flag(self, mock_popen):
+        app = object.__new__(h.HimawariProcessorApp)
+        app._append_log = mock.Mock()
+
+        h.HimawariProcessorApp._open_environment_fix(app)
+
+        command = mock_popen.call_args.args[0]
+        self.assertIn(h.sys.executable, command)
+        self.assertIn(str(h.PROJECT_DIR / "check_environment.py"), command)
+        self.assertIn("--fix", command)
+        app._append_log.assert_called_once()
+
+    def test_gui_running_state_disables_mutable_controls(self):
+        app = object.__new__(h.HimawariProcessorApp)
+        app.start_button = FakeWidget()
+        app.stop_button = FakeWidget()
+        app.choose_output_button = FakeWidget()
+        app.choose_temp_button = FakeWidget()
+        app.open_temp_button = FakeWidget()
+        app.open_output_button = FakeWidget()
+        app.check_env_button = FakeWidget()
+        app.quick_fix_button = FakeWidget()
+        app._path_controls = (app.choose_output_button, app.choose_temp_button, app.open_temp_button)
+        app._refresh_mode_state = mock.Mock()
+
+        h.HimawariProcessorApp._set_running(app, True)
+
+        self.assertEqual(app.start_button.configured["state"], "disabled")
+        self.assertEqual(app.stop_button.configured["state"], "normal")
+        self.assertEqual(app.choose_output_button.configured["state"], "disabled")
+        self.assertEqual(app.choose_temp_button.configured["state"], "disabled")
+        self.assertEqual(app.open_output_button.configured["state"], "disabled")
+        self.assertEqual(app.check_env_button.configured["state"], "disabled")
+        self.assertEqual(app.quick_fix_button.configured["state"], "disabled")
+
+        h.HimawariProcessorApp._set_running(app, False)
+
+        self.assertEqual(app.start_button.configured["state"], "normal")
+        self.assertEqual(app.stop_button.configured["state"], "disabled")
+        self.assertEqual(app.choose_output_button.configured["state"], "normal")
+        self.assertEqual(app.choose_temp_button.configured["state"], "normal")
+
+    def test_gui_path_fields_refresh_from_selected_directories(self):
+        app = object.__new__(h.HimawariProcessorApp)
+        app.output_dir_var = FakeVar()
+        app.temp_dir_var = FakeVar()
+
+        original_output = h.OUTPUT_DIR
+        original_temp = h.TEMP_DIR
+        try:
+            h.OUTPUT_DIR = h.Path("C:/Himawari/outputs")
+            h.TEMP_DIR = h.Path("C:/Himawari/temp")
+
+            h.HimawariProcessorApp._refresh_path_fields(app)
+
+            self.assertEqual(app.output_dir_var.get(), str(h.OUTPUT_DIR))
+            self.assertEqual(app.temp_dir_var.get(), str(h.TEMP_DIR))
+        finally:
+            h.OUTPUT_DIR = original_output
+            h.TEMP_DIR = original_temp
 
 
 if __name__ == "__main__":

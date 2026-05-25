@@ -134,7 +134,7 @@ initial settings:
 ```python
 USER_URL = "https://noaa-himawari9.s3.amazonaws.com/..."
 MODE = "Single Image"
-COMPOSITE_CHOICE = "True Color RGB (Enhanced)"
+COMPOSITE_CHOICE = "True Color Reproduction Image"
 IMAGE_FORMAT = "png"
 ```
 

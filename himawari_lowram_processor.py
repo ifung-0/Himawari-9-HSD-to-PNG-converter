@@ -35,7 +35,7 @@ APP_VERSION = "2026.05.25.1"
 APP_DISPLAY_NAME = "Himawari-9 Low-RAM Processor"
 USER_URL = "https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/2024/07/25/0400/HS_H09_20240725_0400_B01_FLDK_R10_S0110.DAT.bz2"
 MODE = "Single Image"  # "Single Image" or "Timelapse"
-COMPOSITE_CHOICE = "True Color RGB (Enhanced)"
+COMPOSITE_CHOICE = "True Color Reproduction Image"
 
 HOURS_BACK = 72
 INTERVAL_MINUTES = 20
@@ -62,6 +62,8 @@ NATIVE_GRID_INDEX_TOLERANCE = 1e-7
 PROJECT_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = PROJECT_DIR / "outputs"
 TEMP_DIR = PROJECT_DIR / "temp"
+CLOUD_SYNC_PREFIXES = ("onedrive", "dropbox", "google drive", "icloud")
+CLOUD_SYNC_EXACT = ("box",)
 
 
 # ---------------------------------------------------------------------------
@@ -2007,6 +2009,144 @@ class QueueLogHandler(logging.Handler):
         self.messages.put(("log", self.format(record)))
 
 
+@dataclass(frozen=True)
+class SetupStatus:
+    ok: bool
+    details: tuple[str, ...]
+    warnings: tuple[str, ...]
+    errors: tuple[str, ...]
+
+    def display_text(self) -> str:
+        lines: list[str] = []
+        if self.errors:
+            lines.append("Fix before starting:")
+            lines.extend(f"- {error}" for error in self.errors)
+        else:
+            lines.append("Ready to start.")
+        if self.details:
+            lines.append("")
+            lines.extend(self.details)
+        if self.warnings:
+            lines.append("")
+            lines.append("Check before long runs:")
+            lines.extend(f"- {warning}" for warning in self.warnings)
+        return "\n".join(lines)
+
+
+def cloud_sync_marker(path: Path) -> str | None:
+    for part in path.expanduser().resolve(strict=False).parts:
+        normalized = part.lower()
+        if normalized in CLOUD_SYNC_EXACT:
+            return part
+        if any(normalized.startswith(prefix) for prefix in CLOUD_SYNC_PREFIXES):
+            return part
+    return None
+
+
+def setup_configuration_errors(config: ProcessorConfig) -> list[str]:
+    errors: list[str] = []
+    if not config.user_url.strip():
+        errors.append("Himawari URL is required.")
+    if config.mode not in {"Single Image", "Timelapse"}:
+        errors.append('Mode must be "Single Image" or "Timelapse".')
+    if config.composite_choice not in COMPOSITE_BANDS:
+        errors.append(f"Unsupported product: {config.composite_choice}")
+    if config.interval_minutes <= 0:
+        errors.append("Interval minutes must be positive.")
+    if config.hours_back <= 0:
+        errors.append("Hours back must be positive.")
+    if config.fps <= 0:
+        errors.append("FPS must be positive.")
+    if config.download_workers <= 0:
+        errors.append("Download workers must be positive.")
+    if config.dask_num_workers <= 0:
+        errors.append("Dask workers must be positive.")
+    if config.ram_limit_gb <= 0:
+        errors.append("RAM limit must be positive.")
+    if config.image_format.lower() not in {"png", "tif", "tiff", "geotiff"}:
+        errors.append('Image format must be "png" or "tif".')
+    if config.timelapse_format.lower() not in {"gif", "mp4"}:
+        errors.append('Timelapse format must be "gif" or "mp4".')
+    if config.resampler.lower() not in {"native", "nearest"}:
+        errors.append('Resampler must be "native" or "nearest".')
+    if config.add_border_lines:
+        try:
+            parse_rgb_color(config.border_line_color)
+        except ValueError as exc:
+            errors.append(str(exc))
+        if config.border_line_width <= 0:
+            errors.append("Border line width must be positive.")
+    return errors
+
+
+def build_setup_status(
+    config: ProcessorConfig,
+    output_dir: Path = OUTPUT_DIR,
+    temp_dir: Path = TEMP_DIR,
+) -> SetupStatus:
+    details: list[str] = []
+    warnings: list[str] = []
+    errors = setup_configuration_errors(config)
+    info: UrlInfo | None = None
+    start: datetime | None = None
+
+    if config.user_url.strip():
+        try:
+            info = parse_url(config.user_url)
+            start = datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
+            details.append(f"Source: {info.area} {info.timestamp}, {info.total_segments} segments per band")
+        except Exception as exc:
+            errors.append(str(exc))
+
+    if config.composite_choice in COMPOSITE_BANDS:
+        bands = required_bands(config.composite_choice, use_night_fallback=config.use_night_fallback)
+        band_list = ", ".join(bands)
+        details.append(f"Product: {config.composite_choice} ({len(bands)} band(s): {band_list})")
+        if info is not None and start is not None:
+            try:
+                frames = len(frame_datetimes(start, config.mode, config.hours_back, config.interval_minutes))
+                total_segments = frames * len(bands) * info.total_segments
+                frame_word = "frame" if frames == 1 else "frames"
+                details.append(f"Download estimate: {total_segments} segment file(s) across {frames} {frame_word}")
+            except Exception as exc:
+                errors.append(str(exc))
+            if (
+                info.area == "FLDK"
+                and config.image_format.lower() == "png"
+                and target_pixel_size_m(config.composite_choice) <= 500
+            ):
+                warnings.append(
+                    "Full-disk 500 m PNG jobs may auto-switch to GeoTIFF for low-RAM writing."
+                )
+
+    if config.add_border_lines:
+        overlay_notes = ["pycoast", "aggdraw", "GSHHS/WDBII shapefiles under overlays/"]
+        missing_packages = [module for module in ("pycoast", "aggdraw") if not has_module(module)]
+        if missing_packages:
+            overlay_notes.append("missing package(s): " + ", ".join(missing_packages))
+        if not (PROJECT_DIR / "overlays").exists():
+            overlay_notes.append("overlays/ folder not found")
+        warnings.append("Border lines require " + "; ".join(overlay_notes) + ".")
+
+    cloud_matches = []
+    for label, path in (("project", PROJECT_DIR), ("output", output_dir), ("temp", temp_dir)):
+        marker = cloud_sync_marker(path)
+        if marker:
+            cloud_matches.append(f"{label}: {path} ({marker})")
+    if cloud_matches:
+        warnings.append(
+            "Cloud-sync path detected; large output/temp writes are safer in local folders. "
+            + "; ".join(cloud_matches)
+        )
+
+    return SetupStatus(
+        ok=not errors,
+        details=tuple(details),
+        warnings=tuple(warnings),
+        errors=tuple(errors),
+    )
+
+
 class HimawariProcessorApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -2040,9 +2180,14 @@ class HimawariProcessorApp:
         self.border_width_var = tk.StringVar(value=str(BORDER_LINE_WIDTH))
         self.status_var = tk.StringVar(value="Ready")
         self.progress_var = tk.DoubleVar(value=0)
+        self.setup_status_var = tk.StringVar(value="")
+        self.output_dir_var = tk.StringVar(value=str(OUTPUT_DIR))
+        self.temp_dir_var = tk.StringVar(value=str(TEMP_DIR))
 
         self._build_ui()
         self._install_log_handler()
+        self._install_setup_watchers()
+        self._update_setup_status()
         self._set_running(False)
         self.root.after(100, self._poll_messages)
 
@@ -2062,6 +2207,7 @@ class HimawariProcessorApp:
         style.configure("Section.TLabelframe", padding=12)
         style.configure("Section.TLabelframe.Label", font=("Segoe UI", 10, "bold"))
         style.configure("Primary.TButton", font=("Segoe UI", 10, "bold"))
+        style.configure("Status.TLabel", justify="left")
 
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(2, weight=1)
@@ -2190,6 +2336,16 @@ class HimawariProcessorApp:
             width=8,
         ).grid(row=4, column=0, sticky="w", pady=(2, 0))
 
+        status_frame = ttk.LabelFrame(settings, text="Setup Status", style="Section.TLabelframe")
+        status_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        status_frame.columnconfigure(0, weight=1)
+        ttk.Label(
+            status_frame,
+            textvariable=self.setup_status_var,
+            style="Status.TLabel",
+            wraplength=960,
+        ).grid(row=0, column=0, sticky="ew")
+
         performance_frame = ttk.LabelFrame(advanced, text="Performance", style="Section.TLabelframe")
         performance_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 10))
         for col in (0, 1):
@@ -2226,11 +2382,37 @@ class HimawariProcessorApp:
             state="readonly",
         ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 10))
 
-        ttk.Button(paths_frame, text="Choose Output Folder", command=self._choose_output_dir).grid(
-            row=2, column=0, sticky="ew", padx=(0, 8), pady=(2, 10)
+        ttk.Label(paths_frame, text="Output Folder").grid(row=2, column=0, columnspan=2, sticky="w")
+        ttk.Entry(paths_frame, textvariable=self.output_dir_var, state="readonly").grid(
+            row=3, column=0, columnspan=2, sticky="ew", pady=(2, 8)
         )
-        ttk.Button(paths_frame, text="Choose Temp Folder", command=self._choose_temp_dir).grid(
-            row=2, column=1, sticky="ew", pady=(2, 10)
+        ttk.Label(paths_frame, text="Temp Folder").grid(row=4, column=0, columnspan=2, sticky="w")
+        ttk.Entry(paths_frame, textvariable=self.temp_dir_var, state="readonly").grid(
+            row=5, column=0, columnspan=2, sticky="ew", pady=(2, 8)
+        )
+        self.choose_output_button = ttk.Button(
+            paths_frame,
+            text="Choose Output Folder",
+            command=self._choose_output_dir,
+        )
+        self.choose_output_button.grid(row=6, column=0, sticky="ew", padx=(0, 8), pady=(2, 8))
+        self.choose_temp_button = ttk.Button(
+            paths_frame,
+            text="Choose Temp Folder",
+            command=self._choose_temp_dir,
+        )
+        self.choose_temp_button.grid(row=6, column=1, sticky="ew", pady=(2, 8))
+        self.open_temp_button = ttk.Button(
+            paths_frame,
+            text="Open Temp Folder",
+            command=self._open_temp_folder,
+        )
+        self.open_temp_button.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+        self._refresh_path_fields()
+        self._path_controls = (
+            self.choose_output_button,
+            self.choose_temp_button,
+            self.open_temp_button,
         )
         self._refresh_mode_state()
 
@@ -2254,15 +2436,61 @@ class HimawariProcessorApp:
         buttons.columnconfigure(0, weight=1)
         self.start_button = ttk.Button(buttons, text="Start Processing", command=self._start, style="Primary.TButton")
         self.start_button.grid(row=0, column=1, padx=(0, 8))
-        self.stop_button = ttk.Button(buttons, text="Stop Processing", command=self._stop_current_task)
+        self.stop_button = ttk.Button(buttons, text="Stop", command=self._stop_current_task)
         self.stop_button.grid(row=0, column=2, padx=(0, 8))
-        ttk.Button(buttons, text="Open Output Folder", command=self._open_output_folder).grid(
+        self.open_output_button = ttk.Button(buttons, text="Open Outputs", command=self._open_output_folder)
+        self.open_output_button.grid(
             row=0, column=3, padx=(0, 8)
         )
-        ttk.Button(buttons, text="Check Environment", command=self._open_environment_check).grid(
+        self.check_env_button = ttk.Button(buttons, text="Check Env", command=self._open_environment_check)
+        self.check_env_button.grid(
             row=0, column=4, padx=(0, 8)
         )
-        ttk.Button(buttons, text="Close", command=self._terminate_app).grid(row=0, column=5)
+        self.quick_fix_button = ttk.Button(buttons, text="Quick Fix", command=self._open_environment_fix)
+        self.quick_fix_button.grid(
+            row=0, column=5, padx=(0, 8)
+        )
+        ttk.Button(buttons, text="Close", command=self._terminate_app).grid(row=0, column=6)
+
+    def _install_setup_watchers(self) -> None:
+        watched_vars = (
+            self.url_var,
+            self.mode_var,
+            self.composite_var,
+            self.hours_var,
+            self.interval_var,
+            self.fps_var,
+            self.download_workers_var,
+            self.dask_workers_var,
+            self.chunk_var,
+            self.ram_limit_var,
+            self.image_format_var,
+            self.resampler_var,
+            self.timelapse_format_var,
+            self.auto_download_var,
+            self.night_fallback_var,
+            self.delete_frames_var,
+            self.quality_fallback_var,
+            self.border_lines_var,
+            self.border_color_var,
+            self.border_width_var,
+        )
+        for watched_var in watched_vars:
+            watched_var.trace_add("write", lambda *_args: self._update_setup_status())
+
+    def _update_setup_status(self) -> SetupStatus:
+        try:
+            config = self._read_config()
+            setup_status = build_setup_status(config, OUTPUT_DIR, TEMP_DIR)
+            self.setup_status_var.set(setup_status.display_text())
+        except Exception as exc:
+            setup_status = SetupStatus(False, (), (), (f"Invalid setup value: {exc}",))
+            self.setup_status_var.set(setup_status.display_text())
+        return setup_status
+
+    def _refresh_path_fields(self) -> None:
+        self.output_dir_var.set(str(OUTPUT_DIR))
+        self.temp_dir_var.set(str(TEMP_DIR))
 
     def _refresh_mode_state(self) -> None:
         is_timelapse = self.mode_var.get() == "Timelapse"
@@ -2274,20 +2502,34 @@ class HimawariProcessorApp:
         self.is_running = running
         self.start_button.configure(state="disabled" if running else "normal")
         self.stop_button.configure(state="normal" if running else "disabled")
+        mutable_state = "disabled" if running else "normal"
+        for widget in getattr(self, "_path_controls", ()):
+            widget.configure(state=mutable_state)
+        for widget in (
+            getattr(self, "open_output_button", None),
+            getattr(self, "check_env_button", None),
+            getattr(self, "quick_fix_button", None),
+        ):
+            if widget is not None:
+                widget.configure(state=mutable_state)
         self._refresh_mode_state()
 
     def _choose_output_dir(self) -> None:
         global OUTPUT_DIR
         selected = filedialog.askdirectory(initialdir=OUTPUT_DIR)
         if selected:
-            OUTPUT_DIR = Path(selected)
+            OUTPUT_DIR = Path(selected).expanduser().resolve()
+            self._refresh_path_fields()
+            self._update_setup_status()
             self._append_log(f"Output folder set to {OUTPUT_DIR}")
 
     def _choose_temp_dir(self) -> None:
         global TEMP_DIR
         selected = filedialog.askdirectory(initialdir=TEMP_DIR)
         if selected:
-            TEMP_DIR = Path(selected)
+            TEMP_DIR = Path(selected).expanduser().resolve()
+            self._refresh_path_fields()
+            self._update_setup_status()
             self._append_log(f"Temp folder set to {TEMP_DIR}")
 
     def _open_output_folder(self) -> None:
@@ -2297,8 +2539,15 @@ class HimawariProcessorApp:
         else:
             messagebox.showinfo("Output folder", str(OUTPUT_DIR))
 
-    def _open_environment_check(self) -> None:
-        command = [sys.executable, str(PROJECT_DIR / "check_environment.py")]
+    def _open_temp_folder(self) -> None:
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        if os.name == "nt":
+            os.startfile(str(TEMP_DIR))
+        else:
+            messagebox.showinfo("Temp folder", str(TEMP_DIR))
+
+    def _open_environment_command(self, args: list[str], label: str) -> None:
+        command = [sys.executable, str(PROJECT_DIR / "check_environment.py"), *args]
         try:
             if os.name == "nt":
                 subprocess.Popen(
@@ -2308,9 +2557,15 @@ class HimawariProcessorApp:
                 )
             else:
                 subprocess.Popen(command, cwd=PROJECT_DIR)
-            self._append_log("Environment check started in a separate console.")
+            self._append_log(f"{label} started in a separate console.")
         except Exception as exc:
-            messagebox.showerror("Environment check failed", str(exc))
+            messagebox.showerror(f"{label} failed", str(exc))
+
+    def _open_environment_check(self) -> None:
+        self._open_environment_command(["--plain"], "Environment check")
+
+    def _open_environment_fix(self) -> None:
+        self._open_environment_command(["--fix"], "Environment quick fix")
 
     def _choose_border_color(self) -> None:
         initial = self.border_color_var.get()
@@ -2351,6 +2606,9 @@ class HimawariProcessorApp:
         try:
             config = self._read_config()
             validate_configuration(config)
+            setup_status = self._update_setup_status()
+            if not setup_status.ok:
+                raise ValueError("\n".join(setup_status.errors))
         except Exception as exc:
             self._append_log(f"Invalid settings: {exc}")
             messagebox.showerror("Invalid settings", str(exc))
