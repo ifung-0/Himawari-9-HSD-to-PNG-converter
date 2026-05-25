@@ -50,6 +50,22 @@ current Python. With `--auto`, it does the same repair automatically and, if
 the active Python is unsupported, tries to create/use a local `.venv` with
 Python 3.12 or 3.13 from the Windows `py` launcher.
 
+## First Thing To Try
+
+If the app fails on another machine, start from the project folder and run:
+
+```powershell
+git pull origin main
+python himawari_cli.py --version
+python check_environment.py --plain
+python check_environment.py --auto
+```
+
+Expected current version: `2026.05.25.1`. If `--version` shows an older value,
+the machine is not running the latest update. If `--plain` reports a different
+Python than the one used to launch the GUI, use `run_gui.bat`, `run_cli.bat`,
+or `check_environment.bat` so the same Python environment is selected.
+
 Launch the GUI:
 
 ```powershell
@@ -122,8 +138,8 @@ COMPOSITE_CHOICE = "True Color RGB (Enhanced)"
 IMAGE_FORMAT = "png"
 ```
 
-Outputs are written to `outputs/`. Temporary DAT files are written under
-`temp/` and cleaned after each frame.
+Outputs are written to `outputs/`. Downloaded `.DAT` files are cached under
+`temp/` for retry reuse. Incomplete `.part` files are cleaned after each frame.
 
 Cancellation is cooperative. Downloads stop at the next streamed chunk or
 request timeout, while Satpy load/resample/save calls finish their current call
@@ -145,27 +161,94 @@ Custom lazy composites:
 
 ## Common Errors and Fixes
 
+### Quick Repair Commands
+
+Use these commands from the project folder before trying a more specific fix:
+
+```powershell
+git pull origin main
+python himawari_cli.py --version
+python check_environment.py --plain
+python check_environment.py --auto
+```
+
+If `check_environment.py --plain` shows optional warnings only, core processing
+can still work. If it shows critical failures, use the Python executable shown
+by the checker when installing or launching the app.
+
+### Wrong version or old files
+
+Symptom: a friend says the fix is installed, but logs do not show:
+
+```text
+App version: 2026.05.25.1
+```
+
+Likely cause: their folder is still on an old commit, or they downloaded a ZIP
+before the latest push.
+
+Quick fix:
+
+```powershell
+cd path\to\Himawari-9-HSD-to-PNG-converter
+git pull origin main
+python himawari_cli.py --version
+```
+
+If they do not use Git, download the latest ZIP from GitHub again, then check
+`python himawari_cli.py --version`.
+
+### GUI or CLI uses the wrong Python
+
+Symptom: requirements were installed, but the app still reports missing Satpy,
+`pyspectral`, `rasterio`, or other packages.
+
+Likely cause: packages were installed into one Python, while the GUI/CLI runs
+with another Python.
+
+Quick fix:
+
+```powershell
+python check_environment.py --plain
+check_environment.bat
+run_gui.bat
+run_cli.bat
+```
+
+If the checker reports Python 3.14 or another unsupported version, run:
+
+```powershell
+python check_environment.py --auto
+```
+
 ### Downloading 50 segments feels slow
 
-Full-disk (`FLDK`) Himawari files are split into 10 scan segments per band.
-True color reproduction needs `B01`, `B02`, `B03`, and `B04`; with night
-fallback enabled the app also downloads `B13`, so one frame can be 50 files.
+Symptom: one full-disk true color frame downloads 40 or 50 files.
 
-For a faster daytime single image, turn off `Use night fallback for day-only
-products` to avoid the extra `B13` band. Already-downloaded complete `.DAT`
-segments are kept after failed or canceled frames, so retrying the same
-timestamp can reuse them.
+Likely cause: full-disk (`FLDK`) Himawari files are split into 10 scan segments
+per band. True color reproduction needs `B01`, `B02`, `B03`, and `B04`; with
+night fallback enabled the app also downloads `B13`.
 
-After pressing `Stop Download`, wait for the canceled message before starting
+Quick fix:
+
+```powershell
+python himawari_cli.py --run --composite "True Color Reproduction Image" --night-fallback no
+```
+
+Or in the GUI, turn off `Use night fallback for day-only products` for faster
+daytime single images. Already-downloaded complete `.DAT` files are kept under
+`temp/`, so retrying the same timestamp can reuse them.
+
+After pressing `Stop Processing`, wait for the canceled message before starting
 again. The app lets active download workers close their `.part` files first so
 Windows does not leave temporary files locked.
 
 ### `No dataset matching 'true_color' found`
 
-Satpy cannot find the AHI true color composite after loading or resampling.
-This is usually an old Satpy install, a broken Satpy config install, or the
-GUI running with a different Python than the one where requirements were
-installed.
+Symptom: the log says Satpy cannot find `true_color`.
+
+Likely cause: old Satpy install, broken Satpy AHI composite config, or the app
+is using the wrong Python environment.
 
 The app now falls back automatically to a custom low-RAM RGB approximation and
 continues writing an output. The log will say:
@@ -176,10 +259,10 @@ Satpy true_color unavailable; using custom low-RAM fallback
 
 Use the checker below if you want to repair the official Satpy composite.
 
-Fix:
+Quick fix:
 
 ```powershell
-python check_environment.py
+python check_environment.py --plain
 python check_environment.py --auto
 python check_environment.py --fix
 ```
@@ -189,10 +272,11 @@ used to launch `himawari_lowram_processor.py`.
 
 ### `Satpy true_color_reproduction unavailable; using custom low-RAM fallback`
 
-That message means the saved image used the app's approximate RGB fallback, not
-official Satpy/JMA true color reproduction. Older app versions could trigger
-that fallback too early because Satpy often creates `true_color_reproduction`
-during resampling from its prerequisite bands.
+Symptom: the saved image does not look like official true color reproduction.
+
+Likely cause: Satpy could not create `true_color_reproduction`, so the app used
+its approximate RGB fallback. That output is useful, but it is not official
+Satpy/JMA true color reproduction.
 
 Update the app first. Current versions let Satpy resample the prerequisites and
 then save the generated `true_color_reproduction` dataset. If Satpy still cannot
@@ -205,9 +289,11 @@ Satpy true_color_reproduction unavailable; using custom low-RAM fallback approxi
 Use the checker below to verify that `pyspectral` and Satpy's AHI composite
 configuration are available to the same Python used by the app.
 
-Fix:
+Quick fix:
 
 ```powershell
+git pull origin main
+python himawari_cli.py --version
 python check_environment.py --plain
 python check_environment.py --auto
 python check_environment.py --fix
@@ -220,13 +306,15 @@ supported `.venv` when Python 3.12/3.13 is installed.
 
 ### True color says `pyspectral` is missing
 
-The official-looking true color composites need `pyspectral`.
+Symptom: official-looking true color reports missing `pyspectral`.
 
-Fix:
+Likely cause: `pyspectral` is not installed in the active Python environment.
+
+Quick fix:
 
 ```powershell
-python install_requirements.py --upgrade
-python check_environment.py
+python check_environment.py --fix
+python check_environment.py --plain
 ```
 
 As a temporary workaround, enable the lower-quality fallback checkbox or choose
@@ -234,43 +322,92 @@ As a temporary workaround, enable the lower-quality fallback checkbox or choose
 
 ### Full-disk PNG changes to GeoTIFF
 
-This is expected for very large outputs, especially 500 m full-disk true color.
-PNG/Pillow has to build a huge image in memory, so the app switches to chunked
-GeoTIFF for low-RAM writing.
+Symptom: image format is set to `png`, but the app saves `.tif`.
 
-Fix: install `rasterio` if GeoTIFF output fails.
+Likely cause: this is expected for very large outputs, especially 500 m
+full-disk true color. PNG/Pillow has to build a huge image in memory, so the
+app switches to chunked GeoTIFF for low-RAM writing.
+
+Quick fix if GeoTIFF output fails:
 
 ```powershell
 python check_environment.py --fix
 ```
 
+Use `Single Image` for full-disk 500 m true color. Use smaller Target areas or
+coarser products for PNG workflows.
+
+### Saving GeoTIFF takes a long time
+
+Symptom: the GUI status stays on `Saving ... .tif` for 10 minutes or longer.
+
+Likely cause: full-disk 500 m true color is about 484 million pixels. Satpy and
+Dask do much of the real composite calculation during save, so the output file
+may stay small until computation finishes.
+
+Quick fix:
+
+```powershell
+python himawari_cli.py --run --composite "B13 (Infrared Window)" --image-format tif
+```
+
+If the quick B13 test works, the original true color job is probably just heavy.
+For faster true color tests, use a Target area URL such as `R301` instead of
+full-disk `FLDK`.
+
+### OneDrive or cloud sync makes saving slow
+
+Symptom: large `.tif` saves are much slower in a synced Desktop/OneDrive folder.
+
+Likely cause: cloud sync scans or uploads the large GeoTIFF while Satpy/rasterio
+is still writing it.
+
+Quick fix:
+
+```powershell
+python himawari_cli.py --menu
+```
+
+In the menu, set output and temp folders to local non-synced folders such as:
+
+```text
+C:\Himawari\outputs
+C:\Himawari\temp
+```
+
 ### Timelapse finishes with no GIF/MP4
 
-This usually means all frames failed or were unavailable. Check the log panel
-for the first frame error. Common causes are invalid timestamps, missing NOAA
-segments, or unsupported composites in the active Satpy environment.
+Symptom: processing ends but no GIF/MP4 is created.
+
+Likely cause: all frames failed or were unavailable. Common causes are invalid
+timestamps, missing NOAA segments, or unsupported composites in the active
+Satpy environment.
 
 Full-disk 500 m true-color timelapses are intentionally rejected when the app
 would need GeoTIFF frame output. GIF/MP4 assembly has to read every finished
 frame into memory, which is not low-RAM at full-disk true-color size.
 
-Fix:
+Quick fix:
 
 ```powershell
-python check_environment.py
+python check_environment.py --plain
+python himawari_cli.py --run --mode Timelapse --composite "B13 (Infrared Window)" --hours-back 2 --interval-minutes 60 --timelapse-format gif
 ```
 
-Then try a simple timelapse with `B13 (Infrared Window)`, `gif`, and a short
-time range before using heavier true color products. Use `Single Image` for
-full-disk 500 m true-color GeoTIFF output.
+If B13 works, use `Single Image` for full-disk 500 m true-color GeoTIFF output
+or switch to a smaller Target area for true-color timelapses.
 
 ### Single image says failed and no output was created
 
-Older builds could show a final "Done" dialog with an empty output list after
-the only frame failed. Current builds report this as a failure. Check the log
-panel for the first `Frame failed` message, then run:
+Symptom: the GUI reports failure and no image appears in `outputs/`.
+
+Likely cause: the only requested frame failed. Check the log panel for the
+first `Frame failed` message.
+
+Quick fix:
 
 ```powershell
+git pull origin main
 python check_environment.py --auto
 ```
 
@@ -281,29 +418,39 @@ grid needed by the selected product, so 500 m true color uses the B03 grid
 instead of a B13-derived grid. Avoid changing the resampler to bilinear for
 full-disk low-RAM work.
 
-Fix:
+Quick fix:
 
 ```powershell
-git pull
+git pull origin main
+python himawari_cli.py --version
 python -m unittest discover -s tests
 ```
 
 ### Downloads are slow, stuck, or partially written
 
-Large full-disk products need many compressed NOAA segments. Use `Stop
-Download` to cancel safely. Partial `.part` files are cleaned up automatically,
-while complete `.DAT` files are kept for retry reuse.
+Symptom: downloads take a long time, stop midway, or leave `.part` files.
 
-Fix: retry the same timestamp, lower the download worker count if the network
-is unstable, or test with a single low-resolution band like `B13`.
+Likely cause: large full-disk products need many compressed NOAA segments, and
+unstable networks can interrupt workers.
+
+Quick fix:
+
+```powershell
+python himawari_cli.py --run --composite "B13 (Infrared Window)" --download-workers 1
+```
+
+Retry the same timestamp to reuse completed `.DAT` files. Partial `.part` files
+are cleaned up automatically.
 
 ### Border overlays do not draw
 
-Overlay rendering needs `pycoast`, `aggdraw`, and compatible coastline/border
-shapefiles. The Python packages are installed by requirements, but shapefile
-data may still need to be placed under `overlays/`.
+Symptom: coastline/country borders are missing or the log says overlay failed.
 
-Fix:
+Likely cause: overlay rendering needs `pycoast`, `aggdraw`, and compatible
+coastline/border shapefiles. The Python packages are installed by requirements,
+but shapefile data may still need to be placed under `overlays/`.
+
+Quick fix:
 
 ```powershell
 python check_environment.py --fix
@@ -314,10 +461,12 @@ folder.
 
 ### MP4 output falls back to GIF
 
-MP4 writing needs `imageio-ffmpeg`. If it is missing, the app logs a warning
-and writes a GIF instead.
+Symptom: timelapse format is set to MP4, but a GIF is written.
 
-Fix:
+Likely cause: MP4 writing needs `imageio-ffmpeg`. If it is missing, the app
+logs a warning and writes a GIF instead.
+
+Quick fix:
 
 ```powershell
 python check_environment.py --fix
@@ -325,9 +474,11 @@ python check_environment.py --fix
 
 ### `URL not recognised`
 
-The app expects a NOAA AWS AHI object URL or NOAA AWS index URL. Make sure the
-URL includes an AHI-L1b area (`FLDK`, `Target`, or `Japan`), timestamp, band,
-resolution, and segment pattern.
+Symptom: the app rejects the URL before downloading.
+
+Likely cause: the app expects a NOAA AWS AHI object URL or NOAA AWS index URL.
+Make sure the URL includes an AHI-L1b area (`FLDK`, `Target`, or `Japan`),
+timestamp, band, resolution, and segment pattern.
 
 Example object URL:
 
