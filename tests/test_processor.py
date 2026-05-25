@@ -12,6 +12,11 @@ import himawari_lowram_processor as h
 
 
 class ProcessorTests(unittest.TestCase):
+    def test_app_version_label(self):
+        self.assertRegex(h.APP_VERSION, r"^\d{4}\.\d{2}\.\d{2}\.\d+$")
+        self.assertIn(h.APP_VERSION, h.app_version_label())
+        self.assertIn(h.APP_DISPLAY_NAME, h.app_version_label())
+
     def test_parse_url(self):
         info = h.parse_url(h.USER_URL)
         self.assertEqual(info.root, "https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/")
@@ -1134,6 +1139,19 @@ class ProcessorTests(unittest.TestCase):
             h.area_compatibility_bands("True Color Reproduction Image"),
         )
         self.assertNotIn("B13", mock_common_area.call_args.kwargs["compatibility_bands"])
+
+    @mock.patch("himawari_lowram_processor.process_frame")
+    @mock.patch("himawari_lowram_processor.validate_runtime_dependencies")
+    @mock.patch("himawari_lowram_processor.common_area_from_frames")
+    def test_run_logs_app_version(self, mock_common_area, _mock_validate, mock_process):
+        config = h.default_config()
+        mock_common_area.return_value = mock.Mock(width=10, height=10)
+        mock_process.return_value = h.Path("out.png")
+
+        with self.assertLogs(h.LOG, level="INFO") as captured:
+            h.run(config)
+
+        self.assertTrue(any(f"App version: {h.APP_VERSION}" in message for message in captured.output))
 
     @mock.patch("himawari_lowram_processor.process_frame")
     @mock.patch("himawari_lowram_processor.validate_runtime_dependencies")

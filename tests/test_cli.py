@@ -1,4 +1,5 @@
 import argparse
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -99,6 +100,15 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         mock_run_processor.assert_called_once()
+
+    def test_main_version_prints_app_version(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            with self.assertRaises(SystemExit) as raised:
+                cli.main(["--version"])
+
+        self.assertEqual(raised.exception.code, 0)
+        self.assertIn(processor.APP_VERSION, stdout.getvalue())
+        self.assertIn(processor.APP_DISPLAY_NAME, stdout.getvalue())
 
 
 if __name__ == "__main__":

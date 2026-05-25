@@ -3,6 +3,7 @@ from io import StringIO
 from unittest import mock
 
 import check_environment as env
+import himawari_lowram_processor as processor
 
 
 class FakeDataID:
@@ -19,6 +20,21 @@ class EnvironmentCheckTests(unittest.TestCase):
     def test_version_tuple_parses_numeric_prefix(self):
         self.assertGreaterEqual(env.version_tuple("0.60.0"), (0, 60))
         self.assertEqual(env.version_tuple("1.2.3rc1"), (1, 2, 3))
+
+    def test_app_version_result_uses_processor_version(self):
+        result = env.check_app_version()
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.name, "app version")
+        self.assertIn(processor.APP_VERSION, result.detail)
+
+    def test_banner_prints_app_version(self):
+        with mock.patch("sys.stdout", new_callable=StringIO) as stdout:
+            env.print_banner()
+
+        output = stdout.getvalue()
+        self.assertIn("App:", output)
+        self.assertIn(processor.APP_VERSION, output)
 
     def test_pip_install_command_uses_current_python_and_requirements(self):
         command = env.pip_install_command(upgrade=True)

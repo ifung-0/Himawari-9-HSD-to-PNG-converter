@@ -93,6 +93,19 @@ python himawari_cli.py --run --composite "B13 (Infrared Window)" --mode "Single 
 Windows helper launchers prefer `.venv\Scripts\python.exe` when it exists,
 then `py -3.13`, `py -3.12`, and finally `python`.
 
+Verify the installed app version:
+
+```powershell
+python himawari_cli.py --version
+python check_environment.py --plain
+```
+
+Current fixed build: `2026.05.25.1`. Processing logs should include:
+
+```text
+App version: 2026.05.25.1
+```
+
 For official-looking true color and true color reproduction, keep the
 lower-quality fallback checkbox off and make sure `pyspectral` is installed in
 the same Python environment that launches the GUI. `install_requirements.py`

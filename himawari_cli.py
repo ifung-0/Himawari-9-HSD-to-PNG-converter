@@ -48,6 +48,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--menu", action="store_true", help="Open the interactive CLI menu.")
     parser.add_argument("--run", action="store_true", help="Run once with the provided options.")
     parser.add_argument("--check-env", action="store_true", help="Run check_environment.py before any processing.")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=processor.app_version_label(),
+        help="Show the app version and exit.",
+    )
     parser.add_argument("--output-dir", help="Folder for final outputs.")
     parser.add_argument("--temp-dir", help="Folder for downloaded DAT files and temporary frame data.")
 
@@ -251,7 +257,7 @@ def run_processor(config: processor.ProcessorConfig) -> list[Path]:
 def interactive_menu(config: processor.ProcessorConfig) -> int:
     while True:
         print()
-        print("Himawari-9 Low-RAM Processor CLI")
+        print(f"{processor.app_version_label()} CLI")
         print("--------------------------------")
         print("1. Review current settings")
         print("2. Edit basic settings")

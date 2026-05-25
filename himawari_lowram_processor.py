@@ -31,6 +31,8 @@ from satpy import Scene
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+APP_VERSION = "2026.05.25.1"
+APP_DISPLAY_NAME = "Himawari-9 Low-RAM Processor"
 USER_URL = "https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/2024/07/25/0400/HS_H09_20240725_0400_B01_FLDK_R10_S0110.DAT.bz2"
 MODE = "Single Image"  # "Single Image" or "Timelapse"
 COMPOSITE_CHOICE = "True Color RGB (Enhanced)"
@@ -278,6 +280,10 @@ def check_cancel(cancel_event: threading.Event | None) -> None:
 
 def default_config() -> ProcessorConfig:
     return ProcessorConfig()
+
+
+def app_version_label() -> str:
+    return f"{APP_DISPLAY_NAME} {APP_VERSION}"
 
 
 def configure_logging() -> None:
@@ -1926,6 +1932,7 @@ def run(
     configure_logging()
     validate_configuration(config)
     check_cancel(cancel_event)
+    LOG.info("App version: %s", APP_VERSION)
     configure_dask(config)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -2003,7 +2010,7 @@ class QueueLogHandler(logging.Handler):
 class HimawariProcessorApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Himawari-9 Low-RAM Processor")
+        self.root.title(f"{APP_DISPLAY_NAME} v{APP_VERSION}")
         self.root.geometry("1060x800")
         self.root.minsize(920, 680)
         self.messages: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -2061,7 +2068,7 @@ class HimawariProcessorApp:
 
         title = ttk.Label(
             self.root,
-            text="Himawari-9 Low-RAM Imagery Processor",
+            text=f"{APP_DISPLAY_NAME} v{APP_VERSION}",
             style="Title.TLabel",
         )
         title.grid(row=0, column=0, sticky="w", padx=16, pady=(14, 6))
@@ -2353,7 +2360,7 @@ class HimawariProcessorApp:
         self.status_var.set("Starting")
         self.cancel_event.clear()
         self._set_running(True)
-        self._append_log("Starting processing")
+        self._append_log(f"Starting processing - version {APP_VERSION}")
 
         self.worker = threading.Thread(target=self._run_worker, args=(config,), daemon=True)
         self.worker.start()

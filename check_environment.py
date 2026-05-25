@@ -13,6 +13,7 @@ from pathlib import Path
 PROJECT_DIR = Path(__file__).resolve().parent
 REQUIREMENTS_FILE = PROJECT_DIR / "requirements.txt"
 VENV_DIR = PROJECT_DIR / ".venv"
+APP_IMPORT_NAME = "himawari_lowram_processor"
 MIN_SATPY_VERSION = (0, 60)
 SUPPORTED_PYTHON_MAJOR = 3
 SUPPORTED_PYTHON_MINOR_MIN = 12
@@ -394,6 +395,17 @@ def check_project_import() -> CheckResult:
     )
 
 
+def check_app_version() -> CheckResult:
+    try:
+        import himawari_lowram_processor as app
+    except Exception as exc:
+        return CheckResult("app version", False, f"failed to import {APP_IMPORT_NAME}: {exc}")
+    version = getattr(app, "APP_VERSION", None)
+    if version:
+        return CheckResult("app version", True, f"{app.app_version_label()}")
+    return CheckResult("app version", False, "APP_VERSION is missing")
+
+
 def run_checks() -> list[CheckResult]:
     python_ok = supported_python_version()
     results = [
@@ -414,6 +426,7 @@ def run_checks() -> list[CheckResult]:
     results.append(check_satpy_version())
     results.extend(check_satpy_ahi_configs())
     results.append(check_satpy_true_color_registry())
+    results.append(check_app_version())
     results.append(check_project_import())
     results.append(check_project_true_color_fallback_runtime())
     return results
@@ -449,6 +462,12 @@ def status_label(result: CheckResult) -> str:
 
 def print_banner() -> None:
     print("Himawari-9 processor environment check")
+    try:
+        import himawari_lowram_processor as app
+
+        print(f"App:     {app.app_version_label()}")
+    except Exception:
+        print("App:     unavailable")
     print(f"Project: {PROJECT_DIR}")
     print(f"Python:  {sys.executable}")
     print()
