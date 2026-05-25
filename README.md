@@ -33,7 +33,8 @@ Install dependencies first:
 python install_requirements.py
 ```
 
-If true color reproduction fails with a Satpy error like
+If true color fails with a Satpy error like
+`No dataset matching 'true_color' found` or
 `No dataset matching 'true_color_reproduction' found`, run the environment
 checker with the same Python that launches the GUI:
 
@@ -127,11 +128,37 @@ After pressing `Stop Download`, wait for the canceled message before starting
 again. The app lets active download workers close their `.part` files first so
 Windows does not leave temporary files locked.
 
+### `No dataset matching 'true_color' found`
+
+Satpy cannot find the AHI true color composite after loading or resampling.
+This is usually an old Satpy install, a broken Satpy config install, or the
+GUI running with a different Python than the one where requirements were
+installed.
+
+The app now falls back automatically to a custom low-RAM RGB approximation and
+continues writing an output. The log will say:
+
+```text
+Satpy true_color unavailable; using custom low-RAM fallback
+```
+
+Use the checker below if you want to repair the official Satpy composite.
+
+Fix:
+
+```powershell
+python check_environment.py
+python check_environment.py --auto
+python check_environment.py --fix
+```
+
+If it still fails, check that the reported Python executable is the same one
+used to launch `himawari_lowram_processor.py`.
+
 ### `No dataset matching 'true_color_reproduction' found`
 
-Satpy cannot find the AHI true color reproduction composite. This is usually
-an old Satpy install, a broken Satpy config install, or the GUI running with a
-different Python than the one where requirements were installed.
+Satpy cannot find the AHI true color reproduction composite. This has the same
+common causes as the `true_color` error above.
 
 The app now falls back automatically to a custom low-RAM RGB approximation and
 continues writing an output. The log will say:
@@ -213,9 +240,10 @@ python check_environment.py --auto
 
 ### `Aggregation factors are not integers` or `Expand factor must be a whole number`
 
-Use the latest app version. Timelapse target areas are now snapped to a native
-B13 grid before Satpy native resampling. Avoid changing the resampler to
-bilinear for full-disk low-RAM work.
+Use the latest app version. Target areas are now snapped to the finest native
+grid needed by the selected product, so 500 m true color uses the B03 grid
+instead of a B13-derived grid. Avoid changing the resampler to bilinear for
+full-disk low-RAM work.
 
 Fix:
 

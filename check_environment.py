@@ -17,7 +17,10 @@ MIN_SATPY_VERSION = (0, 60)
 SUPPORTED_PYTHON_MAJOR = 3
 SUPPORTED_PYTHON_MINOR_MIN = 12
 SUPPORTED_PYTHON_MINOR_MAX = 13
+TRUE_COLOR = "true_color"
+TRUE_COLOR_UI = "True Color RGB (Enhanced)"
 TRUE_COLOR_REPRODUCTION = "true_color_reproduction"
+TRUE_COLOR_REPRODUCTION_UI = "True Color Reproduction Image"
 
 
 @dataclass(frozen=True)
@@ -111,6 +114,15 @@ def satpy_config_file(*parts: str) -> Path | None:
     if package_dir is None:
         return None
     return package_dir.joinpath("etc", *parts)
+
+
+def satpy_config_environment_detail() -> str:
+    values = []
+    for name in ("SATPY_CONFIG_PATH", "PPP_CONFIG_DIR"):
+        value = os.environ.get(name)
+        if value:
+            values.append(f"{name}={value}")
+    return "; ".join(values) if values else "no custom Satpy config environment variables"
 
 
 def pip_install_command(upgrade: bool = True, python_executable: str | Path | None = None) -> list[str]:
@@ -260,24 +272,124 @@ def check_satpy_ahi_configs() -> list[CheckResult]:
     return results
 
 
+def satpy_compositor_names_for_sensor(sensor: str = "ahi") -> set[str]:
+    from satpy.composites.config_loader import load_compositor_configs_for_sensors
+
+    composites, _modifiers = load_compositor_configs_for_sensors({sensor})
+    sensor_composites = composites.get(sensor, {})
+    names = set()
+    for data_id in sensor_composites:
+        try:
+            names.add(data_id["name"])
+        except Exception:
+            names.add(getattr(data_id, "name", str(data_id)))
+    return names
+
+
+def check_satpy_true_color_registry() -> CheckResult:
+    try:
+        names = satpy_compositor_names_for_sensor("ahi")
+    except Exception as exc:
+        return CheckResult(
+            "Satpy parsed true_color_reproduction",
+            False,
+            f"could not parse active Satpy AHI compositor configs: {exc}; {satpy_config_environment_detail()}",
+            critical=False,
+        )
+
+    if TRUE_COLOR_REPRODUCTION in names:
+        return CheckResult(
+            "Satpy parsed true_color_reproduction",
+            True,
+            f"available in active Satpy compositor registry; {satpy_config_environment_detail()}",
+            critical=False,
+        )
+    matching = ", ".join(sorted(name for name in names if "true_color" in name)) or "none"
+    return CheckResult(
+        "Satpy parsed true_color_reproduction",
+        False,
+        (
+            f"{TRUE_COLOR_REPRODUCTION!r} was not found in Satpy's parsed AHI compositor registry. "
+            f"Other true_color entries: {matching}. {satpy_config_environment_detail()}. "
+            "The app will use its custom low-RAM fallback for this product."
+        ),
+        critical=False,
+    )
+
+
+def check_project_true_color_fallback_runtime() -> CheckResult:
+    try:
+        import himawari_lowram_processor as app
+    except Exception as exc:
+        return CheckResult("project true color fallback runtime", False, f"project import failed: {exc}")
+
+    products = (
+        (TRUE_COLOR_UI, TRUE_COLOR),
+        (TRUE_COLOR_REPRODUCTION_UI, TRUE_COLOR_REPRODUCTION),
+    )
+    missing_routes = []
+    for ui_name, satpy_name in products:
+        missing_exc = KeyError(f"\"No dataset matching 'DataQuery(name='{satpy_name}')' found\"")
+        mapped_name = app.SATPY_COMPOSITE_NAMES.get(ui_name)
+        has_custom_name = ui_name in app.CUSTOM_DATASET_NAMES
+        detects_missing = bool(
+            mapped_name
+            and has_custom_name
+            and app.use_custom_satpy_missing_dataset_fallback(
+                missing_exc,
+                ui_name,
+                mapped_name,
+            )
+        )
+        if not detects_missing:
+            missing_routes.append(f"{ui_name} -> {satpy_name}")
+
+    if not missing_routes:
+        return CheckResult(
+            "project true color fallback runtime",
+            True,
+            "missing Satpy true_color and true_color_reproduction errors are routed to custom low-RAM fallbacks",
+        )
+    return CheckResult(
+        "project true color fallback runtime",
+        False,
+        "missing Satpy dataset errors would not be caught by the app fallback for: "
+        + ", ".join(missing_routes),
+    )
+
+
 def check_project_import() -> CheckResult:
     try:
         import himawari_lowram_processor as app
     except Exception as exc:
         return CheckResult("project import", False, f"failed to import himawari_lowram_processor: {exc}")
 
-    mapped_name = app.SATPY_COMPOSITE_NAMES.get("True Color Reproduction Image")
-    has_fallback = "True Color Reproduction Image" in app.CUSTOM_DATASET_NAMES
-    if mapped_name == TRUE_COLOR_REPRODUCTION and has_fallback:
+    expected = {
+        TRUE_COLOR_UI: TRUE_COLOR,
+        TRUE_COLOR_REPRODUCTION_UI: TRUE_COLOR_REPRODUCTION,
+    }
+    mismatches = [
+        f"{ui_name}: expected {satpy_name!r}, found {app.SATPY_COMPOSITE_NAMES.get(ui_name)!r}"
+        for ui_name, satpy_name in expected.items()
+        if app.SATPY_COMPOSITE_NAMES.get(ui_name) != satpy_name
+    ]
+    missing_fallbacks = [
+        ui_name
+        for ui_name in expected
+        if ui_name not in app.CUSTOM_DATASET_NAMES
+        or ui_name not in app.CUSTOM_SATPY_MISSING_DATASET_FALLBACKS
+    ]
+    if not mismatches and not missing_fallbacks:
         return CheckResult(
             "project true color mapping",
             True,
-            f"maps to {mapped_name!r}; custom fallback available",
+            "true_color and true_color_reproduction mappings have custom fallbacks available",
         )
+    details = mismatches + [f"missing custom fallback for {name}" for name in missing_fallbacks]
     return CheckResult(
         "project true color mapping",
         False,
-        f"expected {TRUE_COLOR_REPRODUCTION!r} with custom fallback, found {mapped_name!r}",
+        "; ".join(details),
     )
 
 
@@ -300,7 +412,9 @@ def run_checks() -> list[CheckResult]:
     results.extend(check_packages())
     results.append(check_satpy_version())
     results.extend(check_satpy_ahi_configs())
+    results.append(check_satpy_true_color_registry())
     results.append(check_project_import())
+    results.append(check_project_true_color_fallback_runtime())
     return results
 
 

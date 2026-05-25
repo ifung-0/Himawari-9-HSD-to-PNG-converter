@@ -4,6 +4,16 @@ from unittest import mock
 import check_environment as env
 
 
+class FakeDataID:
+    def __init__(self, name):
+        self.name = name
+
+    def __getitem__(self, key):
+        if key == "name":
+            return self.name
+        raise KeyError(key)
+
+
 class EnvironmentCheckTests(unittest.TestCase):
     def test_version_tuple_parses_numeric_prefix(self):
         self.assertGreaterEqual(env.version_tuple("0.60.0"), (0, 60))
@@ -112,6 +122,44 @@ class EnvironmentCheckTests(unittest.TestCase):
         self.assertFalse(reproduction.ok)
         self.assertFalse(reproduction.critical)
         self.assertIn("custom low-RAM fallback", reproduction.detail)
+
+    @mock.patch("check_environment.satpy_compositor_names_for_sensor")
+    def test_parsed_registry_reports_true_color_reproduction_available(self, mock_names):
+        mock_names.return_value = {"true_color", "true_color_reproduction"}
+
+        result = env.check_satpy_true_color_registry()
+
+        self.assertTrue(result.ok)
+        self.assertIn("available", result.detail)
+
+    @mock.patch.dict("check_environment.os.environ", {"SATPY_CONFIG_PATH": "C:/custom/satpy"}, clear=True)
+    @mock.patch("check_environment.satpy_compositor_names_for_sensor")
+    def test_parsed_registry_warns_when_true_color_reproduction_missing(self, mock_names):
+        mock_names.return_value = {"true_color", "true_color_nocorr"}
+
+        result = env.check_satpy_true_color_registry()
+
+        self.assertFalse(result.ok)
+        self.assertFalse(result.critical)
+        self.assertIn("parsed AHI compositor registry", result.detail)
+        self.assertIn("SATPY_CONFIG_PATH=C:/custom/satpy", result.detail)
+
+    def test_satpy_compositor_names_extracts_data_id_name(self):
+        with mock.patch(
+            "satpy.composites.config_loader.load_compositor_configs_for_sensors",
+            return_value=({"ahi": {FakeDataID("true_color_reproduction"): object()}}, {}),
+        ):
+            names = env.satpy_compositor_names_for_sensor("ahi")
+
+        self.assertIn("true_color_reproduction", names)
+
+    def test_project_true_color_fallback_runtime_catches_missing_satpy_dataset(self):
+        result = env.check_project_true_color_fallback_runtime()
+
+        self.assertTrue(result.ok)
+        self.assertIn("custom low-RAM fallback", result.detail)
+        self.assertIn("true_color", result.detail)
+        self.assertIn("true_color_reproduction", result.detail)
 
 
 if __name__ == "__main__":

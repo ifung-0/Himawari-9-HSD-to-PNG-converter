@@ -67,6 +67,13 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(h.target_pixel_size_m("B01 (Blue Visible)"), 1000)
         self.assertEqual(h.target_pixel_size_m("Day Snow-Fog RGB"), 500)
 
+    def test_area_reference_band_uses_finest_product_band(self):
+        self.assertEqual(h.area_reference_band("True Color Reproduction Image"), "B03")
+        self.assertEqual(h.area_reference_band("True Color RGB (Enhanced)"), "B03")
+        self.assertEqual(h.area_reference_band("Natural Color RGB"), "B03")
+        self.assertEqual(h.area_reference_band("B13 (Infrared Window)"), "B13")
+        self.assertEqual(h.area_reference_band("Day Microphysics RGB"), "B04")
+
     def test_worker_clamps(self):
         self.assertEqual(h.clamp_download_workers(14), 4)
         self.assertEqual(h.clamp_download_workers(0), 1)
@@ -94,6 +101,29 @@ class ProcessorTests(unittest.TestCase):
             h.select_active_composite("Night Microphysics RGB", True, use_night_fallback=True),
             "Night Microphysics RGB",
         )
+
+    def test_coarse_sample_area_caps_large_full_disk(self):
+        projection = {"proj": "geos", "lon_0": 140.7, "h": 35785863, "a": 6378137, "b": 6356752.31414}
+        area = AreaDefinition(
+            "full",
+            "Full Disk",
+            "full",
+            projection,
+            22000,
+            22000,
+            (-5_500_000, -5_500_000, 5_500_000, 5_500_000),
+        )
+
+        sample = h.coarse_sample_area(area)
+
+        self.assertLessEqual(sample.width, h.NIGHT_CHECK_SAMPLE_PIXELS)
+        self.assertLessEqual(sample.height, h.NIGHT_CHECK_SAMPLE_PIXELS)
+        self.assertEqual(sample.area_extent, area.area_extent)
+
+    def test_coarse_sample_area_keeps_small_area(self):
+        area = mock.Mock(width=128, height=96)
+
+        self.assertIs(h.coarse_sample_area(area), area)
 
     def test_output_filename(self):
         info = h.parse_url(h.USER_URL)
@@ -177,10 +207,43 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(sandwich.attrs["mode"], "RGB")
         self.assertEqual(true_color_repro.attrs["mode"], "RGB")
         self.assertNotIn("calibration", sandwich.attrs)
+        self.assertNotIn("calibration", true_color_repro.attrs)
         self.assertEqual(sandwich.dims[0], "bands")
         self.assertEqual(heavy.shape, (3, 4, 4))
         self.assertEqual(snow_fog.shape, (3, 4, 4))
         self.assertEqual(true_color_repro.shape, (3, 4, 4))
+
+    def test_true_color_reproduction_fallback_balanced_enhancement(self):
+        attrs = {"area": "dummy", "sensor": "ahi", "calibration": "reflectance"}
+        b01 = xr.DataArray(da.from_array([[18.0, 22.0], [26.0, 30.0]], chunks=(1, 2)), dims=("y", "x"), attrs=attrs)
+        b02 = xr.DataArray(da.from_array([[30.0, 38.0], [46.0, 54.0]], chunks=(1, 2)), dims=("y", "x"), attrs=attrs)
+        b03 = xr.DataArray(da.from_array([[42.0, 50.0], [58.0, 66.0]], chunks=(1, 2)), dims=("y", "x"), attrs=attrs)
+        b04 = xr.DataArray(da.from_array([[36.0, 44.0], [52.0, 60.0]], chunks=(1, 2)), dims=("y", "x"), attrs=attrs)
+
+        enhanced = h.create_true_color_reproduction_fallback(b01, b02, b03, b04)
+        flat_red = h.scale_reflectance(b03, max_value=100.0, gamma=1.25)
+        flat_green = h.xr_clip(
+            h.scale_reflectance(b02, max_value=100.0, gamma=1.18) * 0.58
+            + h.scale_reflectance(b03, max_value=100.0, gamma=1.2) * 0.30
+            + h.scale_reflectance(b04, max_value=100.0, gamma=1.15) * 0.12,
+            0.0,
+            1.0,
+        )
+        flat_blue = h.scale_reflectance(b01, max_value=100.0, gamma=1.2)
+        old_flat = h.rgb_dataarray(flat_red, flat_green, flat_blue, name="old", standard_name="old")
+
+        enhanced_values = enhanced.compute()
+        old_values = old_flat.compute()
+
+        self.assertIsInstance(enhanced.data, da.Array)
+        self.assertEqual(enhanced.dtype, h.np.uint8)
+        self.assertEqual(enhanced.shape, (3, 2, 2))
+        self.assertNotIn("calibration", enhanced.attrs)
+        self.assertGreaterEqual(int(enhanced_values.min()), 0)
+        self.assertLessEqual(int(enhanced_values.max()), 255)
+        self.assertFalse(bool((enhanced_values.sel(bands="R") == enhanced_values.sel(bands="G")).all()))
+        self.assertFalse(bool((enhanced_values.sel(bands="G") == enhanced_values.sel(bands="B")).all()))
+        self.assertFalse(bool((enhanced_values == old_values).all()))
 
     def test_all_single_band_products_build_lazy_uint8_rgb(self):
         attrs = {"area": "dummy", "sensor": "ahi"}
@@ -216,6 +279,27 @@ class ProcessorTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             h.validate_configuration(config)
 
+    def test_config_validation_rejects_bad_user_inputs(self):
+        bad_values = [
+            ("user_url", "   ", "Himawari URL"),
+            ("mode", "Movie", "MODE"),
+            ("composite_choice", "Not a product", "Unsupported"),
+            ("interval_minutes", 0, "INTERVAL_MINUTES"),
+            ("hours_back", 0, "HOURS_BACK"),
+            ("fps", 0, "FPS"),
+            ("dask_num_workers", 0, "Dask workers"),
+            ("ram_limit_gb", 0, "RAM limit"),
+            ("image_format", "jpg", "IMAGE_FORMAT"),
+            ("timelapse_format", "avi", "TIMELAPSE_FORMAT"),
+            ("resampler", "bilinear", "RESAMPLER"),
+        ]
+        for field, value, message in bad_values:
+            with self.subTest(field=field):
+                config = h.default_config()
+                setattr(config, field, value)
+                with self.assertRaisesRegex(ValueError, message):
+                    h.validate_configuration(config)
+
     def test_low_ram_resampler_rejects_bilinear(self):
         config = h.default_config()
         config.resampler = "bilinear"
@@ -236,6 +320,142 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(target.height % factor, 0)
         for area in (first, shifted):
             self.assertEqual(h.area_slice_shape(area, target), (b13_height, b13_width))
+
+    def test_native_compatibility_detects_fldk_b13_derived_500m_mismatch(self):
+        projection = {"proj": "geos", "lon_0": 140.7, "h": 35785863, "a": 6378137, "b": 6356752.3}
+        b01 = AreaDefinition(
+            "b01",
+            "b01",
+            "b01",
+            projection,
+            11000,
+            11000,
+            (-5500000.035542117, -5500000.035542117, 5500000.035542117, 5500000.035542117),
+        )
+        b03 = AreaDefinition(
+            "b03",
+            "b03",
+            "b03",
+            projection,
+            22000,
+            22000,
+            (-5499999.968358421, -5499999.968358421, 5499999.968358421, 5499999.968358421),
+        )
+        b13 = AreaDefinition(
+            "b13",
+            "b13",
+            "b13",
+            projection,
+            5500,
+            5500,
+            (-5499999.901174725, -5499999.901174725, 5499999.901174725, 5499999.901174725),
+        )
+        band_areas = {"B01": b01, "B02": b01, "B03": b03, "B04": b01, "B13": b13}
+
+        b13_target = h.native_compatible_common_area([b13], 500)
+        b03_target = h.native_compatible_common_area([b03], 500, source_pixel_size_m=500)
+
+        self.assertIn("B03", h.native_area_compatibility_error(band_areas, b13_target))
+        self.assertIsNone(h.native_area_compatibility_error(band_areas, b03_target))
+
+    def test_native_common_area_refines_r301_target_for_visible_band_compatibility(self):
+        projection = {"proj": "geos", "lon_0": 140.7, "h": 35785863, "a": 6378137, "b": 6356752.31414}
+        frame_extents = [
+            (
+                "20250801_2020",
+                (-350000.002, 3080000.020, 650000.004, 4080000.026),
+                (-349999.998, 3079999.982, 649999.996, 4079999.977),
+            ),
+            (
+                "20250801_2220",
+                (-350000.002, 3080000.020, 650000.004, 4080000.026),
+                (-349999.998, 3079999.982, 649999.996, 4079999.977),
+            ),
+            (
+                "20250802_0020",
+                (-320000.002, 3100000.020, 680000.004, 4100000.026),
+                (-319999.998, 3099999.982, 679999.996, 4099999.976),
+            ),
+            (
+                "20250802_0220",
+                (-290000.002, 3130000.020, 710000.005, 4130000.027),
+                (-289999.998, 3129999.982, 709999.996, 4129999.976),
+            ),
+            (
+                "20250802_0420",
+                (-280000.002, 3160000.020, 720000.005, 4160000.027),
+                (-279999.998, 3159999.982, 719999.996, 4159999.976),
+            ),
+        ]
+        b03_areas = []
+        compatibility_areas = {}
+        for frame, b01_extent, b03_extent in frame_extents:
+            b01_area = AreaDefinition(f"{frame}_b01", "b01", "b01", projection, 1000, 1000, b01_extent)
+            b03_area = AreaDefinition(f"{frame}_b03", "b03", "b03", projection, 2000, 2000, b03_extent)
+            b03_areas.append(b03_area)
+            for band in ("B01", "B02", "B04"):
+                compatibility_areas[f"{frame}:{band}"] = b01_area
+            compatibility_areas[f"{frame}:B03"] = b03_area
+
+        b03_only_target = h.native_compatible_common_area(b03_areas, 500, source_pixel_size_m=500)
+        refined_target = h.native_compatible_common_area(
+            b03_areas,
+            500,
+            source_pixel_size_m=500,
+            compatibility_areas=compatibility_areas,
+        )
+
+        self.assertEqual((b03_only_target.width, b03_only_target.height), (1860, 1840))
+        self.assertIsNotNone(h.native_area_compatibility_error(compatibility_areas, b03_only_target))
+        self.assertEqual((refined_target.width, refined_target.height), (1860, 1838))
+        self.assertIsNone(h.native_area_compatibility_error(compatibility_areas, refined_target))
+
+    def test_native_common_area_daytime_lock_excludes_fallback_only_b13(self):
+        projection = {"proj": "geos", "lon_0": 140.7, "h": 35785863, "a": 6378137, "b": 6356752.31414}
+        b01_area = AreaDefinition(
+            "b01",
+            "b01",
+            "b01",
+            projection,
+            1000,
+            1000,
+            (-350000.002, 3080000.020, 650000.004, 4080000.026),
+        )
+        b03_area = AreaDefinition(
+            "b03",
+            "b03",
+            "b03",
+            projection,
+            2000,
+            2000,
+            (-349999.998, 3079999.982, 649999.996, 4079999.977),
+        )
+        b13_area = AreaDefinition(
+            "b13",
+            "b13",
+            "b13",
+            projection,
+            500,
+            500,
+            (-350000.0, 3080000.0, 650000.0, 4080000.0),
+        )
+        day_compatibility_areas = {
+            "frame:B01": b01_area,
+            "frame:B02": b01_area,
+            "frame:B03": b03_area,
+            "frame:B04": b01_area,
+        }
+        fallback_areas = {"frame:B13": b13_area}
+
+        target = h.native_compatible_common_area(
+            [b03_area],
+            500,
+            source_pixel_size_m=500,
+            compatibility_areas=day_compatibility_areas,
+        )
+
+        self.assertIsNone(h.native_area_compatibility_error(day_compatibility_areas, target))
+        self.assertIsNotNone(h.native_area_compatibility_error(fallback_areas, target))
 
     def test_resampler_forwards_dataset_filter(self):
         config = h.default_config()
@@ -339,6 +559,7 @@ class ProcessorTests(unittest.TestCase):
             h.SATPY_OPTIONAL_DEP_FALLBACKS["True Color RGB (Enhanced)"],
             "true_color_nocorr",
         )
+        self.assertIn("True Color RGB (Enhanced)", h.CUSTOM_SATPY_MISSING_DATASET_FALLBACKS)
         self.assertNotIn("True Color Reproduction Image", h.SATPY_OPTIONAL_DEP_FALLBACKS)
         self.assertIn("True Color Reproduction Image", h.QUALITY_CRITICAL_COMPOSITES)
         exc = ModuleNotFoundError("No module named 'pyspectral'")
@@ -349,9 +570,27 @@ class ProcessorTests(unittest.TestCase):
 
     def test_missing_satpy_dataset_detection(self):
         exc = KeyError("\"No dataset matching 'DataQuery(name='true_color_reproduction')' found\"")
+        chained = RuntimeError("outer")
+        chained.__cause__ = KeyError("Dataset true_color_reproduction not found after resampling")
 
         self.assertTrue(h.missing_satpy_dataset(exc, "true_color_reproduction"))
+        self.assertTrue(h.missing_satpy_dataset(chained, "true_color_reproduction"))
         self.assertFalse(h.missing_satpy_dataset(exc, "true_color"))
+        self.assertTrue(
+            h.use_true_color_reproduction_fallback(
+                exc,
+                "True Color Reproduction Image",
+                "true_color_reproduction",
+            )
+        )
+        true_color_exc = KeyError("\"No dataset matching 'DataQuery(name='true_color')' found\"")
+        self.assertTrue(
+            h.use_custom_satpy_missing_dataset_fallback(
+                true_color_exc,
+                "True Color RGB (Enhanced)",
+                "true_color",
+            )
+        )
 
     @mock.patch("himawari_lowram_processor.cleanup_paths")
     @mock.patch("himawari_lowram_processor.save_dataset_with_optional_overlay")
@@ -366,7 +605,9 @@ class ProcessorTests(unittest.TestCase):
         mock_save,
         _mock_cleanup,
     ):
-        attrs = {"area": "dummy", "sensor": "ahi"}
+        source_area = mock.Mock()
+        source_area.get_area_slices.return_value = (slice(0, 4), slice(0, 4))
+        attrs = {"area": source_area, "sensor": "ahi"}
         bands = {
             band: xr.DataArray(da.ones((4, 4), chunks=(2, 2)) * 50, dims=("y", "x"), attrs=attrs)
             for band in ("B01", "B02", "B03", "B04")
@@ -394,13 +635,124 @@ class ProcessorTests(unittest.TestCase):
         info = h.parse_url(h.USER_URL)
         dt = h.datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
 
-        result = h.process_frame(dt, info, mock.Mock(width=10, height=10), 0, 1, config=config, progress=progress)
+        result = h.process_frame(dt, info, mock.Mock(width=4, height=4), 0, 1, config=config, progress=progress)
 
         self.assertEqual(result, h.Path("out.png"))
         mock_save.assert_called_once()
         self.assertEqual(mock_save.call_args.args[1], h.CUSTOM_DATASET_NAMES["True Color Reproduction Image"])
         self.assertFalse(mock_save.call_args.kwargs["enhance"])
         self.assertTrue(any("custom low-RAM fallback" in message for message, _current, _total in events))
+
+    @mock.patch("himawari_lowram_processor.cleanup_paths")
+    @mock.patch("himawari_lowram_processor.save_custom_satpy_missing_dataset_fallback")
+    @mock.patch("himawari_lowram_processor.resample_scene_low_ram")
+    @mock.patch("himawari_lowram_processor.download_segments")
+    @mock.patch("himawari_lowram_processor.Scene")
+    def test_true_color_reproduction_resample_missing_dataset_uses_custom_fallback(
+        self,
+        mock_scene_class,
+        mock_download,
+        mock_resample,
+        mock_fallback,
+        mock_cleanup,
+    ):
+        original_scene = mock.Mock()
+        original_scene.load.return_value = None
+        mock_scene_class.return_value = original_scene
+        mock_resample.side_effect = KeyError(
+            "\"No dataset matching 'DataQuery(name='true_color_reproduction')' found\""
+        )
+        mock_fallback.return_value = h.Path("out.png")
+        mock_download.return_value = [h.Path(f"segment-{idx}.dat") for idx in range(40)]
+        config = h.default_config()
+        config.composite_choice = "True Color Reproduction Image"
+        config.use_night_fallback = False
+        info = h.parse_url(h.USER_URL)
+        dt = h.datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
+
+        result = h.process_frame(dt, info, mock.Mock(width=10, height=10), 0, 1, config=config)
+
+        self.assertEqual(result, h.Path("out.png"))
+        mock_fallback.assert_called_once()
+        self.assertEqual(mock_fallback.call_args.args[1:3], ("True Color Reproduction Image", "true_color_reproduction"))
+        mock_cleanup.assert_called_once()
+
+    @mock.patch("himawari_lowram_processor.cleanup_paths")
+    @mock.patch("himawari_lowram_processor.save_custom_satpy_missing_dataset_fallback")
+    @mock.patch("himawari_lowram_processor.resample_scene_low_ram")
+    @mock.patch("himawari_lowram_processor.download_segments")
+    @mock.patch("himawari_lowram_processor.Scene")
+    def test_true_color_rgb_resample_missing_dataset_uses_custom_fallback(
+        self,
+        mock_scene_class,
+        mock_download,
+        mock_resample,
+        mock_fallback,
+        mock_cleanup,
+    ):
+        original_scene = mock.Mock()
+        original_scene.load.return_value = None
+        mock_scene_class.return_value = original_scene
+        mock_resample.side_effect = KeyError("\"No dataset matching 'DataQuery(name='true_color')' found\"")
+        mock_fallback.return_value = h.Path("out.png")
+        mock_download.return_value = [h.Path(f"segment-{idx}.dat") for idx in range(40)]
+        config = h.default_config()
+        config.composite_choice = "True Color RGB (Enhanced)"
+        config.use_night_fallback = False
+        info = h.parse_url(h.USER_URL)
+        dt = h.datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
+
+        result = h.process_frame(dt, info, mock.Mock(width=10, height=10), 0, 1, config=config)
+
+        self.assertEqual(result, h.Path("out.png"))
+        mock_fallback.assert_called_once()
+        self.assertEqual(mock_fallback.call_args.args[1:3], ("True Color RGB (Enhanced)", "true_color"))
+        mock_cleanup.assert_called_once()
+
+    @mock.patch("himawari_lowram_processor.cleanup_paths")
+    @mock.patch("himawari_lowram_processor.save_custom_satpy_missing_dataset_fallback")
+    @mock.patch("himawari_lowram_processor.download_segments")
+    @mock.patch("himawari_lowram_processor.Scene")
+    def test_true_color_rgb_load_missing_dataset_uses_custom_fallback(
+        self,
+        mock_scene_class,
+        mock_download,
+        mock_fallback,
+        mock_cleanup,
+    ):
+        original_scene = mock.Mock()
+        original_scene.load.side_effect = KeyError("\"No dataset matching 'DataQuery(name='true_color')' found\"")
+        mock_scene_class.return_value = original_scene
+        mock_fallback.return_value = h.Path("out.png")
+        mock_download.return_value = [h.Path(f"segment-{idx}.dat") for idx in range(40)]
+        config = h.default_config()
+        config.composite_choice = "True Color RGB (Enhanced)"
+        config.use_night_fallback = False
+        info = h.parse_url(h.USER_URL)
+        dt = h.datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
+
+        result = h.process_frame(dt, info, mock.Mock(width=10, height=10), 0, 1, config=config)
+
+        self.assertEqual(result, h.Path("out.png"))
+        mock_fallback.assert_called_once()
+        self.assertEqual(mock_fallback.call_args.args[1:3], ("True Color RGB (Enhanced)", "true_color"))
+        mock_cleanup.assert_called_once()
+
+    @mock.patch("himawari_lowram_processor.cleanup_paths")
+    @mock.patch("himawari_lowram_processor.download_segments")
+    def test_process_frame_downloads_night_fallback_band_for_day_product(self, mock_download, _mock_cleanup):
+        config = h.default_config()
+        config.composite_choice = "True Color Reproduction Image"
+        config.use_night_fallback = True
+        info = h.parse_url(h.USER_URL)
+        dt = h.datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
+        mock_download.return_value = []
+
+        result = h.process_frame(dt, info, mock.Mock(width=10, height=10), 0, 1, config=config)
+
+        self.assertIsNone(result)
+        task_names = [task.destination.name for task in mock_download.call_args.args[0]]
+        self.assertTrue(any("_B13_" in name for name in task_names))
 
     def test_download_segments_progress_for_existing_files(self):
         events = []
@@ -414,6 +766,95 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(result, [h.Path(__file__)])
         self.assertTrue(events)
         self.assertEqual(events[-1][1:], (1, 1))
+
+    def test_download_workload_summary_describes_bands_scans_and_workers(self):
+        info = h.parse_url(h.USER_URL)
+        dt = h.datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tasks = h.make_download_tasks(info, dt, ("B01", "B02", "B03", "B04", "B13"), h.Path(tmp_dir))
+
+        summary = h.download_workload_summary(tasks, worker_count=4)
+
+        self.assertEqual(summary, "Downloading 50 segments (5 bands x 10 FLDK scans, 4 workers)")
+
+    def test_download_task_label_uses_band_and_segment(self):
+        info = h.parse_url(h.USER_URL)
+        dt = h.datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = h.make_download_tasks(info, dt, ("B01",), h.Path(tmp_dir))[6]
+
+        self.assertEqual(h.download_task_label(task), "B01 S07/10")
+
+    @mock.patch("himawari_lowram_processor.stream_download_and_extract")
+    def test_download_segments_progress_includes_workload_and_active_segments(self, mock_stream):
+        events = []
+        info = h.parse_url(h.USER_URL)
+        dt = h.datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tasks = h.make_download_tasks(info, dt, ("B01",), h.Path(tmp_dir))[:2]
+
+            def progress(message, current, total):
+                events.append((message, current, total))
+
+            mock_stream.side_effect = [task.destination for task in tasks]
+
+            result = h.download_segments(tasks, workers=1, progress=progress)
+
+        self.assertEqual(result, [task.destination for task in tasks])
+        self.assertEqual(events[0], ("Downloading 2 segments (1 band x 10 FLDK scans, 1 worker)", 0, 2))
+        self.assertTrue(any(event[0] == "Downloading B01 S01/10" for event in events))
+        self.assertTrue(any(event[0] == "Downloaded B01 S02/10 (2/2)" for event in events))
+
+    @mock.patch("himawari_lowram_processor.requests.get")
+    def test_stream_download_removes_stale_part_before_retry(self, mock_get):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            destination = h.Path(tmp_dir) / "segment.dat"
+            part_path = destination.with_suffix(destination.suffix + ".part")
+            part_path.write_text("stale")
+            payload = bz2.compress(b"fresh")
+            response = mock.Mock()
+            response.status_code = 200
+            response.iter_content.return_value = [payload]
+            response.__enter__ = mock.Mock(return_value=response)
+            response.__exit__ = mock.Mock(return_value=None)
+            mock_get.return_value = response
+
+            result = h.stream_download_and_extract(h.DownloadTask("https://example.test/file.bz2", destination))
+
+            self.assertEqual(result, destination)
+            self.assertEqual(destination.read_bytes(), b"fresh")
+            self.assertFalse(part_path.exists())
+
+    @mock.patch("himawari_lowram_processor.requests.get")
+    def test_stream_download_http_error_cleans_stale_part(self, mock_get):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            destination = h.Path(tmp_dir) / "missing.dat"
+            part_path = destination.with_suffix(destination.suffix + ".part")
+            part_path.write_text("stale")
+            response = mock.Mock()
+            response.status_code = 404
+            response.__enter__ = mock.Mock(return_value=response)
+            response.__exit__ = mock.Mock(return_value=None)
+            mock_get.return_value = response
+
+            result = h.stream_download_and_extract(h.DownloadTask("https://example.test/missing.bz2", destination))
+
+            self.assertIsNone(result)
+            self.assertFalse(part_path.exists())
+
+    @mock.patch("himawari_lowram_processor.requests.get")
+    def test_stream_download_stale_part_unlink_failure_is_handled(self, mock_get):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            destination = h.Path(tmp_dir) / "segment.dat"
+            part_path = destination.with_suffix(destination.suffix + ".part")
+            part_path.write_text("stale")
+            task = h.DownloadTask("https://example.test/file.bz2", destination)
+
+            with mock.patch("himawari_lowram_processor.remove_partial_download", return_value=False):
+                result = h.stream_download_and_extract(task)
+
+        self.assertIsNone(result)
+        mock_get.assert_not_called()
 
     def test_streaming_bz2_handles_concatenated_streams(self):
         decompressor = bz2.BZ2Decompressor()
@@ -463,6 +904,84 @@ class ProcessorTests(unittest.TestCase):
         mock_cleanup.assert_called_once()
         self.assertEqual(mock_cleanup.call_args.args[0], [part_path])
 
+    @mock.patch("himawari_lowram_processor.cleanup_paths")
+    def test_success_cleanup_keeps_completed_download_cache(self, mock_cleanup):
+        frame_dir = h.Path("temp") / "20240725_0400"
+
+        h.cleanup_partial_downloads(frame_dir)
+
+        mock_cleanup.assert_called_once()
+        glob_arg = mock_cleanup.call_args.args[0]
+        self.assertTrue(all(path.suffix == ".part" for path in glob_arg))
+
+    @mock.patch("himawari_lowram_processor.cleanup_paths")
+    def test_assemble_timelapse_deletes_frame_paths_when_configured(self, mock_cleanup):
+        writer = mock.Mock()
+        writer.__enter__ = mock.Mock(return_value=writer)
+        writer.__exit__ = mock.Mock(return_value=None)
+        fake_imageio = mock.Mock()
+        fake_imageio.get_writer.return_value = writer
+        fake_imageio.imread.side_effect = ["frame-a", "frame-b"]
+        config = h.default_config()
+        config.mode = "Timelapse"
+        config.timelapse_format = "gif"
+        config.delete_timelapse_frames = True
+        paths = [h.Path("frame_0000.png"), h.Path("frame_0001.png")]
+        info = h.parse_url(h.USER_URL)
+
+        with mock.patch("imageio.v2.get_writer", fake_imageio.get_writer), mock.patch(
+            "imageio.v2.imread", fake_imageio.imread
+        ):
+            result = h.assemble_timelapse(paths, info, config=config)
+
+        self.assertEqual(result.suffix, ".gif")
+        self.assertEqual(writer.append_data.call_args_list, [mock.call("frame-a"), mock.call("frame-b")])
+        mock_cleanup.assert_called_once_with(paths)
+
+    @mock.patch("himawari_lowram_processor.cleanup_paths")
+    def test_assemble_timelapse_keeps_frame_paths_when_configured(self, mock_cleanup):
+        writer = mock.Mock()
+        writer.__enter__ = mock.Mock(return_value=writer)
+        writer.__exit__ = mock.Mock(return_value=None)
+        fake_imageio = mock.Mock()
+        fake_imageio.get_writer.return_value = writer
+        fake_imageio.imread.return_value = "frame"
+        config = h.default_config()
+        config.mode = "Timelapse"
+        config.timelapse_format = "gif"
+        config.delete_timelapse_frames = False
+        info = h.parse_url(h.USER_URL)
+
+        with mock.patch("imageio.v2.get_writer", fake_imageio.get_writer), mock.patch(
+            "imageio.v2.imread", fake_imageio.imread
+        ):
+            h.assemble_timelapse([h.Path("frame_0000.png")], info, config=config)
+
+        mock_cleanup.assert_not_called()
+
+    @mock.patch("himawari_lowram_processor.cleanup_paths")
+    def test_assemble_timelapse_falls_back_to_gif_without_ffmpeg(self, _mock_cleanup):
+        writer = mock.Mock()
+        writer.__enter__ = mock.Mock(return_value=writer)
+        writer.__exit__ = mock.Mock(return_value=None)
+        fake_imageio = mock.Mock()
+        fake_imageio.get_writer.return_value = writer
+        fake_imageio.imread.return_value = "frame"
+        config = h.default_config()
+        config.mode = "Timelapse"
+        config.timelapse_format = "mp4"
+        config.delete_timelapse_frames = False
+        info = h.parse_url(h.USER_URL)
+
+        with mock.patch("imageio.v2.get_writer", fake_imageio.get_writer), mock.patch(
+            "imageio.v2.imread", fake_imageio.imread
+        ), mock.patch("himawari_lowram_processor.has_module", return_value=False):
+            result = h.assemble_timelapse([h.Path("frame_0000.png")], info, config=config)
+
+        self.assertEqual(result.suffix, ".gif")
+        fake_imageio.get_writer.assert_called_once()
+        self.assertEqual(fake_imageio.get_writer.call_args.kwargs["mode"], "I")
+
     def test_run_honors_precanceled_event(self):
         cancel_event = threading.Event()
         cancel_event.set()
@@ -485,7 +1004,7 @@ class ProcessorTests(unittest.TestCase):
         config = h.default_config()
         info = h.parse_url(h.USER_URL)
         dt = h.datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
-        fake_path = h.Path("fake-b13.dat")
+        fake_path = h.Path("fake-b03.dat")
         fake_area = mock.Mock(width=10, height=10)
         fake_scene = mock.Mock()
         fake_scene.__getitem__ = mock.Mock(return_value=mock.Mock(attrs={"area": fake_area}))
@@ -496,13 +1015,95 @@ class ProcessorTests(unittest.TestCase):
         def progress(message, current, total):
             events.append((message, current, total))
 
-        result = h.common_area_from_frames(info, [dt], 2000, config=config, progress=progress)
+        result = h.common_area_from_frames(info, [dt], 500, "B03", config=config, progress=progress)
 
         self.assertIs(result, fake_area)
+        self.assertEqual(mock_download.call_args.args[0][0].destination.name, "HS_H09_20240725_0400_B03_FLDK_R05_S0110.DAT")
         self.assertIs(mock_download.call_args.kwargs["progress"], progress)
+        fake_scene.load.assert_called_once_with(["B03"], calibration="reflectance")
+        mock_native_area.assert_called_once_with(
+            [fake_area],
+            500,
+            source_pixel_size_m=500,
+            compatibility_areas={"20240725_0400:B03": fake_area},
+        )
         self.assertTrue(events)
-        self.assertEqual(events[0][0], "Downloading B13 scan segments for common area")
+        self.assertEqual(events[0][0], "Downloading B03 scan segments for common area")
         mock_cleanup.assert_not_called()
+
+    @mock.patch("himawari_lowram_processor.native_compatible_common_area")
+    @mock.patch("himawari_lowram_processor.Scene")
+    @mock.patch("himawari_lowram_processor.download_segments")
+    def test_common_area_scan_loads_compatibility_bands(
+        self,
+        mock_download,
+        mock_scene_class,
+        mock_native_area,
+    ):
+        config = h.default_config()
+        info = h.parse_url(h.USER_URL)
+        dt = h.datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
+        fake_area = mock.Mock(width=10, height=10)
+        fake_scene = mock.Mock()
+        fake_scene.__getitem__ = mock.Mock(return_value=mock.Mock(attrs={"area": fake_area}))
+        mock_scene_class.return_value = fake_scene
+        mock_download.return_value = [h.Path(f"segment-{idx}.dat") for idx in range(info.total_segments * 4)]
+        mock_native_area.return_value = fake_area
+
+        result = h.common_area_from_frames(
+            info,
+            [dt],
+            500,
+            "B03",
+            compatibility_bands=("B01", "B02", "B03", "B04"),
+            config=config,
+        )
+
+        self.assertIs(result, fake_area)
+        task_names = [task.destination.name for task in mock_download.call_args.args[0]]
+        self.assertTrue(any("_B01_" in name for name in task_names))
+        self.assertTrue(any("_B03_" in name for name in task_names))
+        fake_scene.load.assert_any_call(["B01"], calibration="reflectance")
+        fake_scene.load.assert_any_call(["B03"], calibration="reflectance")
+        self.assertEqual(len(mock_native_area.call_args.kwargs["compatibility_areas"]), 4)
+
+    @mock.patch("himawari_lowram_processor.process_frame")
+    @mock.patch("himawari_lowram_processor.validate_runtime_dependencies")
+    @mock.patch("himawari_lowram_processor.common_area_from_frames")
+    def test_run_passes_day_product_bands_to_common_area(self, mock_common_area, _mock_validate, mock_process):
+        config = h.default_config()
+        config.mode = "Single Image"
+        config.composite_choice = "True Color Reproduction Image"
+        config.use_night_fallback = True
+        mock_common_area.return_value = mock.Mock(width=10, height=10)
+        mock_process.return_value = h.Path("out.png")
+
+        h.run(config)
+
+        self.assertEqual(
+            mock_common_area.call_args.kwargs["compatibility_bands"],
+            h.area_compatibility_bands("True Color Reproduction Image"),
+        )
+        self.assertNotIn("B13", mock_common_area.call_args.kwargs["compatibility_bands"])
+
+    @mock.patch("himawari_lowram_processor.process_frame")
+    @mock.patch("himawari_lowram_processor.validate_runtime_dependencies")
+    @mock.patch("himawari_lowram_processor.common_area_from_frames")
+    def test_run_single_band_common_area_keeps_single_required_band(
+        self,
+        mock_common_area,
+        _mock_validate,
+        mock_process,
+    ):
+        config = h.default_config()
+        config.mode = "Single Image"
+        config.composite_choice = "B13 (Infrared Window)"
+        mock_common_area.return_value = mock.Mock(width=10, height=10)
+        mock_process.return_value = h.Path("out.png")
+
+        h.run(config)
+
+        self.assertEqual(mock_common_area.call_args.kwargs["compatibility_bands"], ("B13",))
 
     @mock.patch("himawari_lowram_processor.process_frame", return_value=None)
     @mock.patch("himawari_lowram_processor.validate_runtime_dependencies")
@@ -528,6 +1129,31 @@ class ProcessorTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "no frames were processed"):
             h.run(config)
+
+    @mock.patch("himawari_lowram_processor.assemble_timelapse", return_value=h.Path("movie.gif"))
+    @mock.patch("himawari_lowram_processor.process_frame")
+    @mock.patch("himawari_lowram_processor.validate_runtime_dependencies")
+    @mock.patch("himawari_lowram_processor.common_area_from_frames")
+    def test_timelapse_warns_when_only_some_frames_process(
+        self,
+        mock_common_area,
+        _mock_validate,
+        mock_process,
+        mock_assemble,
+    ):
+        events = []
+        config = h.default_config()
+        config.mode = "Timelapse"
+        config.hours_back = 1
+        config.interval_minutes = 30
+        mock_common_area.return_value = mock.Mock(width=10, height=10)
+        mock_process.side_effect = [h.Path("frame_0000.png"), None, h.Path("frame_0002.png")]
+
+        result = h.run(config, progress=lambda message, current, total: events.append((message, current, total)))
+
+        self.assertEqual(result, [h.Path("movie.gif")])
+        mock_assemble.assert_called_once()
+        self.assertTrue(any("successful frames" in message for message, _current, _total in events))
 
 
 if __name__ == "__main__":

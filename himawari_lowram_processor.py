@@ -52,6 +52,9 @@ MAX_SAFE_PNG_PIXELS = 120_000_000
 RAM_LIMIT_GB = 10.0
 DASK_CHUNK_SIZE = "64MiB"  # Use "128MiB" only if the machine has headroom.
 DASK_NUM_WORKERS = 1  # Keep at 1 or 2.
+NIGHT_CHECK_SAMPLE_PIXELS = 512
+MAX_NATIVE_COMPATIBILITY_CROP_PIXELS = 32
+NATIVE_GRID_INDEX_TOLERANCE = 1e-7
 
 PROJECT_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = PROJECT_DIR / "outputs"
@@ -205,10 +208,16 @@ NIGHT_FALLBACK_MAP = {
 }
 
 CUSTOM_DATASET_NAMES = {
+    "True Color RGB (Enhanced)": "custom_true_color_rgb",
     "True Color Reproduction Image": "custom_true_color_reproduction_rgb",
     "Sandwich (B03 + B13)": "custom_sandwich_b03_b13",
     "B03 and B13 at night": "custom_b03_b13_night",
     "Heavy Rainfall Potential": "custom_heavy_rainfall_potential",
+}
+
+CUSTOM_SATPY_MISSING_DATASET_FALLBACKS = {
+    "True Color RGB (Enhanced)",
+    "True Color Reproduction Image",
 }
 
 LOG = logging.getLogger("himawari_lowram")
@@ -463,6 +472,51 @@ def decompress_bz2_chunk(
     return decompressor, bytes(output)
 
 
+def download_task_label(task: DownloadTask) -> str:
+    match = re.search(r"_(B\d{2})_[A-Z0-9]+_R\d{2}_S(\d{2})(\d{2})\.DAT$", task.destination.name)
+    if match:
+        return f"{match.group(1)} S{int(match.group(2)):02d}/{int(match.group(3)):02d}"
+    return task.destination.name
+
+
+def download_workload_summary(tasks: list[DownloadTask], worker_count: int) -> str:
+    if not tasks:
+        worker_word = "worker" if worker_count == 1 else "workers"
+        return f"Downloading 0 segments ({worker_count} {worker_word})"
+
+    bands: set[str] = set()
+    scan_counts: set[int] = set()
+    areas: set[str] = set()
+    for task in tasks:
+        match = re.search(r"_(B\d{2})_([A-Z0-9]+)_R\d{2}_S\d{2}(\d{2})\.DAT$", task.destination.name)
+        if not match:
+            continue
+        bands.add(match.group(1))
+        areas.add(match.group(2))
+        scan_counts.add(int(match.group(3)))
+
+    if len(areas) == 1 and len(scan_counts) == 1 and bands:
+        area = next(iter(areas))
+        scans = next(iter(scan_counts))
+        band_word = "band" if len(bands) == 1 else "bands"
+        worker_word = "worker" if worker_count == 1 else "workers"
+        return (
+            f"Downloading {len(tasks)} segments "
+            f"({len(bands)} {band_word} x {scans} {area} scans, {worker_count} {worker_word})"
+        )
+    worker_word = "worker" if worker_count == 1 else "workers"
+    return f"Downloading {len(tasks)} segments ({worker_count} {worker_word})"
+
+
+def remove_partial_download(path: Path) -> bool:
+    try:
+        path.unlink(missing_ok=True)
+        return True
+    except Exception as exc:
+        LOG.warning("Could not remove partial download %s: %s", path, exc)
+        return False
+
+
 def stream_download_and_extract(
     task: DownloadTask,
     timeout: int = 60,
@@ -475,6 +529,8 @@ def stream_download_and_extract(
     task.destination.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = task.destination.with_suffix(task.destination.suffix + ".part")
     try:
+        if not remove_partial_download(tmp_path):
+            return None
         with requests.get(task.url, timeout=timeout, stream=True) as response:
             check_cancel(cancel_event)
             if response.status_code != 200:
@@ -494,13 +550,11 @@ def stream_download_and_extract(
         tmp_path.replace(task.destination)
         return task.destination
     except ProcessingCancelled:
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
+        remove_partial_download(tmp_path)
         raise
     except Exception as exc:
         LOG.warning("Download failed for %s: %s", task.url, exc)
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
+        remove_partial_download(tmp_path)
         return None
 
 
@@ -521,14 +575,19 @@ def download_segments(
 
     worker_count = clamp_download_workers(workers)
     LOG.info("Downloading %s segments with %s worker(s)", len(tasks), worker_count)
-    emit_progress(progress, f"Downloading {total} segment(s)", 0, total)
+    emit_progress(progress, download_workload_summary(tasks, worker_count), 0, total)
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=worker_count)
     future_map: dict[concurrent.futures.Future[Path | None], DownloadTask] = {}
     results = []
+
+    def download_one(task: DownloadTask) -> Path | None:
+        emit_progress(progress, f"Downloading {download_task_label(task)}", completed, total)
+        return stream_download_and_extract(task, cancel_event=cancel_event)
+
     try:
         for task in tasks:
             check_cancel(cancel_event)
-            future = pool.submit(stream_download_and_extract, task, cancel_event=cancel_event)
+            future = pool.submit(download_one, task)
             future_map[future] = task
 
         pending = set(future_map)
@@ -544,7 +603,8 @@ def download_segments(
                 result = future.result()
                 if result is not None:
                     results.append(result)
-                emit_progress(progress, f"Downloaded {completed}/{total} segment(s)", completed, total)
+                label = download_task_label(future_map[future])
+                emit_progress(progress, f"Downloaded {label} ({completed}/{total})", completed, total)
     except ProcessingCancelled:
         for future in future_map:
             future.cancel()
@@ -572,6 +632,11 @@ def required_bands(
     return tuple(dict.fromkeys(bands))
 
 
+def area_compatibility_bands(composite_choice: str) -> tuple[str, ...]:
+    """Bands that must align for the requested daytime product area."""
+    return required_bands(composite_choice, include_night_fallback=False)
+
+
 def select_active_composite(
     composite_choice: str,
     is_night: bool,
@@ -590,10 +655,45 @@ def target_pixel_size_m(composite_choice: str, use_night_fallback: bool | None =
     return min(BAND_PIXEL_SIZE_M[band] for band in bands)
 
 
+def area_reference_band(composite_choice: str) -> str:
+    """Choose the finest day-product band to define the native target grid."""
+    bands = COMPOSITE_BANDS[composite_choice]
+    finest = min(BAND_PIXEL_SIZE_M[band] for band in bands)
+    for band in bands:
+        if BAND_PIXEL_SIZE_M[band] == finest:
+            return band
+    raise KeyError(f"No area reference band for {composite_choice}")
+
+
+def coarse_sample_area(area: AreaDefinition, max_pixels: int = NIGHT_CHECK_SAMPLE_PIXELS) -> AreaDefinition:
+    if area.width <= max_pixels and area.height <= max_pixels:
+        return area
+    scale = max(area.width / max_pixels, area.height / max_pixels)
+    width = max(1, int(np.ceil(area.width / scale)))
+    height = max(1, int(np.ceil(area.height / scale)))
+    return AreaDefinition(
+        f"{area.area_id}_sample",
+        f"{area.description} Sample",
+        area.proj_id,
+        area.crs,
+        width,
+        height,
+        area.area_extent,
+    )
+
+
 def is_visible_dark(scene: Scene, area: AreaDefinition) -> bool:
     try:
         scene.load(["B03"], calibration="reflectance")
-        sampled = scene.resample(area, resampler="nearest", radius_of_influence=10000)
+        sample_area = coarse_sample_area(area)
+        LOG.info(
+            "Night check sampling B03 at %sx%s px instead of %sx%s full target",
+            sample_area.width,
+            sample_area.height,
+            area.width,
+            area.height,
+        )
+        sampled = scene.resample(sample_area, resampler="nearest", radius_of_influence=10000)
         max_value = sampled["B03"].max(skipna=True).compute()
         result = float(max_value) < 2.0
         LOG.info("Night check: B03 max reflectance %.4f -> %s", float(max_value), result)
@@ -629,6 +729,29 @@ def scale_ir_temperature(
     if gamma != 1.0:
         scaled = scaled ** (1.0 / gamma)
     return xr_clip(scaled, 0.0, 1.0)
+
+
+def apply_black_point(data: xr.DataArray, black: float = 0.015) -> xr.DataArray:
+    corrected = (data - black) / (1.0 - black)
+    return xr_clip(corrected, 0.0, 1.0)
+
+
+def apply_contrast(data: xr.DataArray, contrast: float = 1.12, midpoint: float = 0.42) -> xr.DataArray:
+    return xr_clip((data - midpoint) * contrast + midpoint, 0.0, 1.0)
+
+
+def apply_saturation(
+    red: xr.DataArray,
+    green: xr.DataArray,
+    blue: xr.DataArray,
+    saturation: float = 1.18,
+) -> tuple[xr.DataArray, xr.DataArray, xr.DataArray]:
+    luma = red * 0.2126 + green * 0.7152 + blue * 0.0722
+    return (
+        xr_clip(luma + (red - luma) * saturation, 0.0, 1.0),
+        xr_clip(luma + (green - luma) * saturation, 0.0, 1.0),
+        xr_clip(luma + (blue - luma) * saturation, 0.0, 1.0),
+    )
 
 
 def rgb_dataarray(
@@ -732,22 +855,28 @@ def create_true_color_reproduction_fallback(
     b02: xr.DataArray,
     b03: xr.DataArray,
     b04: xr.DataArray,
+    name: str | None = None,
+    standard_name: str = "custom_true_color_reproduction_rgb",
 ) -> xr.DataArray:
-    red = scale_reflectance(b03, max_value=100.0, gamma=1.25)
+    red = apply_black_point(scale_reflectance(b03, max_value=100.0, gamma=1.22), black=0.018)
     green = xr_clip(
-        scale_reflectance(b02, max_value=100.0, gamma=1.18) * 0.58
-        + scale_reflectance(b03, max_value=100.0, gamma=1.2) * 0.30
-        + scale_reflectance(b04, max_value=100.0, gamma=1.15) * 0.12,
+        apply_black_point(scale_reflectance(b02, max_value=100.0, gamma=1.15), black=0.015) * 0.56
+        + red * 0.32
+        + apply_black_point(scale_reflectance(b04, max_value=100.0, gamma=1.1), black=0.012) * 0.12,
         0.0,
         1.0,
     )
-    blue = scale_reflectance(b01, max_value=100.0, gamma=1.2)
+    blue = apply_black_point(scale_reflectance(b01, max_value=100.0, gamma=1.18), black=0.008)
+    red = apply_contrast(xr_clip(red * 1.05 + 0.01, 0.0, 1.0), contrast=1.12, midpoint=0.42)
+    green = apply_contrast(xr_clip(green * 1.03 + 0.004, 0.0, 1.0), contrast=1.10, midpoint=0.42)
+    blue = apply_contrast(xr_clip(blue * 0.94, 0.0, 1.0), contrast=1.08, midpoint=0.40)
+    red, green, blue = apply_saturation(red, green, blue, saturation=1.18)
     return rgb_dataarray(
         red,
         green,
         blue,
-        name=CUSTOM_DATASET_NAMES["True Color Reproduction Image"],
-        standard_name="custom_true_color_reproduction_rgb",
+        name=name or CUSTOM_DATASET_NAMES["True Color Reproduction Image"],
+        standard_name=standard_name,
     )
 
 
@@ -757,12 +886,14 @@ def build_custom_composite(scene: Scene, composite_choice: str, is_night: bool) 
         dataset_name = f"custom_{band.lower()}_rgb"
         return dataset_name, single_band_to_rgb(scene[band], band, dataset_name)
 
-    if composite_choice == "True Color Reproduction Image":
+    if composite_choice in {"True Color RGB (Enhanced)", "True Color Reproduction Image"}:
         dataset = create_true_color_reproduction_fallback(
             scene["B01"],
             scene["B02"],
             scene["B03"],
             scene["B04"],
+            name=CUSTOM_DATASET_NAMES[composite_choice],
+            standard_name=CUSTOM_DATASET_NAMES[composite_choice],
         )
         return dataset.attrs["name"], dataset
 
@@ -949,6 +1080,68 @@ def make_native_area(
     )
 
 
+def crop_native_area(
+    template_area: AreaDefinition,
+    left_crop: int,
+    bottom_crop: int,
+    right_crop: int,
+    top_crop: int,
+    pixel_size_m: int,
+) -> AreaDefinition | None:
+    width = template_area.width - left_crop - right_crop
+    height = template_area.height - bottom_crop - top_crop
+    if width <= 0 or height <= 0:
+        return None
+    x_min, y_min, x_max, y_max = template_area.area_extent
+    return AreaDefinition(
+        template_area.area_id,
+        template_area.description,
+        template_area.proj_id,
+        template_area.crs,
+        width,
+        height,
+        (
+            x_min + left_crop * pixel_size_m,
+            y_min + bottom_crop * pixel_size_m,
+            x_max - right_crop * pixel_size_m,
+            y_max - top_crop * pixel_size_m,
+        ),
+    )
+
+
+def native_ratio_is_integer(source_size: int, target_size: int) -> bool:
+    larger = max(source_size, target_size)
+    smaller = min(source_size, target_size)
+    return smaller > 0 and larger % smaller == 0
+
+
+def native_area_compatibility_error(
+    band_areas: dict[str, AreaDefinition],
+    target_area: AreaDefinition,
+) -> str | None:
+    problems = []
+    for band, area in band_areas.items():
+        try:
+            height, width = area_slice_shape(area, target_area)
+        except Exception as exc:
+            problems.append(f"{band}: could not slice source area ({exc})")
+            continue
+        if not (
+            native_ratio_is_integer(height, target_area.height)
+            and native_ratio_is_integer(width, target_area.width)
+        ):
+            problems.append(
+                f"{band}: source slice {width}x{height} cannot resample natively "
+                f"to target {target_area.width}x{target_area.height}"
+            )
+    if not problems:
+        return None
+    return (
+        "Native target area is not integer-compatible with all requested bands. "
+        + "; ".join(problems)
+    )
+
+
 def snap_extent_to_template_grid(
     template_area: AreaDefinition,
     extent: tuple[float, float, float, float],
@@ -956,10 +1149,11 @@ def snap_extent_to_template_grid(
 ) -> tuple[float, float, float, float]:
     x_min, y_min, x_max, y_max = extent
     base_x_min, base_y_min, base_x_max, base_y_max = template_area.area_extent
-    left_index = max(0, int(np.ceil((x_min - base_x_min) / pixel_size_m)))
-    bottom_index = max(0, int(np.ceil((y_min - base_y_min) / pixel_size_m)))
-    right_index = min(template_area.width, int(np.floor((x_max - base_x_min) / pixel_size_m)))
-    top_index = min(template_area.height, int(np.floor((y_max - base_y_min) / pixel_size_m)))
+    tol = NATIVE_GRID_INDEX_TOLERANCE
+    left_index = max(0, int(np.ceil((x_min - base_x_min) / pixel_size_m - tol)))
+    bottom_index = max(0, int(np.ceil((y_min - base_y_min) / pixel_size_m - tol)))
+    right_index = min(template_area.width, int(np.floor((x_max - base_x_min) / pixel_size_m + tol)))
+    top_index = min(template_area.height, int(np.floor((y_max - base_y_min) / pixel_size_m + tol)))
     if left_index >= right_index or bottom_index >= top_index:
         raise RuntimeError("No common geographic area across selected frames.")
     return (
@@ -997,38 +1191,153 @@ def find_native_common_area(
                 shape = same_area_slice_shape(areas, candidate)
                 if shape is not None:
                     return candidate, shape
-    raise RuntimeError("Could not snap common area to native B13 grid for all frames.")
+    raise RuntimeError("Could not snap common area to the native source grid for all frames.")
+
+
+def compatibility_area_labels(compatibility_areas: dict[str, AreaDefinition]) -> str:
+    bands = sorted({label.split(":", 1)[-1] for label in compatibility_areas})
+    return "/".join(bands) if bands else "requested bands"
+
+
+def native_dimension_compatible(
+    compatibility_areas: dict[str, AreaDefinition],
+    target_area: AreaDefinition,
+    dimension: str,
+) -> bool:
+    for area in compatibility_areas.values():
+        try:
+            height, width = area_slice_shape(area, target_area)
+        except Exception:
+            return False
+        if dimension == "x":
+            if not native_ratio_is_integer(width, target_area.width):
+                return False
+        elif dimension == "y":
+            if not native_ratio_is_integer(height, target_area.height):
+                return False
+        else:
+            raise ValueError(f"Unsupported dimension: {dimension}")
+    return True
+
+
+def find_dimension_crop(
+    target_area: AreaDefinition,
+    compatibility_areas: dict[str, AreaDefinition],
+    target_pixel_size_m: int,
+    dimension: str,
+    max_crop_pixels: int,
+) -> tuple[int, int]:
+    if native_dimension_compatible(compatibility_areas, target_area, dimension):
+        return 0, 0
+    for total_crop in range(1, max_crop_pixels + 1):
+        for lower_crop in range(total_crop + 1):
+            upper_crop = total_crop - lower_crop
+            if dimension == "x":
+                candidate = crop_native_area(target_area, lower_crop, 0, upper_crop, 0, target_pixel_size_m)
+            elif dimension == "y":
+                candidate = crop_native_area(target_area, 0, lower_crop, 0, upper_crop, target_pixel_size_m)
+            else:
+                raise ValueError(f"Unsupported dimension: {dimension}")
+            if candidate is not None and native_dimension_compatible(compatibility_areas, candidate, dimension):
+                return lower_crop, upper_crop
+    raise RuntimeError(f"Could not find native-compatible {dimension}-axis crop.")
+
+
+def refine_native_compatible_target_area(
+    target_area: AreaDefinition,
+    compatibility_areas: dict[str, AreaDefinition],
+    target_pixel_size_m: int,
+    max_crop_pixels: int = MAX_NATIVE_COMPATIBILITY_CROP_PIXELS,
+) -> AreaDefinition:
+    if not compatibility_areas:
+        return target_area
+    if native_area_compatibility_error(compatibility_areas, target_area) is None:
+        return target_area
+
+    try:
+        left_crop, right_crop = find_dimension_crop(
+            target_area,
+            compatibility_areas,
+            target_pixel_size_m,
+            "x",
+            max_crop_pixels,
+        )
+        x_refined = crop_native_area(target_area, left_crop, 0, right_crop, 0, target_pixel_size_m)
+        if x_refined is None:
+            raise RuntimeError("Horizontal native-compatible crop removed the full target area.")
+        bottom_crop, top_crop = find_dimension_crop(
+            x_refined,
+            compatibility_areas,
+            target_pixel_size_m,
+            "y",
+            max_crop_pixels,
+        )
+        candidate = crop_native_area(
+            target_area,
+            left_crop,
+            bottom_crop,
+            right_crop,
+            top_crop,
+            target_pixel_size_m,
+        )
+        if candidate is not None and native_area_compatibility_error(compatibility_areas, candidate) is None:
+            labels = compatibility_area_labels(compatibility_areas)
+            LOG.info(
+                "Adjusted target area by %s/%s/%s/%s px for %s native compatibility",
+                left_crop,
+                bottom_crop,
+                right_crop,
+                top_crop,
+                labels,
+            )
+            return candidate
+    except RuntimeError:
+        pass
+
+    error = native_area_compatibility_error(compatibility_areas, target_area)
+    raise RuntimeError(
+        "Selected frames cannot be aligned to a native low-RAM target area across all required bands. "
+        "Try a shorter timelapse range, use Single Image, or choose a coarser product such as B13. "
+        f"Last compatibility check: {error}"
+    )
 
 
 def native_compatible_common_area(
     areas: Iterable[AreaDefinition],
     target_pixel_size_m: int,
     source_pixel_size_m: int = BAND_PIXEL_SIZE_M["B13"],
+    compatibility_areas: dict[str, AreaDefinition] | None = None,
 ) -> AreaDefinition:
     area_list = list(areas)
     if not area_list:
-        raise RuntimeError("Could not determine geographic area from B13 scan segments.")
+        raise RuntimeError("Could not determine geographic area from scan segments.")
     if source_pixel_size_m % target_pixel_size_m != 0:
         raise RuntimeError(
             f"Target pixel size {target_pixel_size_m} m is not an integer native factor "
-            f"of {source_pixel_size_m} m B13 scan data."
+            f"of {source_pixel_size_m} m source scan data."
         )
 
     template_area = area_list[0]
-    common, b13_shape = find_native_common_area(area_list, intersect_extents(area_list), source_pixel_size_m)
-    height_b13, width_b13 = b13_shape
-    if height_b13 <= 0 or width_b13 <= 0:
+    all_areas = list(compatibility_areas.values()) if compatibility_areas else area_list
+    common, source_shape = find_native_common_area(area_list, intersect_extents(all_areas), source_pixel_size_m)
+    source_height, source_width = source_shape
+    if source_height <= 0 or source_width <= 0:
         raise RuntimeError("No common geographic area across selected frames.")
 
     target_factor = source_pixel_size_m // target_pixel_size_m
-    return AreaDefinition(
+    target_area = AreaDefinition(
         "stabilized_target",
         "Stabilized Target Area",
         "stabilized_target",
         template_area.crs,
-        width_b13 * target_factor,
-        height_b13 * target_factor,
+        source_width * target_factor,
+        source_height * target_factor,
         common.area_extent,
+    )
+    return refine_native_compatible_target_area(
+        target_area,
+        compatibility_areas or {},
+        target_pixel_size_m,
     )
 
 
@@ -1036,18 +1345,25 @@ def common_area_from_frames(
     info: UrlInfo,
     steps: list[datetime],
     pixel_size_m: int,
+    area_band: str,
+    compatibility_bands: Iterable[str] | None = None,
     config: ProcessorConfig | None = None,
     progress: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
 ) -> AreaDefinition:
     config = config or default_config()
     LOG.info("Scanning frames for common native area")
-    emit_progress(progress, "Downloading B13 scan segments for common area", 0, len(steps))
+    scan_bands = tuple(dict.fromkeys(compatibility_bands or (area_band,)))
+    if area_band not in scan_bands:
+        scan_bands = (area_band, *scan_bands)
+    emit_progress(progress, f"Downloading {', '.join(scan_bands)} scan segments for common area", 0, len(steps))
     areas = []
+    compatibility_areas: dict[str, AreaDefinition] = {}
+    source_pixel_size_m = BAND_PIXEL_SIZE_M[area_band]
 
     for idx, dt in enumerate(steps, start=1):
         check_cancel(cancel_event)
-        tasks = make_download_tasks(info, dt, ("B13",), TEMP_DIR)
+        tasks = make_download_tasks(info, dt, scan_bands, TEMP_DIR)
         results = download_segments(
             tasks,
             config.download_workers,
@@ -1061,8 +1377,10 @@ def common_area_from_frames(
             continue
         try:
             scene = Scene(filenames=[str(path) for path in results], reader="ahi_hsd")
-            scene.load(["B13"], calibration="brightness_temperature")
-            area = scene["B13"].attrs["area"]
+            for band in scan_bands:
+                scene.load([band], calibration=calibration_for_band(band))
+                compatibility_areas[f"{dt:%Y%m%d_%H%M}:{band}"] = scene[band].attrs["area"]
+            area = scene[area_band].attrs["area"]
             areas.append(area)
             LOG.info("Scanned %s", dt.strftime("%Y%m%d_%H%M"))
             emit_progress(progress, f"Area scanned {idx}/{len(steps)}", idx, len(steps))
@@ -1073,8 +1391,19 @@ def common_area_from_frames(
 
     log_memory("area scan complete", config)
 
-    target_area = native_compatible_common_area(areas, pixel_size_m)
-    LOG.info("Area locked: %sx%s px at %s m native target", target_area.width, target_area.height, pixel_size_m)
+    target_area = native_compatible_common_area(
+        areas,
+        pixel_size_m,
+        source_pixel_size_m=source_pixel_size_m,
+        compatibility_areas=compatibility_areas,
+    )
+    LOG.info(
+        "Area locked: %sx%s px at %s m native target using %s grid",
+        target_area.width,
+        target_area.height,
+        pixel_size_m,
+        area_band,
+    )
     return target_area
 
 
@@ -1121,10 +1450,26 @@ def missing_satpy_dataset(exc: BaseException, dataset_name: str) -> bool:
     current: BaseException | None = exc
     while current is not None:
         message = str(current)
-        if "No dataset matching" in message and dataset_pattern.search(message):
+        if (
+            dataset_pattern.search(message)
+            and (
+                "No dataset matching" in message
+                or "unknown dataset" in message.lower()
+                or "could not find" in message.lower()
+                or "not found" in message.lower()
+            )
+        ):
             return True
         current = current.__cause__ or current.__context__
     return False
+
+
+def use_custom_satpy_missing_dataset_fallback(exc: BaseException, active: str, satpy_name: str) -> bool:
+    return active in CUSTOM_SATPY_MISSING_DATASET_FALLBACKS and missing_satpy_dataset(exc, satpy_name)
+
+
+def use_true_color_reproduction_fallback(exc: BaseException, active: str, satpy_name: str) -> bool:
+    return use_custom_satpy_missing_dataset_fallback(exc, active, satpy_name)
 
 
 def missing_pyspectral_message(composite_name: str) -> str:
@@ -1194,6 +1539,19 @@ def save_custom_composite_output(
     load_bands(scene, custom_bands)
     log_memory("after load", config)
     check_cancel(cancel_event)
+    band_areas = {band: scene[band].attrs["area"] for band in custom_bands}
+    compatibility_error = native_area_compatibility_error(band_areas, master_area)
+    if compatibility_error:
+        if is_night:
+            emit_progress(
+                progress,
+                f"Skipping night fallback frame; {active} is not native-compatible with the locked target area",
+                None,
+                None,
+            )
+        else:
+            emit_progress(progress, f"Skipping frame; {active} is not native-compatible with target area", None, None)
+        raise RuntimeError(compatibility_error)
     emit_progress(progress, "Resampling", None, None)
     resampled = resample_scene_low_ram(scene, master_area, config, datasets=custom_bands)
     log_memory("after resample", config)
@@ -1214,6 +1572,59 @@ def save_custom_composite_output(
     )
     log_memory("after save", config)
     return output_path
+
+
+def save_custom_satpy_missing_dataset_fallback(
+    local_files: list[Path],
+    active: str,
+    satpy_name: str,
+    master_area: AreaDefinition,
+    output_path: Path,
+    config: ProcessorConfig,
+    is_night: bool,
+    overlay_options: dict | None,
+    progress: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
+) -> Path:
+    message = f"Satpy {satpy_name} unavailable; using custom low-RAM fallback"
+    LOG.warning("%s.", message)
+    emit_progress(progress, message, None, None)
+    scene = Scene(filenames=[str(path) for path in local_files], reader="ahi_hsd")
+    return save_custom_composite_output(
+        scene,
+        active,
+        master_area,
+        output_path,
+        config,
+        is_night,
+        overlay_options,
+        progress=progress,
+        cancel_event=cancel_event,
+    )
+
+
+def save_true_color_reproduction_fallback(
+    local_files: list[Path],
+    master_area: AreaDefinition,
+    output_path: Path,
+    config: ProcessorConfig,
+    is_night: bool,
+    overlay_options: dict | None,
+    progress: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
+) -> Path:
+    return save_custom_satpy_missing_dataset_fallback(
+        local_files,
+        "True Color Reproduction Image",
+        "true_color_reproduction",
+        master_area,
+        output_path,
+        config,
+        is_night,
+        overlay_options,
+        progress=progress,
+        cancel_event=cancel_event,
+    )
 
 
 def process_frame(
@@ -1288,14 +1699,11 @@ def process_frame(
             try:
                 scene.load([satpy_name])
             except Exception as exc:
-                if active == "True Color Reproduction Image" and missing_satpy_dataset(exc, satpy_name):
-                    message = "Satpy true_color_reproduction unavailable; using custom low-RAM fallback"
-                    LOG.warning("%s.", message)
-                    emit_progress(progress, message, None, None)
-                    scene = Scene(filenames=[str(path) for path in local_files], reader="ahi_hsd")
-                    return save_custom_composite_output(
-                        scene,
+                if use_custom_satpy_missing_dataset_fallback(exc, active, satpy_name):
+                    output_path = save_custom_satpy_missing_dataset_fallback(
+                        local_files,
                         active,
+                        satpy_name,
                         master_area,
                         output_path,
                         config,
@@ -1304,6 +1712,8 @@ def process_frame(
                         progress=progress,
                         cancel_event=cancel_event,
                     )
+                    frame_succeeded = True
+                    return output_path
                 if (
                     active in QUALITY_CRITICAL_COMPOSITES
                     and not config.allow_quality_fallback
@@ -1326,18 +1736,35 @@ def process_frame(
             log_memory("after load", config)
             check_cancel(cancel_event)
             emit_progress(progress, "Resampling", None, None)
-            resampled = resample_scene_low_ram(scene, master_area, config, datasets=[satpy_name])
-            log_memory("after resample", config)
-            check_cancel(cancel_event)
-            emit_progress(progress, f"Saving {output_path.name}", None, None)
-            output_path = save_dataset_with_optional_overlay(
-                resampled,
-                satpy_name,
-                output_path,
-                writer_for_output(output_path),
-                enhance=True,
-                overlay=overlay_options,
-            )
+            try:
+                resampled = resample_scene_low_ram(scene, master_area, config, datasets=[satpy_name])
+                log_memory("after resample", config)
+                check_cancel(cancel_event)
+                emit_progress(progress, f"Saving {output_path.name}", None, None)
+                output_path = save_dataset_with_optional_overlay(
+                    resampled,
+                    satpy_name,
+                    output_path,
+                    writer_for_output(output_path),
+                    enhance=True,
+                    overlay=overlay_options,
+                )
+            except Exception as exc:
+                if use_custom_satpy_missing_dataset_fallback(exc, active, satpy_name):
+                    output_path = save_custom_satpy_missing_dataset_fallback(
+                        local_files,
+                        active,
+                        satpy_name,
+                        master_area,
+                        output_path,
+                        config,
+                        is_night,
+                        overlay_options,
+                        progress=progress,
+                        cancel_event=cancel_event,
+                    )
+                else:
+                    raise
             log_memory("after save", config)
             frame_succeeded = True
             return output_path
@@ -1363,10 +1790,7 @@ def process_frame(
         return None
     finally:
         scene = None
-        if frame_succeeded:
-            cleanup_paths([frame_dir])
-        else:
-            cleanup_partial_downloads(frame_dir)
+        cleanup_partial_downloads(frame_dir)
         gc.collect()
         log_memory("frame cleanup", config)
 
@@ -1385,12 +1809,9 @@ def assemble_timelapse(
 
     safe_composite = re.sub(r"[^A-Za-z0-9]+", "_", config.composite_choice).strip("_")
     fmt = config.timelapse_format.lower()
-    if fmt == "mp4":
-        try:
-            import imageio_ffmpeg  # noqa: F401
-        except Exception:
-            LOG.warning("imageio-ffmpeg is unavailable; falling back to GIF")
-            fmt = "gif"
+    if fmt == "mp4" and not has_module("imageio_ffmpeg"):
+        LOG.warning("imageio-ffmpeg is unavailable; falling back to GIF")
+        fmt = "gif"
 
     import imageio.v2 as imageio
 
@@ -1493,12 +1914,15 @@ def run(
     info = parse_url(config.user_url)
     start = datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
     steps = frame_datetimes(start, config.mode, config.hours_back, config.interval_minutes)
+    area_band = area_reference_band(config.composite_choice)
     check_cancel(cancel_event)
     log_memory("startup", config)
     master_area = common_area_from_frames(
         info,
         steps,
         target_pixel_size_m(config.composite_choice, config.use_night_fallback),
+        area_band,
+        compatibility_bands=area_compatibility_bands(config.composite_choice),
         config=config,
         progress=progress,
         cancel_event=cancel_event,
@@ -1523,6 +1947,18 @@ def run(
             outputs.append(result)
 
     if config.mode == "Timelapse" and outputs:
+        if len(outputs) != len(steps):
+            LOG.warning(
+                "Timelapse assembled from %s/%s successful frame(s). Check earlier frame errors.",
+                len(outputs),
+                len(steps),
+            )
+            emit_progress(
+                progress,
+                f"Timelapse using {len(outputs)}/{len(steps)} successful frames",
+                len(outputs),
+                len(steps),
+            )
         movie = assemble_timelapse(outputs, info, config=config, progress=progress, cancel_event=cancel_event)
         return [movie] if movie else []
     if config.mode == "Timelapse":
