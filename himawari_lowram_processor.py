@@ -2719,7 +2719,7 @@ class HimawariProcessorApp:
         self.root = root
         self.root.title(f"{APP_DISPLAY_NAME} v{APP_VERSION}")
         self.root.geometry("1060x800")
-        self.root.minsize(920, 680)
+        self.root.minsize(820, 520)
         self.messages: queue.Queue[tuple[str, object]] = queue.Queue()
         self.worker: threading.Thread | None = None
         self.is_running = False
@@ -2767,6 +2767,63 @@ class HimawariProcessorApp:
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%H:%M:%S"))
         LOG.addHandler(handler)
 
+    @staticmethod
+    def _mouse_wheel_units(event: tk.Event) -> int:
+        delta = getattr(event, "delta", 0)
+        if delta:
+            return -1 * int(delta / 120)
+        button = getattr(event, "num", None)
+        if button == 4:
+            return -1
+        if button == 5:
+            return 1
+        return 0
+
+    def _create_scrollable_tab(self, notebook: ttk.Notebook, label: str) -> ttk.Frame:
+        tab = ttk.Frame(notebook)
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(0, weight=1)
+        notebook.add(tab, text=label)
+
+        canvas = tk.Canvas(tab, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas, padding=(12, 10))
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        def refresh_scroll_region(_event: tk.Event | None = None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def resize_inner(event: tk.Event) -> None:
+            canvas.itemconfigure(window_id, width=event.width)
+
+        def on_mouse_wheel(event: tk.Event) -> str:
+            units = self._mouse_wheel_units(event)
+            if units:
+                canvas.yview_scroll(units, "units")
+            return "break"
+
+        def bind_mouse_wheel(_event: tk.Event) -> None:
+            canvas.bind_all("<MouseWheel>", on_mouse_wheel)
+            canvas.bind_all("<Button-4>", on_mouse_wheel)
+            canvas.bind_all("<Button-5>", on_mouse_wheel)
+
+        def unbind_mouse_wheel(_event: tk.Event) -> None:
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        inner.bind("<Configure>", refresh_scroll_region)
+        canvas.bind("<Configure>", resize_inner)
+        canvas.bind("<Enter>", bind_mouse_wheel)
+        canvas.bind("<Leave>", unbind_mouse_wheel)
+        inner.bind("<Enter>", bind_mouse_wheel)
+        inner.bind("<Leave>", unbind_mouse_wheel)
+        return inner
+
     def _build_ui(self) -> None:
         style = ttk.Style(self.root)
         try:
@@ -2792,10 +2849,8 @@ class HimawariProcessorApp:
         notebook = ttk.Notebook(self.root)
         notebook.grid(row=1, column=0, sticky="nsew", padx=16, pady=8)
 
-        settings = ttk.Frame(notebook, padding=(12, 10))
-        advanced = ttk.Frame(notebook, padding=(12, 10))
-        notebook.add(settings, text="Run Setup")
-        notebook.add(advanced, text="Advanced")
+        settings = self._create_scrollable_tab(notebook, "Run Setup")
+        advanced = self._create_scrollable_tab(notebook, "Advanced")
 
         for col in (0, 1):
             settings.columnconfigure(col, weight=1)

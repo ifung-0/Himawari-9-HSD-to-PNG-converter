@@ -45,6 +45,12 @@ class FakeRoot:
         self.updated = True
 
 
+class FakeEvent:
+    def __init__(self, delta=0, num=None):
+        self.delta = delta
+        self.num = num
+
+
 class ProcessorTests(unittest.TestCase):
     def test_app_version_label(self):
         self.assertRegex(h.APP_VERSION, r"^\d{4}\.\d{2}\.\d{2}\.\d+$")
@@ -1550,6 +1556,13 @@ class ProcessorTests(unittest.TestCase):
 
         self.assertIn("No processing error", app.root.clipboard)
 
+    def test_gui_mouse_wheel_units_supports_common_platform_events(self):
+        self.assertEqual(h.HimawariProcessorApp._mouse_wheel_units(FakeEvent(delta=120)), -1)
+        self.assertEqual(h.HimawariProcessorApp._mouse_wheel_units(FakeEvent(delta=-120)), 1)
+        self.assertEqual(h.HimawariProcessorApp._mouse_wheel_units(FakeEvent(num=4)), -1)
+        self.assertEqual(h.HimawariProcessorApp._mouse_wheel_units(FakeEvent(num=5)), 1)
+        self.assertEqual(h.HimawariProcessorApp._mouse_wheel_units(FakeEvent()), 0)
+
     def test_gui_running_state_disables_mutable_controls(self):
         app = object.__new__(h.HimawariProcessorApp)
         app.start_button = FakeWidget()
@@ -1560,6 +1573,11 @@ class ProcessorTests(unittest.TestCase):
         app.open_output_button = FakeWidget()
         app.check_env_button = FakeWidget()
         app.quick_fix_button = FakeWidget()
+        app.latest_url_button = FakeWidget()
+        app.overlay_check_button = FakeWidget()
+        app.open_last_button = FakeWidget()
+        app.copy_paths_button = FakeWidget()
+        app.copy_error_button = FakeWidget()
         app._path_controls = (app.choose_output_button, app.choose_temp_button, app.open_temp_button)
         app._refresh_mode_state = mock.Mock()
 
@@ -1572,6 +1590,9 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(app.open_output_button.configured["state"], "disabled")
         self.assertEqual(app.check_env_button.configured["state"], "disabled")
         self.assertEqual(app.quick_fix_button.configured["state"], "disabled")
+        self.assertEqual(app.latest_url_button.configured["state"], "disabled")
+        self.assertEqual(app.overlay_check_button.configured["state"], "disabled")
+        self.assertEqual(app.copy_error_button.configured["state"], "disabled")
 
         h.HimawariProcessorApp._set_running(app, False)
 
@@ -1579,6 +1600,7 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(app.stop_button.configured["state"], "disabled")
         self.assertEqual(app.choose_output_button.configured["state"], "normal")
         self.assertEqual(app.choose_temp_button.configured["state"], "normal")
+        self.assertEqual(app.latest_url_button.configured["state"], "normal")
 
     def test_gui_path_fields_refresh_from_selected_directories(self):
         app = object.__new__(h.HimawariProcessorApp)
