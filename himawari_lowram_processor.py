@@ -3482,7 +3482,7 @@ class HimawariProcessorApp:
         notebook_pane = ttk.Frame(self.main_pane)
         notebook_pane.columnconfigure(0, weight=1)
         notebook_pane.rowconfigure(0, weight=1)
-        self.main_pane.add(notebook_pane, weight=1, minsize=180)
+        self.main_pane.add(notebook_pane, weight=1)
 
         self.notebook = ttk.Notebook(notebook_pane)
         self.notebook.grid(row=0, column=0, sticky="nsew")
@@ -3756,7 +3756,7 @@ class HimawariProcessorApp:
         self.log_frame = ttk.Frame(self.main_pane, padding=(0, 4, 0, 0))
         self.log_frame.columnconfigure(0, weight=1)
         self.log_frame.rowconfigure(1, weight=1)
-        self.main_pane.add(self.log_frame, weight=1, minsize=180)
+        self.main_pane.add(self.log_frame, weight=1)
 
         progress = ttk.Progressbar(self.log_frame, variable=self.progress_var, maximum=100)
         progress.grid(row=0, column=0, sticky="ew", pady=(0, 6))

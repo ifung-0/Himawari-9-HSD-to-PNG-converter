@@ -1795,6 +1795,12 @@ class ProcessorTests(unittest.TestCase):
 
         self.assertEqual(app.main_pane.sash_positions, [(0, 400)])
 
+    def test_gui_main_split_does_not_use_unsupported_minsize_option(self):
+        source = h.Path(h.__file__).read_text(encoding="utf-8")
+
+        self.assertNotIn("self.main_pane.add(notebook_pane, weight=1, minsize=", source)
+        self.assertNotIn("self.main_pane.add(self.log_frame, weight=1, minsize=", source)
+
     def test_gui_running_state_disables_mutable_controls(self):
         app = object.__new__(h.HimawariProcessorApp)
         app.start_button = FakeWidget()
