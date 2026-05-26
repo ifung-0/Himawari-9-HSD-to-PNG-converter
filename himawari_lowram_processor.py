@@ -3445,11 +3445,14 @@ class HimawariProcessorApp:
         return max(minimum_pane_height, min(desired, total_height - minimum_pane_height))
 
     def _configure_main_split(self) -> None:
-        def set_initial_sash() -> None:
+        def set_initial_sash(attempt: int = 0) -> None:
             height = self.main_pane.winfo_height()
+            if height < 360 and attempt < 20:
+                self.root.after(50, lambda: set_initial_sash(attempt + 1))
+                return
             self.main_pane.sashpos(0, self._initial_split_position(height))
 
-        self.root.after(100, set_initial_sash)
+        self.root.after_idle(set_initial_sash)
 
     def _build_ui(self) -> None:
         style = ttk.Style(self.root)
@@ -3479,7 +3482,7 @@ class HimawariProcessorApp:
         notebook_pane = ttk.Frame(self.main_pane)
         notebook_pane.columnconfigure(0, weight=1)
         notebook_pane.rowconfigure(0, weight=1)
-        self.main_pane.add(notebook_pane, weight=1)
+        self.main_pane.add(notebook_pane, weight=1, minsize=180)
 
         self.notebook = ttk.Notebook(notebook_pane)
         self.notebook.grid(row=0, column=0, sticky="nsew")
@@ -3753,7 +3756,7 @@ class HimawariProcessorApp:
         self.log_frame = ttk.Frame(self.main_pane, padding=(0, 4, 0, 0))
         self.log_frame.columnconfigure(0, weight=1)
         self.log_frame.rowconfigure(1, weight=1)
-        self.main_pane.add(self.log_frame, weight=1)
+        self.main_pane.add(self.log_frame, weight=1, minsize=180)
 
         progress = ttk.Progressbar(self.log_frame, variable=self.progress_var, maximum=100)
         progress.grid(row=0, column=0, sticky="ew", pady=(0, 6))

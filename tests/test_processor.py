@@ -45,6 +45,32 @@ class FakeRoot:
         self.updated = True
 
 
+class FakeScheduledRoot(FakeRoot):
+    def __init__(self):
+        super().__init__()
+        self.callbacks = []
+
+    def after_idle(self, callback):
+        self.callbacks.append(callback)
+
+    def after(self, _delay, callback):
+        self.callbacks.append(callback)
+
+
+class FakePane:
+    def __init__(self, heights):
+        self.heights = list(heights)
+        self.sash_positions = []
+
+    def winfo_height(self):
+        if self.heights:
+            return self.heights.pop(0)
+        return 800
+
+    def sashpos(self, index, position):
+        self.sash_positions.append((index, position))
+
+
 class FakeEvent:
     def __init__(self, delta=0, num=None):
         self.delta = delta
@@ -1756,6 +1782,18 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(h.HimawariProcessorApp._initial_split_position(800), 400)
         self.assertEqual(h.HimawariProcessorApp._initial_split_position(800, ratio=0.05), 160)
         self.assertEqual(h.HimawariProcessorApp._initial_split_position(800, ratio=0.95), 640)
+
+    def test_gui_main_split_waits_for_real_height(self):
+        app = object.__new__(h.HimawariProcessorApp)
+        app.root = FakeScheduledRoot()
+        app.main_pane = FakePane([1, 240, 800])
+
+        h.HimawariProcessorApp._configure_main_split(app)
+        while app.root.callbacks:
+            callback = app.root.callbacks.pop(0)
+            callback()
+
+        self.assertEqual(app.main_pane.sash_positions, [(0, 400)])
 
     def test_gui_running_state_disables_mutable_controls(self):
         app = object.__new__(h.HimawariProcessorApp)
