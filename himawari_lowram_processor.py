@@ -2824,6 +2824,23 @@ class HimawariProcessorApp:
         inner.bind("<Leave>", unbind_mouse_wheel)
         return inner
 
+    @staticmethod
+    def _initial_split_position(total_height: int, ratio: float = 0.45) -> int:
+        if total_height <= 0:
+            return 220
+        minimum_pane_height = 160
+        if total_height <= minimum_pane_height * 2:
+            return max(80, total_height // 2)
+        desired = int(total_height * ratio)
+        return max(minimum_pane_height, min(desired, total_height - minimum_pane_height))
+
+    def _configure_main_split(self) -> None:
+        def set_initial_sash() -> None:
+            height = self.main_pane.winfo_height()
+            self.main_pane.sashpos(0, self._initial_split_position(height))
+
+        self.root.after(100, set_initial_sash)
+
     def _build_ui(self) -> None:
         style = ttk.Style(self.root)
         try:
@@ -2837,7 +2854,7 @@ class HimawariProcessorApp:
         style.configure("Status.TLabel", justify="left")
 
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(2, weight=1)
+        self.root.rowconfigure(1, weight=1)
 
         title = ttk.Label(
             self.root,
@@ -2846,11 +2863,19 @@ class HimawariProcessorApp:
         )
         title.grid(row=0, column=0, sticky="w", padx=16, pady=(14, 6))
 
-        notebook = ttk.Notebook(self.root)
-        notebook.grid(row=1, column=0, sticky="nsew", padx=16, pady=8)
+        self.main_pane = ttk.PanedWindow(self.root, orient="vertical")
+        self.main_pane.grid(row=1, column=0, sticky="nsew", padx=16, pady=8)
 
-        settings = self._create_scrollable_tab(notebook, "Run Setup")
-        advanced = self._create_scrollable_tab(notebook, "Advanced")
+        notebook_pane = ttk.Frame(self.main_pane)
+        notebook_pane.columnconfigure(0, weight=1)
+        notebook_pane.rowconfigure(0, weight=1)
+        self.main_pane.add(notebook_pane, weight=1)
+
+        self.notebook = ttk.Notebook(notebook_pane)
+        self.notebook.grid(row=0, column=0, sticky="nsew")
+
+        settings = self._create_scrollable_tab(self.notebook, "Run Setup")
+        advanced = self._create_scrollable_tab(self.notebook, "Advanced")
 
         for col in (0, 1):
             settings.columnconfigure(col, weight=1)
@@ -3053,23 +3078,23 @@ class HimawariProcessorApp:
         )
         self._refresh_mode_state()
 
-        log_frame = ttk.Frame(self.root, padding=(16, 4, 16, 8))
-        log_frame.grid(row=2, column=0, sticky="nsew")
-        log_frame.columnconfigure(0, weight=1)
-        log_frame.rowconfigure(1, weight=1)
+        self.log_frame = ttk.Frame(self.main_pane, padding=(0, 4, 0, 0))
+        self.log_frame.columnconfigure(0, weight=1)
+        self.log_frame.rowconfigure(1, weight=1)
+        self.main_pane.add(self.log_frame, weight=1)
 
-        progress = ttk.Progressbar(log_frame, variable=self.progress_var, maximum=100)
+        progress = ttk.Progressbar(self.log_frame, variable=self.progress_var, maximum=100)
         progress.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        ttk.Label(log_frame, textvariable=self.status_var).grid(row=0, column=1, sticky="e", padx=(10, 0))
+        ttk.Label(self.log_frame, textvariable=self.status_var).grid(row=0, column=1, sticky="e", padx=(10, 0))
 
-        self.log_text = tk.Text(log_frame, height=16, wrap="word", state="disabled")
+        self.log_text = tk.Text(self.log_frame, height=16, wrap="word", state="disabled")
         self.log_text.grid(row=1, column=0, columnspan=2, sticky="nsew")
-        scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
+        scroll = ttk.Scrollbar(self.log_frame, orient="vertical", command=self.log_text.yview)
         scroll.grid(row=1, column=2, sticky="ns")
         self.log_text.configure(yscrollcommand=scroll.set)
 
         buttons = ttk.Frame(self.root, padding=(16, 0, 16, 16))
-        buttons.grid(row=3, column=0, sticky="ew")
+        buttons.grid(row=2, column=0, sticky="ew")
         buttons.columnconfigure(0, weight=1)
         self.start_button = ttk.Button(buttons, text="Start Processing", command=self._start, style="Primary.TButton")
         self.start_button.grid(row=0, column=1, padx=(0, 8))
@@ -3094,6 +3119,7 @@ class HimawariProcessorApp:
         self.copy_error_button = ttk.Button(buttons, text="Copy Error", command=self._copy_error_report)
         self.copy_error_button.grid(row=0, column=8, padx=(0, 8))
         ttk.Button(buttons, text="Close", command=self._terminate_app).grid(row=0, column=9)
+        self._configure_main_split()
 
     def _install_setup_watchers(self) -> None:
         watched_vars = (

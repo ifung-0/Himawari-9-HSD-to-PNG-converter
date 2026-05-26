@@ -1563,6 +1563,13 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(h.HimawariProcessorApp._mouse_wheel_units(FakeEvent(num=5)), 1)
         self.assertEqual(h.HimawariProcessorApp._mouse_wheel_units(FakeEvent()), 0)
 
+    def test_gui_initial_split_position_uses_clamped_ratio(self):
+        self.assertEqual(h.HimawariProcessorApp._initial_split_position(0), 220)
+        self.assertEqual(h.HimawariProcessorApp._initial_split_position(240), 120)
+        self.assertEqual(h.HimawariProcessorApp._initial_split_position(800), 360)
+        self.assertEqual(h.HimawariProcessorApp._initial_split_position(800, ratio=0.05), 160)
+        self.assertEqual(h.HimawariProcessorApp._initial_split_position(800, ratio=0.95), 640)
+
     def test_gui_running_state_disables_mutable_controls(self):
         app = object.__new__(h.HimawariProcessorApp)
         app.start_button = FakeWidget()
