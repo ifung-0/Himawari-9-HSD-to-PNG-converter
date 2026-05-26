@@ -495,8 +495,10 @@ class ProcessorTests(unittest.TestCase):
 
         status = h.build_setup_status(config, h.Path("C:/Himawari/outputs"), h.Path("C:/Himawari/temp"))
 
+        self.assertFalse(status.ok)
         self.assertTrue(any("Border lines require" in warning for warning in status.warnings))
         self.assertTrue(any("GSHHS/WDBII" in warning for warning in status.warnings))
+        self.assertTrue(any("GSHHS_l_L1.shp" in error for error in status.errors))
 
     @mock.patch.object(h.Path, "resolve", autospec=True)
     def test_setup_status_warns_for_cloud_sync_paths(self, mock_resolve):
@@ -516,8 +518,9 @@ class ProcessorTests(unittest.TestCase):
 
         self.assertFalse(status.ok)
         self.assertTrue(any("overlays" in item for item in status.missing_data))
+        self.assertTrue(any("GSHHS_l_L1.shp" in item for item in status.missing_data))
 
-    def test_overlay_status_ready_when_packages_and_shape_exist(self):
+    def test_overlay_status_rejects_arbitrary_shape_file(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             overlays = h.Path(tmp_dir) / "overlays"
             overlays.mkdir()
@@ -525,7 +528,29 @@ class ProcessorTests(unittest.TestCase):
 
             status = h.overlay_status(h.Path(tmp_dir), module_checker=lambda _module: True)
 
+        self.assertFalse(status.ok)
+        self.assertTrue(any("GSHHS_l_L1" in item for item in status.missing_data))
+
+    def test_overlay_status_ready_when_required_pycoast_files_exist(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            for path in h.overlay_data_required_paths(h.Path(tmp_dir)):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("fake")
+
+            status = h.overlay_status(h.Path(tmp_dir), module_checker=lambda _module: True)
+
         self.assertTrue(status.ok)
+
+    def test_overlay_status_reports_missing_packages(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            for path in h.overlay_data_required_paths(h.Path(tmp_dir)):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("fake")
+
+            status = h.overlay_status(h.Path(tmp_dir), module_checker=lambda module: module != "pycoast")
+
+        self.assertFalse(status.ok)
+        self.assertEqual(status.missing_packages, ("pycoast",))
 
     def test_build_run_summary_counts_frames_bands_and_segments(self):
         config = h.default_config()
@@ -549,6 +574,23 @@ class ProcessorTests(unittest.TestCase):
 
         self.assertFalse(result.ok)
         self.assertTrue(any("URL not recognised" in error for error in result.errors))
+
+    def test_preflight_blocks_missing_overlay_data_when_enabled(self):
+        config = h.default_config()
+        config.add_border_lines = True
+
+        result = h.preflight_run(config, h.Path("C:/Himawari/outputs"), h.Path("C:/Himawari/temp"))
+
+        self.assertFalse(result.ok)
+        self.assertTrue(any("GSHHS_l_L1.shp" in error for error in result.errors))
+
+    def test_preflight_does_not_require_overlay_data_when_disabled(self):
+        config = h.default_config()
+        config.add_border_lines = False
+
+        result = h.preflight_run(config, h.Path("C:/Himawari/outputs"), h.Path("C:/Himawari/temp"))
+
+        self.assertTrue(all("GSHHS_l_L1" not in error for error in result.errors))
 
     def test_preset_config_values_are_safe(self):
         fast = h.preset_config("Fast IR Check")
@@ -1801,6 +1843,23 @@ class ProcessorTests(unittest.TestCase):
         h.HimawariProcessorApp._copy_selected_recent_paths(app)
 
         self.assertEqual(app.root.clipboard, "out.png")
+
+    @mock.patch("himawari_lowram_processor.messagebox.showwarning")
+    def test_gui_overlay_check_creates_overlay_folder(self, mock_warning):
+        app = object.__new__(h.HimawariProcessorApp)
+        app._append_log = mock.Mock()
+        original_project = h.PROJECT_DIR
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                h.PROJECT_DIR = h.Path(tmp_dir)
+
+                h.HimawariProcessorApp._check_overlays(app)
+
+                self.assertTrue((h.Path(tmp_dir) / "overlays").exists())
+                mock_warning.assert_called_once()
+                self.assertTrue(app._append_log.called)
+        finally:
+            h.PROJECT_DIR = original_project
 
     def test_gui_path_fields_refresh_from_selected_directories(self):
         app = object.__new__(h.HimawariProcessorApp)

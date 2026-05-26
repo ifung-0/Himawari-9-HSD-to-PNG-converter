@@ -89,7 +89,8 @@ line color. The default border color is green.
 Overlay rendering uses Satpy/pycoast, so install requirements first and place
 pycoast-compatible coastline/border shapefiles under the project `overlays/`
 folder if your environment does not already provide them. `Check Overlay Setup`
-reports missing packages or missing shapefile data without downloading data.
+creates/opens the overlay folder and reports the exact pycoast files required;
+processing is blocked when border lines are enabled but those files are missing.
 
 The progress bar advances while segment downloads and timelapse frame assembly
 run, the phase/status strip summarizes the current stage, and the live log panel
@@ -480,8 +481,20 @@ Quick fix:
 python check_environment.py --fix
 ```
 
-Then add pycoast-compatible coastline/border data to the project `overlays/`
-folder.
+Then add pycoast-compatible GSHHS/WDBII coastline and border data to the project
+`overlays/` folder. For the default low-resolution overlay setting, the app
+expects these files:
+
+```text
+overlays/GSHHS_shp/l/GSHHS_l_L1.shp
+overlays/GSHHS_shp/l/GSHHS_l_L1.dbf
+overlays/WDBII_shp/l/WDBII_border_l_L1.shp
+overlays/WDBII_shp/l/WDBII_border_l_L1.dbf
+```
+
+If border lines are enabled and these files are missing, the GUI blocks Start
+before running the long image-processing job. Disable border lines to process
+without overlays.
 
 ### MP4 output falls back to GIF
 

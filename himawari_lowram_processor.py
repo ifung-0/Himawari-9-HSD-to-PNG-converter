@@ -80,6 +80,8 @@ NOAA_HIMAWARI9_BUCKET = "https://noaa-himawari9.s3.amazonaws.com"
 RECENT_RUN_LIMIT = 50
 CUSTOM_PRESET_LIMIT = 25
 PREVIEW_MAX_BYTES = 100 * 1024 * 1024
+OVERLAY_RESOLUTION = "l"
+OVERLAY_LEVEL = 1
 BUILT_IN_PRESETS = ("Balanced Single", "Fast IR Check", "Low-RAM Timelapse")
 ALLOWED_TEMPLATE_TOKENS = {"scan_time", "area", "product", "mode", "band", "format"}
 WINDOWS_RESERVED_FILENAME_CHARS = '<>:"/\\|?*'
@@ -1367,6 +1369,29 @@ def has_module(module_name: str) -> bool:
     return importlib.util.find_spec(module_name) is not None
 
 
+def overlay_data_required_paths(
+    project_dir: Path = PROJECT_DIR,
+    resolution: str = OVERLAY_RESOLUTION,
+    level: int = OVERLAY_LEVEL,
+) -> tuple[Path, ...]:
+    overlays_dir = project_dir / "overlays"
+    return (
+        overlays_dir / "GSHHS_shp" / resolution / f"GSHHS_{resolution}_L{level}.shp",
+        overlays_dir / "GSHHS_shp" / resolution / f"GSHHS_{resolution}_L{level}.dbf",
+        overlays_dir / "WDBII_shp" / resolution / f"WDBII_border_{resolution}_L{level}.shp",
+        overlays_dir / "WDBII_shp" / resolution / f"WDBII_border_{resolution}_L{level}.dbf",
+    )
+
+
+def overlay_data_layout_text(project_dir: Path = PROJECT_DIR) -> str:
+    paths = overlay_data_required_paths(project_dir)
+    return "Expected overlay data files:\n" + "\n".join(f"- {path}" for path in paths)
+
+
+def missing_overlay_data_paths(project_dir: Path = PROJECT_DIR) -> tuple[Path, ...]:
+    return tuple(path for path in overlay_data_required_paths(project_dir) if not path.exists())
+
+
 def overlay_status(
     project_dir: Path = PROJECT_DIR,
     module_checker: Callable[[str], bool] = has_module,
@@ -1374,11 +1399,16 @@ def overlay_status(
     missing_packages = tuple(module for module in ("pycoast", "aggdraw") if not module_checker(module))
     overlays_dir = project_dir / "overlays"
     missing_data: list[str] = []
-    details = [f"Overlay folder: {overlays_dir}"]
+    details = [
+        f"Overlay folder: {overlays_dir}",
+        overlay_data_layout_text(project_dir),
+    ]
     if not overlays_dir.exists():
         missing_data.append("overlays/ folder not found.")
-    elif not any(overlays_dir.rglob("*.shp")):
-        missing_data.append("No shapefile data found under overlays/.")
+    missing_paths = missing_overlay_data_paths(project_dir)
+    if missing_paths:
+        missing_data.append("Missing required pycoast overlay data file(s):")
+        missing_data.extend(str(path) for path in missing_paths)
     return OverlayStatus(
         ok=not missing_packages and not missing_data,
         details=tuple(details),
@@ -1434,9 +1464,9 @@ def build_overlay_options(config: ProcessorConfig) -> dict | None:
         "coast_dir": str(PROJECT_DIR / "overlays"),
         "color": color,
         "width": config.border_line_width,
-        "level_coast": 1,
-        "level_borders": 1,
-        "resolution": "l",
+        "level_coast": OVERLAY_LEVEL,
+        "level_borders": OVERLAY_LEVEL,
+        "resolution": OVERLAY_RESOLUTION,
     }
 
 
@@ -2079,7 +2109,8 @@ def save_dataset_with_optional_overlay(
             return output_path
         except Exception as exc:
             LOG.warning(
-                "Border overlay failed (%s). Saving image without border lines.",
+                "Border overlay failed (%s). Saving image without border lines. "
+                "Overlay preflight should normally catch missing pycoast data before processing.",
                 exc,
             )
     try:
@@ -2533,7 +2564,13 @@ def preflight_run(config: ProcessorConfig, output_dir: Path = OUTPUT_DIR, temp_d
     if config.add_border_lines:
         status = overlay_status()
         if not status.ok:
-            warnings.append(status.display_text())
+            for error in status.missing_data:
+                if error not in errors:
+                    errors.append(error)
+            for package in status.missing_packages:
+                package_error = f"Missing package needed for border overlays: {package}"
+                if package_error not in errors:
+                    errors.append(package_error)
 
     return PreflightResult(
         ok=not errors,
@@ -3243,9 +3280,14 @@ def build_setup_status(
         missing_packages = [module for module in ("pycoast", "aggdraw") if not has_module(module)]
         if missing_packages:
             overlay_notes.append("missing package(s): " + ", ".join(missing_packages))
-        if not (PROJECT_DIR / "overlays").exists():
-            overlay_notes.append("overlays/ folder not found")
+        missing_paths = missing_overlay_data_paths(PROJECT_DIR)
+        if missing_paths:
+            overlay_notes.append("missing required data file(s): " + ", ".join(str(path) for path in missing_paths))
         warnings.append("Border lines require " + "; ".join(overlay_notes) + ".")
+        status = overlay_status()
+        if not status.ok:
+            errors.extend(status.missing_data)
+            errors.extend(f"Missing package needed for border overlays: {package}" for package in status.missing_packages)
 
     cloud_matches = []
     for label, path in (("project", PROJECT_DIR), ("output", output_dir), ("temp", temp_dir)):
@@ -4281,8 +4323,15 @@ class HimawariProcessorApp:
         self._open_environment_command(["--fix"], "Environment quick fix")
 
     def _check_overlays(self) -> None:
+        overlays_dir = PROJECT_DIR / "overlays"
+        overlays_dir.mkdir(parents=True, exist_ok=True)
         status = overlay_status()
         self._append_log(status.display_text())
+        try:
+            if os.name == "nt":
+                os.startfile(str(overlays_dir))
+        except Exception as exc:
+            self._append_log(f"Could not open overlay folder: {exc}")
         if status.ok:
             messagebox.showinfo("Overlay setup", status.display_text())
         else:
