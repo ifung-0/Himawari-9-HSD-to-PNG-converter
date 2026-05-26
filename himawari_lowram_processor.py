@@ -2825,7 +2825,7 @@ class HimawariProcessorApp:
         return inner
 
     @staticmethod
-    def _initial_split_position(total_height: int, ratio: float = 0.45) -> int:
+    def _initial_split_position(total_height: int, ratio: float = 0.5) -> int:
         if total_height <= 0:
             return 220
         minimum_pane_height = 160

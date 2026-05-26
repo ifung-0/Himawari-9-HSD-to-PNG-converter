@@ -1566,7 +1566,7 @@ class ProcessorTests(unittest.TestCase):
     def test_gui_initial_split_position_uses_clamped_ratio(self):
         self.assertEqual(h.HimawariProcessorApp._initial_split_position(0), 220)
         self.assertEqual(h.HimawariProcessorApp._initial_split_position(240), 120)
-        self.assertEqual(h.HimawariProcessorApp._initial_split_position(800), 360)
+        self.assertEqual(h.HimawariProcessorApp._initial_split_position(800), 400)
         self.assertEqual(h.HimawariProcessorApp._initial_split_position(800, ratio=0.05), 160)
         self.assertEqual(h.HimawariProcessorApp._initial_split_position(800, ratio=0.95), 640)
 
