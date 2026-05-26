@@ -11,6 +11,7 @@ import os
 import queue
 import re
 import shutil
+import string
 import subprocess
 import sys
 import threading
@@ -49,6 +50,7 @@ DOWNLOAD_WORKERS = 4
 TIMELAPSE_FORMAT = "gif"  # "gif" or "mp4"
 DELETE_TIMELAPSE_FRAMES = True
 IMAGE_FORMAT = "png"  # Use "tif" for chunked GeoTIFF writes on very large outputs.
+OUTPUT_TEMPLATE = "Himawari_{area}_{scan_time}_{product}"
 RESAMPLER = "native"  # "native" is required for full-disk low-RAM processing.
 ADD_BORDER_LINES = False
 BORDER_LINE_COLOR = "green"
@@ -68,9 +70,19 @@ TEMP_DIR = PROJECT_DIR / "temp"
 CLOUD_SYNC_PREFIXES = ("onedrive", "dropbox", "google drive", "icloud")
 CLOUD_SYNC_EXACT = ("box",)
 GUI_SETTINGS_FILE = PROJECT_DIR / "himawari_gui_settings.json"
+RECENT_RUNS_FILE = PROJECT_DIR / "himawari_recent_runs.json"
+CUSTOM_PRESETS_FILE = PROJECT_DIR / "himawari_custom_presets.json"
 GUI_SETTINGS_SCHEMA_VERSION = 1
+RECENT_RUNS_SCHEMA_VERSION = 1
+CUSTOM_PRESETS_SCHEMA_VERSION = 1
 TIMELAPSE_MANIFEST_SCHEMA_VERSION = 1
 NOAA_HIMAWARI9_BUCKET = "https://noaa-himawari9.s3.amazonaws.com"
+RECENT_RUN_LIMIT = 50
+CUSTOM_PRESET_LIMIT = 25
+PREVIEW_MAX_BYTES = 100 * 1024 * 1024
+BUILT_IN_PRESETS = ("Balanced Single", "Fast IR Check", "Low-RAM Timelapse")
+ALLOWED_TEMPLATE_TOKENS = {"scan_time", "area", "product", "mode", "band", "format"}
+WINDOWS_RESERVED_FILENAME_CHARS = '<>:"/\\|?*'
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +276,7 @@ class ProcessorConfig:
     timelapse_format: str = TIMELAPSE_FORMAT
     delete_timelapse_frames: bool = DELETE_TIMELAPSE_FRAMES
     image_format: str = IMAGE_FORMAT
+    output_template: str = OUTPUT_TEMPLATE
     resampler: str = RESAMPLER
     allow_quality_fallback: bool = False
     add_border_lines: bool = ADD_BORDER_LINES
@@ -351,6 +364,56 @@ class PreflightResult:
             lines.append("Check before long runs:")
             lines.extend(f"- {warning}" for warning in self.warnings)
         return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class RecentScanChoice:
+    timestamp: str
+    band: str
+    url: str
+    label: str
+
+
+@dataclass(frozen=True)
+class OutputPreview:
+    path: Path
+    exists: bool
+    supported_preview: bool
+    reason: str
+    size_bytes: int | None = None
+    dimensions: tuple[int, int] | None = None
+
+    def display_text(self) -> str:
+        lines = [str(self.path)]
+        lines.append("Exists: yes" if self.exists else "Exists: no")
+        if self.size_bytes is not None:
+            lines.append(f"Size: {format_file_size(self.size_bytes)}")
+        if self.dimensions:
+            lines.append(f"Dimensions: {self.dimensions[0]} x {self.dimensions[1]}")
+        if self.reason:
+            lines.append(self.reason)
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class RecentRunRecord:
+    run_id: str
+    status: str
+    started_at_utc: str
+    completed_at_utc: str
+    app_version: str
+    mode: str
+    product: str
+    source: str
+    outputs: tuple[str, ...]
+    manifest_path: str
+    frame_dir: str
+    error: str
+    config: dict[str, object]
+
+    @property
+    def main_output(self) -> str:
+        return self.outputs[-1] if self.outputs else ""
 
 
 class ProcessingCancelled(RuntimeError):
@@ -530,6 +593,25 @@ def latest_fldk_url_from_listing(xml_text: str) -> str | None:
     return object_url_from_s3_key(sorted(candidates)[0])
 
 
+def fldk_scan_choices_from_listing(xml_text: str) -> list[RecentScanChoice]:
+    keys = parse_s3_listing_keys(xml_text)
+    choices: list[RecentScanChoice] = []
+    for key in sorted(keys):
+        match = re.search(r"HS_H09_(\d{8}_\d{4})_(B\d{2})_FLDK_R\d{2}_S01\d{2}\.DAT\.bz2$", key)
+        if not match:
+            continue
+        timestamp, band = match.groups()
+        choices.append(
+            RecentScanChoice(
+                timestamp=timestamp,
+                band=band,
+                url=object_url_from_s3_key(key),
+                label=f"{timestamp} {band}",
+            )
+        )
+    return choices
+
+
 def fetch_s3_prefix_listing(prefix: str, timeout: int = 20) -> str:
     response = requests.get(
         NOAA_HIMAWARI9_BUCKET,
@@ -571,6 +653,37 @@ def find_latest_fldk_url(
     if last_error is not None:
         raise RuntimeError(f"Could not find a recent FLDK scan: {last_error}") from last_error
     raise RuntimeError(f"No FLDK scans found in the last {lookback_hours} hour(s).")
+
+
+def find_recent_fldk_scan_choices(
+    now: datetime | None = None,
+    lookback_hours: int = 6,
+    fetch_listing: Callable[[str], str] | None = None,
+    limit: int = 24,
+) -> list[RecentScanChoice]:
+    fetch_listing = fetch_listing or fetch_s3_prefix_listing
+    choices: list[RecentScanChoice] = []
+    seen: set[tuple[str, str]] = set()
+    last_error: Exception | None = None
+    for dt in recent_himawari_scan_datetimes(now=now, lookback_hours=lookback_hours):
+        try:
+            listing_choices = fldk_scan_choices_from_listing(fetch_listing(noaa_scan_prefix(dt, "FLDK")))
+        except Exception as exc:
+            last_error = exc
+            continue
+        for choice in listing_choices:
+            key = (choice.timestamp, choice.band)
+            if key in seen:
+                continue
+            seen.add(key)
+            choices.append(choice)
+            if len(choices) >= limit:
+                return choices
+    if choices:
+        return choices
+    if last_error is not None:
+        raise RuntimeError(f"Could not list recent FLDK scans: {last_error}") from last_error
+    raise RuntimeError(f"No recent FLDK scans found in the last {lookback_hours} hour(s).")
 
 
 def frame_datetimes(start: datetime, mode: str, hours_back: int, interval_minutes: int) -> list[datetime]:
@@ -620,6 +733,44 @@ def emit_progress(
 ) -> None:
     if progress is not None:
         progress(message, current, total)
+
+
+def phase_from_progress_message(message: str) -> str:
+    normalized = message.strip().lower()
+    if not normalized:
+        return "Working"
+    if "cancel" in normalized:
+        return "Canceled" if "canceled" in normalized else "Canceling"
+    if normalized.startswith("checking") or "preflight" in normalized:
+        return "Checking"
+    if normalized.startswith("download") or " existing files" in normalized:
+        return "Downloading"
+    if normalized.startswith("loading"):
+        return "Loading"
+    if normalized.startswith("area scan") or normalized.startswith("scanning"):
+        return "Scanning"
+    if normalized.startswith("resampling"):
+        return "Resampling"
+    if normalized.startswith("building"):
+        return "Building"
+    if normalized.startswith("saving"):
+        return "Saving"
+    if normalized.startswith("assembling") or normalized.startswith("added frame"):
+        return "Assembling"
+    if normalized.startswith("reusing"):
+        return "Resuming"
+    if normalized.startswith("frame"):
+        return "Processing"
+    if normalized.startswith("timelapse"):
+        return "Assembling"
+    return "Working"
+
+
+def format_phase_status(message: str, current: int | None = None, total: int | None = None) -> str:
+    phase = phase_from_progress_message(message)
+    if current is not None and total:
+        return f"{phase}: {current}/{total} - {message}"
+    return f"{phase}: {message}"
 
 
 def decompress_bz2_chunk(
@@ -1088,6 +1239,74 @@ def output_stem(info: UrlInfo, dt: datetime, composite_choice: str) -> str:
     return f"Himawari_{info.area}_{dt:%Y%m%d_%H%M}_{safe_composite}"
 
 
+def safe_filename_component(value: object) -> str:
+    text = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value)).strip("._-")
+    return text or "output"
+
+
+def first_required_band(composite_choice: str, use_night_fallback: bool = True) -> str:
+    bands = required_bands(composite_choice, use_night_fallback=use_night_fallback)
+    return bands[0] if bands else "B00"
+
+
+def validate_output_template(template: str) -> None:
+    if not template or not template.strip():
+        raise ValueError("Output filename template is required.")
+    if any(char in template for char in "/\\"):
+        raise ValueError("Output filename template must not contain path separators.")
+    formatter = string.Formatter()
+    try:
+        fields = [field_name for _literal, field_name, _format_spec, _conversion in formatter.parse(template) if field_name]
+    except ValueError as exc:
+        raise ValueError(f"Output filename template is invalid: {exc}") from exc
+    unknown = sorted({field for field in fields if field not in ALLOWED_TEMPLATE_TOKENS})
+    if unknown:
+        allowed = ", ".join("{" + token + "}" for token in sorted(ALLOWED_TEMPLATE_TOKENS))
+        raise ValueError(f"Unknown output template token(s): {', '.join(unknown)}. Allowed: {allowed}.")
+    sample_values = {
+        "scan_time": "20240725_0400",
+        "area": "FLDK",
+        "product": "B13_Infrared_Window",
+        "mode": "Single_Image",
+        "band": "B13",
+        "format": "png",
+    }
+    try:
+        rendered = template.format(**sample_values)
+    except Exception as exc:
+        raise ValueError(f"Output filename template is invalid: {exc}") from exc
+    if any(char in rendered for char in WINDOWS_RESERVED_FILENAME_CHARS):
+        raise ValueError("Output filename template renders reserved filename characters.")
+    if not safe_filename_component(rendered):
+        raise ValueError("Output filename template renders an empty filename.")
+    if len(rendered) > 180:
+        raise ValueError("Output filename template is too long.")
+
+
+def output_stem_from_template(
+    config: ProcessorConfig,
+    info: UrlInfo,
+    dt: datetime,
+    image_format: str,
+    composite_choice: str | None = None,
+) -> str:
+    validate_output_template(config.output_template)
+    product = composite_choice or config.composite_choice
+    values = {
+        "scan_time": dt.strftime("%Y%m%d_%H%M"),
+        "area": safe_filename_component(info.area),
+        "product": safe_filename_component(product),
+        "mode": safe_filename_component(config.mode),
+        "band": safe_filename_component(first_required_band(product, config.use_night_fallback)),
+        "format": safe_filename_component(image_format.lower().lstrip(".")),
+    }
+    rendered = config.output_template.format(**values)
+    stem = safe_filename_component(rendered)
+    if len(stem) > 180:
+        raise ValueError("Output filename template renders a name that is too long.")
+    return stem
+
+
 def output_filename(
     info: UrlInfo,
     dt: datetime,
@@ -1096,11 +1315,17 @@ def output_filename(
     frame_idx: int,
     image_format: str | None = None,
     frame_dir: Path | None = None,
+    config: ProcessorConfig | None = None,
 ) -> Path:
     image_format = image_format or IMAGE_FORMAT
     suffix = ".tif" if image_format.lower() in {"tif", "tiff", "geotiff"} else ".png"
     if mode == "Single Image":
-        return OUTPUT_DIR / f"{output_stem(info, dt, composite_choice)}{suffix}"
+        stem = (
+            output_stem_from_template(config, info, dt, image_format, composite_choice)
+            if config
+            else output_stem(info, dt, composite_choice)
+        )
+        return OUTPUT_DIR / f"{stem}{suffix}"
     base_dir = frame_dir or OUTPUT_DIR
     return base_dir / f"frame_{frame_idx:04d}{suffix}"
 
@@ -2049,6 +2274,7 @@ def process_frame(
             frame_idx,
             config.image_format,
             frame_dir=frame_output_dir,
+            config=config,
         )
         output_path = enforce_safe_output_format(output_path, master_area, config)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2169,7 +2395,6 @@ def assemble_timelapse(
     if not paths:
         return None
 
-    safe_composite = re.sub(r"[^A-Za-z0-9]+", "_", config.composite_choice).strip("_")
     fmt = config.timelapse_format.lower()
     if fmt == "mp4" and not has_module("imageio_ffmpeg"):
         LOG.warning("imageio-ffmpeg is unavailable; falling back to GIF")
@@ -2177,7 +2402,8 @@ def assemble_timelapse(
 
     import imageio.v2 as imageio
 
-    output = OUTPUT_DIR / f"Himawari_{info.area}_{info.timestamp}_{safe_composite}.{fmt}"
+    start = datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
+    output = OUTPUT_DIR / f"{output_stem_from_template(config, info, start, fmt)}.{fmt}"
     LOG.info("Assembling %s from %s frame(s)", output.name, len(paths))
     emit_progress(progress, f"Assembling {output.name}", 0, len(paths))
     log_memory("timelapse start", config)
@@ -2230,6 +2456,7 @@ def validate_configuration(config: ProcessorConfig | None = None) -> None:
         LOG.warning("DOWNLOAD_WORKERS=%s requested; capped to 4.", config.download_workers)
     if config.image_format.lower() not in {"png", "tif", "tiff", "geotiff"}:
         raise ValueError('IMAGE_FORMAT must be "png" or "tif".')
+    validate_output_template(config.output_template)
     if config.timelapse_format.lower() not in {"gif", "mp4"}:
         raise ValueError('TIMELAPSE_FORMAT must be "gif" or "mp4".')
     if config.resampler.lower() not in {"native", "nearest"}:
@@ -2249,6 +2476,7 @@ def validate_runtime_dependencies(config: ProcessorConfig, info: UrlInfo, start:
         config.mode,
         0,
         config.image_format,
+        config=config,
     )
     safe_name = enforce_safe_output_format(preview_name, area, config)
     if config.mode == "Timelapse" and writer_for_output(safe_name) == "geotiff":
@@ -2405,6 +2633,333 @@ def load_gui_settings(settings_path: Path = GUI_SETTINGS_FILE) -> tuple[Processo
     output_dir = Path(str(data.get("output_dir") or OUTPUT_DIR)).expanduser().resolve()
     temp_dir = Path(str(data.get("temp_dir") or TEMP_DIR)).expanduser().resolve()
     return config, output_dir, temp_dir
+
+
+def config_from_mapping(raw_config: object) -> ProcessorConfig | None:
+    if not isinstance(raw_config, dict):
+        return None
+    values = default_config().__dict__.copy()
+    for key, value in raw_config.items():
+        if key in processor_config_field_names():
+            values[key] = value
+    try:
+        config = ProcessorConfig(**values)
+        if setup_configuration_errors(config):
+            return None
+    except Exception:
+        return None
+    return config
+
+
+def clean_custom_preset_name(name: str) -> str:
+    cleaned = re.sub(r"\s+", " ", name.strip())
+    if not cleaned:
+        raise ValueError("Preset name is required.")
+    if cleaned in BUILT_IN_PRESETS:
+        raise ValueError("Built-in safe presets cannot be overwritten.")
+    if len(cleaned) > 60:
+        raise ValueError("Preset name is too long.")
+    return cleaned
+
+
+def serialize_custom_presets(presets: dict[str, ProcessorConfig]) -> dict:
+    limited_items = list(presets.items())[:CUSTOM_PRESET_LIMIT]
+    return {
+        "schema_version": CUSTOM_PRESETS_SCHEMA_VERSION,
+        "app_version": APP_VERSION,
+        "presets": {name: config.__dict__.copy() for name, config in limited_items},
+    }
+
+
+def load_custom_presets(presets_path: Path = CUSTOM_PRESETS_FILE) -> dict[str, ProcessorConfig]:
+    data = load_json_file(presets_path)
+    if not data or data.get("schema_version") != CUSTOM_PRESETS_SCHEMA_VERSION:
+        return {}
+    raw_presets = data.get("presets", {})
+    if not isinstance(raw_presets, dict):
+        return {}
+    presets: dict[str, ProcessorConfig] = {}
+    for raw_name, raw_config in raw_presets.items():
+        try:
+            name = clean_custom_preset_name(str(raw_name))
+        except ValueError:
+            continue
+        config = config_from_mapping(raw_config)
+        if config is not None:
+            presets[name] = config
+        if len(presets) >= CUSTOM_PRESET_LIMIT:
+            break
+    return presets
+
+
+def save_custom_presets(presets: dict[str, ProcessorConfig], presets_path: Path = CUSTOM_PRESETS_FILE) -> None:
+    write_json_file(presets_path, serialize_custom_presets(presets))
+
+
+def save_custom_preset(
+    name: str,
+    config: ProcessorConfig,
+    presets_path: Path = CUSTOM_PRESETS_FILE,
+) -> dict[str, ProcessorConfig]:
+    cleaned = clean_custom_preset_name(name)
+    presets = load_custom_presets(presets_path)
+    ordered: dict[str, ProcessorConfig] = {cleaned: config}
+    for existing_name, existing_config in presets.items():
+        if existing_name != cleaned:
+            ordered[existing_name] = existing_config
+        if len(ordered) >= CUSTOM_PRESET_LIMIT:
+            break
+    save_custom_presets(ordered, presets_path)
+    return ordered
+
+
+def delete_custom_preset(name: str, presets_path: Path = CUSTOM_PRESETS_FILE) -> dict[str, ProcessorConfig]:
+    cleaned = clean_custom_preset_name(name)
+    presets = load_custom_presets(presets_path)
+    presets.pop(cleaned, None)
+    save_custom_presets(presets, presets_path)
+    return presets
+
+
+def utc_timestamp() -> str:
+    return datetime.now(UTC).replace(tzinfo=None).isoformat(timespec="seconds") + "Z"
+
+
+def run_record_id(started_at_utc: str, config: ProcessorConfig) -> str:
+    digest = hashlib.sha1(
+        json.dumps(
+            {"started_at_utc": started_at_utc, "config": config.__dict__},
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+    return digest[:12]
+
+
+def recent_run_source(config: ProcessorConfig) -> str:
+    try:
+        info = parse_url(config.user_url)
+        return f"{info.area} {info.timestamp}"
+    except Exception:
+        return config.user_url.strip() or "Unknown source"
+
+
+def recent_run_manifest_path(config: ProcessorConfig, output_dir: Path = OUTPUT_DIR) -> tuple[str, str]:
+    if config.mode != "Timelapse":
+        return "", ""
+    try:
+        info = parse_url(config.user_url)
+        start = datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
+        steps = frame_datetimes(start, config.mode, config.hours_back, config.interval_minutes)
+        run_id = stable_run_id(config, info, steps)
+        return str(timelapse_manifest_path(run_id, output_dir)), str(timelapse_frame_dir(run_id, output_dir))
+    except Exception:
+        return "", ""
+
+
+def build_recent_run_record(
+    status: str,
+    config: ProcessorConfig,
+    started_at_utc: str,
+    completed_at_utc: str | None = None,
+    outputs: Iterable[Path] | None = None,
+    error: str = "",
+    output_dir: Path = OUTPUT_DIR,
+) -> RecentRunRecord:
+    completed = completed_at_utc or utc_timestamp()
+    manifest_path, frame_dir = recent_run_manifest_path(config, output_dir)
+    return RecentRunRecord(
+        run_id=run_record_id(started_at_utc, config),
+        status=status,
+        started_at_utc=started_at_utc,
+        completed_at_utc=completed,
+        app_version=APP_VERSION,
+        mode=config.mode,
+        product=config.composite_choice,
+        source=recent_run_source(config),
+        outputs=tuple(str(path) for path in (outputs or ())),
+        manifest_path=manifest_path,
+        frame_dir=frame_dir,
+        error=error,
+        config=config.__dict__.copy(),
+    )
+
+
+def serialize_recent_run_record(record: RecentRunRecord) -> dict:
+    return {
+        "run_id": record.run_id,
+        "status": record.status,
+        "started_at_utc": record.started_at_utc,
+        "completed_at_utc": record.completed_at_utc,
+        "app_version": record.app_version,
+        "mode": record.mode,
+        "product": record.product,
+        "source": record.source,
+        "outputs": list(record.outputs),
+        "manifest_path": record.manifest_path,
+        "frame_dir": record.frame_dir,
+        "error": record.error,
+        "config": dict(record.config),
+    }
+
+
+def recent_run_record_from_mapping(raw_record: object) -> RecentRunRecord | None:
+    if not isinstance(raw_record, dict):
+        return None
+    raw_outputs = raw_record.get("outputs", [])
+    if not isinstance(raw_outputs, list):
+        raw_outputs = []
+    raw_config = raw_record.get("config", {})
+    config = config_from_mapping(raw_config)
+    if config is None:
+        raw_config = {}
+    return RecentRunRecord(
+        run_id=str(raw_record.get("run_id") or hashlib.sha1(json.dumps(raw_record, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:12]),
+        status=str(raw_record.get("status") or "unknown"),
+        started_at_utc=str(raw_record.get("started_at_utc") or ""),
+        completed_at_utc=str(raw_record.get("completed_at_utc") or ""),
+        app_version=str(raw_record.get("app_version") or ""),
+        mode=str(raw_record.get("mode") or getattr(config, "mode", "")),
+        product=str(raw_record.get("product") or getattr(config, "composite_choice", "")),
+        source=str(raw_record.get("source") or ""),
+        outputs=tuple(str(path) for path in raw_outputs),
+        manifest_path=str(raw_record.get("manifest_path") or ""),
+        frame_dir=str(raw_record.get("frame_dir") or ""),
+        error=str(raw_record.get("error") or ""),
+        config=dict(raw_config) if isinstance(raw_config, dict) else {},
+    )
+
+
+def load_recent_runs(history_path: Path = RECENT_RUNS_FILE) -> list[RecentRunRecord]:
+    data = load_json_file(history_path)
+    if not data or data.get("schema_version") != RECENT_RUNS_SCHEMA_VERSION:
+        return []
+    raw_runs = data.get("runs", [])
+    if not isinstance(raw_runs, list):
+        return []
+    records: list[RecentRunRecord] = []
+    for raw_record in raw_runs:
+        record = recent_run_record_from_mapping(raw_record)
+        if record is not None:
+            records.append(record)
+        if len(records) >= RECENT_RUN_LIMIT:
+            break
+    return records
+
+
+def save_recent_runs(records: list[RecentRunRecord], history_path: Path = RECENT_RUNS_FILE) -> None:
+    write_json_file(
+        history_path,
+        {
+            "schema_version": RECENT_RUNS_SCHEMA_VERSION,
+            "app_version": APP_VERSION,
+            "runs": [serialize_recent_run_record(record) for record in records[:RECENT_RUN_LIMIT]],
+        },
+    )
+
+
+def append_recent_run(record: RecentRunRecord, history_path: Path = RECENT_RUNS_FILE) -> list[RecentRunRecord]:
+    existing = [item for item in load_recent_runs(history_path) if item.run_id != record.run_id]
+    records = [record] + existing
+    save_recent_runs(records, history_path)
+    return records[:RECENT_RUN_LIMIT]
+
+
+def format_recent_run_summary(record: RecentRunRecord) -> str:
+    lines = [
+        f"Status: {record.status}",
+        f"Started: {record.started_at_utc}",
+        f"Completed: {record.completed_at_utc}",
+        f"Source: {record.source}",
+        f"Mode: {record.mode}",
+        f"Product: {record.product}",
+    ]
+    if record.outputs:
+        lines.extend(["", "Outputs:"])
+        lines.extend(record.outputs)
+    if record.manifest_path:
+        lines.extend(["", f"Manifest: {record.manifest_path}"])
+    if record.frame_dir:
+        lines.append(f"Frames: {record.frame_dir}")
+    if record.error:
+        lines.extend(["", "Error:", record.error])
+    return "\n".join(lines)
+
+
+def config_from_recent_run(record: RecentRunRecord) -> ProcessorConfig | None:
+    return config_from_mapping(record.config)
+
+
+def format_file_size(size_bytes: int) -> str:
+    value = float(size_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{size_bytes} B"
+
+
+def safe_preview_metadata(path: Path, max_bytes: int = PREVIEW_MAX_BYTES) -> OutputPreview:
+    if not path.exists():
+        return OutputPreview(path, False, False, "File does not exist.")
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return OutputPreview(path, False, False, f"Could not read file: {exc}")
+    suffix = path.suffix.lower()
+    if suffix in {".tif", ".tiff"}:
+        return OutputPreview(path, True, False, "GeoTIFF preview is metadata-only to avoid high memory use.", size)
+    if suffix == ".mp4":
+        return OutputPreview(path, True, False, "MP4 preview is metadata-only.", size)
+    if suffix not in {".png", ".jpg", ".jpeg", ".gif"}:
+        return OutputPreview(path, True, False, "Preview is not supported for this file type.", size)
+    if size > max_bytes:
+        return OutputPreview(path, True, False, "File is too large for safe preview.", size)
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            dimensions = image.size
+    except Exception as exc:
+        return OutputPreview(path, True, False, f"Could not read preview metadata: {exc}", size)
+    return OutputPreview(path, True, True, "Preview available.", size, dimensions)
+
+
+def completion_message(outputs: Iterable[Path], config: ProcessorConfig, output_dir: Path = OUTPUT_DIR) -> str:
+    output_list = list(outputs)
+    lines = [f"Processing finished with {len(output_list)} output file(s)."]
+    if output_list:
+        main = output_list[-1]
+        lines.append(f"Main output: {main}")
+        if main.exists():
+            try:
+                lines.append(f"Main output size: {format_file_size(main.stat().st_size)}")
+            except OSError:
+                pass
+    lines.append(f"Output folder: {output_dir}")
+    manifest_path, frame_dir = recent_run_manifest_path(config, output_dir)
+    if manifest_path:
+        lines.append(f"Manifest: {manifest_path}")
+    if frame_dir:
+        lines.append(f"Frame folder: {frame_dir}")
+    return "\n".join(lines)
+
+
+def cancel_resume_message(config: ProcessorConfig, outputs: Iterable[Path], output_dir: Path = OUTPUT_DIR) -> str:
+    output_list = list(outputs)
+    if config.mode != "Timelapse":
+        return "Processing canceled. No timelapse resume manifest is needed for single-image runs."
+    manifest_path, frame_dir = recent_run_manifest_path(config, output_dir)
+    frame_word = "frame" if len(output_list) == 1 else "frames"
+    lines = [
+        f"Processing canceled after {len(output_list)} completed {frame_word}.",
+        "Retrying the same timelapse will reuse matching completed frames when resume is enabled.",
+    ]
+    if manifest_path:
+        lines.append(f"Manifest: {manifest_path}")
+    if frame_dir:
+        lines.append(f"Frame folder: {frame_dir}")
+    return "\n".join(lines)
 
 
 def format_environment_results(results: list[object]) -> str:
@@ -2625,6 +3180,10 @@ def setup_configuration_errors(config: ProcessorConfig) -> list[str]:
         errors.append("RAM limit must be positive.")
     if config.image_format.lower() not in {"png", "tif", "tiff", "geotiff"}:
         errors.append('Image format must be "png" or "tif".')
+    try:
+        validate_output_template(config.output_template)
+    except ValueError as exc:
+        errors.append(str(exc))
     if config.timelapse_format.lower() not in {"gif", "mp4"}:
         errors.append('Timelapse format must be "gif" or "mp4".')
     if config.resampler.lower() not in {"native", "nearest"}:
@@ -2727,7 +3286,12 @@ class HimawariProcessorApp:
         self.last_outputs: list[Path] = []
         self.last_config: ProcessorConfig | None = None
         self.last_error_report = ""
+        self.run_started_at_utc = ""
+        self.recent_runs = load_recent_runs()
+        self.custom_presets = load_custom_presets()
+        self.preview_image: object | None = None
 
+        self.ui_mode_var = tk.StringVar(value="Simple")
         self.url_var = tk.StringVar(value=initial_config.user_url)
         self.mode_var = tk.StringVar(value=initial_config.mode)
         self.composite_var = tk.StringVar(value=initial_config.composite_choice)
@@ -2739,6 +3303,7 @@ class HimawariProcessorApp:
         self.chunk_var = tk.StringVar(value=initial_config.dask_chunk_size)
         self.ram_limit_var = tk.StringVar(value=str(initial_config.ram_limit_gb))
         self.image_format_var = tk.StringVar(value=initial_config.image_format)
+        self.output_template_var = tk.StringVar(value=initial_config.output_template)
         self.resampler_var = tk.StringVar(value=initial_config.resampler)
         self.timelapse_format_var = tk.StringVar(value=initial_config.timelapse_format)
         self.auto_download_var = tk.BooleanVar(value=initial_config.auto_download)
@@ -2751,6 +3316,9 @@ class HimawariProcessorApp:
         self.status_var = tk.StringVar(value="Ready")
         self.progress_var = tk.DoubleVar(value=0)
         self.setup_status_var = tk.StringVar(value="")
+        self.phase_var = tk.StringVar(value="Ready")
+        self.run_summary_var = tk.StringVar(value="")
+        self.selected_recent_run_id = ""
         self.output_dir_var = tk.StringVar(value=str(OUTPUT_DIR))
         self.temp_dir_var = tk.StringVar(value=str(TEMP_DIR))
 
@@ -2876,10 +3444,13 @@ class HimawariProcessorApp:
 
         settings = self._create_scrollable_tab(self.notebook, "Run Setup")
         advanced = self._create_scrollable_tab(self.notebook, "Advanced")
+        recent = self._create_scrollable_tab(self.notebook, "Recent Runs")
+        self.advanced_tab_id = self.notebook.tabs()[1]
 
         for col in (0, 1):
             settings.columnconfigure(col, weight=1)
             advanced.columnconfigure(col, weight=1)
+            recent.columnconfigure(col, weight=1)
 
         source_frame = ttk.LabelFrame(settings, text="Source", style="Section.TLabelframe")
         source_frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
@@ -2888,6 +3459,8 @@ class HimawariProcessorApp:
         ttk.Entry(source_frame, textvariable=self.url_var).grid(row=1, column=0, sticky="ew", pady=(2, 0))
         self.latest_url_button = ttk.Button(source_frame, text="Latest FLDK", command=self._fill_latest_fldk_url)
         self.latest_url_button.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(2, 0))
+        self.scan_browser_button = ttk.Button(source_frame, text="Choose Scan", command=self._open_scan_browser)
+        self.scan_browser_button.grid(row=1, column=2, sticky="ew", padx=(8, 0), pady=(2, 0))
 
         product_frame = ttk.LabelFrame(settings, text="Product", style="Section.TLabelframe")
         product_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(0, 10))
@@ -2896,9 +3469,10 @@ class HimawariProcessorApp:
         ttk.Label(product_frame, text="Safe Preset").grid(row=0, column=0, sticky="w")
         preset_box = ttk.Combobox(
             product_frame,
-            values=("Balanced Single", "Fast IR Check", "Low-RAM Timelapse"),
+            values=BUILT_IN_PRESETS,
             state="readonly",
         )
+        self.preset_box = preset_box
         preset_box.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 10))
         preset_box.bind("<<ComboboxSelected>>", lambda _event: self._apply_preset(preset_box.get()))
         mode_box = ttk.Combobox(
@@ -2998,8 +3572,39 @@ class HimawariProcessorApp:
             width=8,
         ).grid(row=4, column=0, sticky="w", pady=(2, 0))
 
+        simple_frame = ttk.LabelFrame(settings, text="Simple View", style="Section.TLabelframe")
+        simple_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        simple_frame.columnconfigure(0, weight=1)
+        simple_frame.columnconfigure(1, weight=1)
+        ttk.Label(simple_frame, text="View Mode").grid(row=0, column=0, sticky="w")
+        self.ui_mode_box = ttk.Combobox(
+            simple_frame,
+            textvariable=self.ui_mode_var,
+            values=("Simple", "Advanced"),
+            state="readonly",
+        )
+        self.ui_mode_box.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(2, 8))
+        self.ui_mode_box.bind("<<ComboboxSelected>>", lambda _event: self._refresh_ui_mode())
+        ttk.Label(simple_frame, text="Output Folder").grid(row=0, column=1, sticky="w")
+        ttk.Entry(simple_frame, textvariable=self.output_dir_var, state="readonly").grid(
+            row=1, column=1, sticky="ew", pady=(2, 8)
+        )
+        self.simple_output_button = ttk.Button(
+            simple_frame,
+            text="Choose Output Folder",
+            command=self._choose_output_dir,
+        )
+        self.simple_output_button.grid(row=2, column=1, sticky="ew", pady=(2, 0))
+        ttk.Label(simple_frame, text="Run Summary").grid(row=2, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(
+            simple_frame,
+            textvariable=self.run_summary_var,
+            style="Status.TLabel",
+            wraplength=560,
+        ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+
         status_frame = ttk.LabelFrame(settings, text="Setup Status", style="Section.TLabelframe")
-        status_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        status_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         status_frame.columnconfigure(0, weight=1)
         ttk.Label(
             status_frame,
@@ -3044,39 +3649,64 @@ class HimawariProcessorApp:
             state="readonly",
         ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 10))
 
-        ttk.Label(paths_frame, text="Output Folder").grid(row=2, column=0, columnspan=2, sticky="w")
-        ttk.Entry(paths_frame, textvariable=self.output_dir_var, state="readonly").grid(
+        ttk.Label(paths_frame, text="Output Filename Template").grid(row=2, column=0, columnspan=2, sticky="w")
+        ttk.Entry(paths_frame, textvariable=self.output_template_var).grid(
             row=3, column=0, columnspan=2, sticky="ew", pady=(2, 8)
         )
-        ttk.Label(paths_frame, text="Temp Folder").grid(row=4, column=0, columnspan=2, sticky="w")
-        ttk.Entry(paths_frame, textvariable=self.temp_dir_var, state="readonly").grid(
+
+        ttk.Label(paths_frame, text="Output Folder").grid(row=4, column=0, columnspan=2, sticky="w")
+        ttk.Entry(paths_frame, textvariable=self.output_dir_var, state="readonly").grid(
             row=5, column=0, columnspan=2, sticky="ew", pady=(2, 8)
+        )
+        ttk.Label(paths_frame, text="Temp Folder").grid(row=6, column=0, columnspan=2, sticky="w")
+        ttk.Entry(paths_frame, textvariable=self.temp_dir_var, state="readonly").grid(
+            row=7, column=0, columnspan=2, sticky="ew", pady=(2, 8)
         )
         self.choose_output_button = ttk.Button(
             paths_frame,
             text="Choose Output Folder",
             command=self._choose_output_dir,
         )
-        self.choose_output_button.grid(row=6, column=0, sticky="ew", padx=(0, 8), pady=(2, 8))
+        self.choose_output_button.grid(row=8, column=0, sticky="ew", padx=(0, 8), pady=(2, 8))
         self.choose_temp_button = ttk.Button(
             paths_frame,
             text="Choose Temp Folder",
             command=self._choose_temp_dir,
         )
-        self.choose_temp_button.grid(row=6, column=1, sticky="ew", pady=(2, 8))
+        self.choose_temp_button.grid(row=8, column=1, sticky="ew", pady=(2, 8))
         self.open_temp_button = ttk.Button(
             paths_frame,
             text="Open Temp Folder",
             command=self._open_temp_folder,
         )
-        self.open_temp_button.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+        self.open_temp_button.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+
+        preset_frame = ttk.LabelFrame(advanced, text="Custom Presets", style="Section.TLabelframe")
+        preset_frame.grid(row=1, column=0, columnspan=2, sticky="ew")
+        preset_frame.columnconfigure(0, weight=1)
+        self.custom_preset_var = tk.StringVar(value="")
+        self.custom_preset_box = ttk.Combobox(
+            preset_frame,
+            textvariable=self.custom_preset_var,
+            values=tuple(self.custom_presets),
+        )
+        self.custom_preset_box.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ttk.Button(preset_frame, text="Load", command=self._load_custom_preset).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(preset_frame, text="Save Current", command=self._save_custom_preset).grid(
+            row=0, column=2, padx=(0, 8)
+        )
+        ttk.Button(preset_frame, text="Delete", command=self._delete_custom_preset).grid(row=0, column=3)
         self._refresh_path_fields()
         self._path_controls = (
             self.choose_output_button,
             self.choose_temp_button,
             self.open_temp_button,
+            self.simple_output_button,
         )
-        self._refresh_mode_state()
+        self._build_recent_runs_tab(recent)
+        self._refresh_custom_preset_box()
+        self._refresh_recent_runs()
+        self._refresh_ui_mode()
 
         self.log_frame = ttk.Frame(self.main_pane, padding=(0, 4, 0, 0))
         self.log_frame.columnconfigure(0, weight=1)
@@ -3086,11 +3716,17 @@ class HimawariProcessorApp:
         progress = ttk.Progressbar(self.log_frame, variable=self.progress_var, maximum=100)
         progress.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         ttk.Label(self.log_frame, textvariable=self.status_var).grid(row=0, column=1, sticky="e", padx=(10, 0))
+        ttk.Label(self.log_frame, textvariable=self.phase_var).grid(
+            row=0,
+            column=2,
+            sticky="e",
+            padx=(10, 0),
+        )
 
         self.log_text = tk.Text(self.log_frame, height=16, wrap="word", state="disabled")
-        self.log_text.grid(row=1, column=0, columnspan=2, sticky="nsew")
+        self.log_text.grid(row=1, column=0, columnspan=3, sticky="nsew")
         scroll = ttk.Scrollbar(self.log_frame, orient="vertical", command=self.log_text.yview)
-        scroll.grid(row=1, column=2, sticky="ns")
+        scroll.grid(row=1, column=3, sticky="ns")
         self.log_text.configure(yscrollcommand=scroll.set)
 
         buttons = ttk.Frame(self.root, padding=(16, 0, 16, 16))
@@ -3119,7 +3755,309 @@ class HimawariProcessorApp:
         self.copy_error_button = ttk.Button(buttons, text="Copy Error", command=self._copy_error_report)
         self.copy_error_button.grid(row=0, column=8, padx=(0, 8))
         ttk.Button(buttons, text="Close", command=self._terminate_app).grid(row=0, column=9)
+        self._refresh_mode_state()
         self._configure_main_split()
+
+    def _build_recent_runs_tab(self, recent: ttk.Frame) -> None:
+        recent.rowconfigure(0, weight=1)
+        recent.columnconfigure(0, weight=1)
+        recent.columnconfigure(1, weight=1)
+
+        list_frame = ttk.LabelFrame(recent, text="Run History", style="Section.TLabelframe")
+        list_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 10))
+        list_frame.rowconfigure(0, weight=1)
+        list_frame.columnconfigure(0, weight=1)
+
+        columns = ("started", "status", "mode", "product", "output")
+        self.recent_tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=10)
+        headings = {
+            "started": "Started",
+            "status": "Status",
+            "mode": "Mode",
+            "product": "Product",
+            "output": "Main Output",
+        }
+        widths = {"started": 140, "status": 80, "mode": 95, "product": 190, "output": 260}
+        for column in columns:
+            self.recent_tree.heading(column, text=headings[column])
+            self.recent_tree.column(column, width=widths[column], anchor="w")
+        self.recent_tree.grid(row=0, column=0, sticky="nsew")
+        recent_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.recent_tree.yview)
+        recent_scroll.grid(row=0, column=1, sticky="ns")
+        self.recent_tree.configure(yscrollcommand=recent_scroll.set)
+        self.recent_tree.bind("<<TreeviewSelect>>", lambda _event: self._select_recent_run())
+
+        actions = ttk.Frame(list_frame)
+        actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for column in range(4):
+            actions.columnconfigure(column, weight=1)
+        ttk.Button(actions, text="Open Output", command=self._open_selected_recent_output).grid(
+            row=0, column=0, sticky="ew", padx=(0, 6), pady=(0, 6)
+        )
+        ttk.Button(actions, text="Open Folder", command=self._open_selected_recent_folder).grid(
+            row=0, column=1, sticky="ew", padx=(0, 6), pady=(0, 6)
+        )
+        ttk.Button(actions, text="Copy Paths", command=self._copy_selected_recent_paths).grid(
+            row=0, column=2, sticky="ew", padx=(0, 6), pady=(0, 6)
+        )
+        ttk.Button(actions, text="Copy Error", command=self._copy_selected_recent_error).grid(
+            row=0, column=3, sticky="ew", pady=(0, 6)
+        )
+        ttk.Button(actions, text="Re-run Settings", command=self._rerun_selected_recent_settings).grid(
+            row=1, column=0, sticky="ew", padx=(0, 6)
+        )
+        ttk.Button(actions, text="Refresh", command=self._refresh_recent_runs).grid(
+            row=1, column=1, sticky="ew", padx=(0, 6)
+        )
+        ttk.Button(actions, text="Clear History", command=self._clear_recent_runs).grid(row=1, column=2, sticky="ew")
+
+        detail_frame = ttk.LabelFrame(recent, text="Details and Preview", style="Section.TLabelframe")
+        detail_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=(0, 10))
+        detail_frame.rowconfigure(0, weight=1)
+        detail_frame.columnconfigure(0, weight=1)
+        self.recent_detail_text = tk.Text(detail_frame, height=12, wrap="word", state="disabled")
+        self.recent_detail_text.grid(row=0, column=0, sticky="nsew")
+        detail_scroll = ttk.Scrollbar(detail_frame, orient="vertical", command=self.recent_detail_text.yview)
+        detail_scroll.grid(row=0, column=1, sticky="ns")
+        self.recent_detail_text.configure(yscrollcommand=detail_scroll.set)
+        self.preview_label = ttk.Label(detail_frame, text="Select a recent run to preview output.")
+        self.preview_label.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
+    def _set_text_widget(self, widget: tk.Text, text: str) -> None:
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("end", text)
+        widget.configure(state="disabled")
+
+    def _refresh_recent_runs(self) -> None:
+        self.recent_runs = load_recent_runs()
+        if not hasattr(self, "recent_tree"):
+            return
+        for item in self.recent_tree.get_children():
+            self.recent_tree.delete(item)
+        for record in self.recent_runs:
+            self.recent_tree.insert(
+                "",
+                "end",
+                iid=record.run_id,
+                values=(
+                    record.started_at_utc,
+                    record.status,
+                    record.mode,
+                    record.product,
+                    Path(record.main_output).name if record.main_output else "",
+                ),
+            )
+        if self.recent_runs:
+            self.recent_tree.selection_set(self.recent_runs[0].run_id)
+            self._select_recent_run()
+
+    def _selected_recent_run(self) -> RecentRunRecord | None:
+        if not hasattr(self, "recent_tree"):
+            return None
+        selection = self.recent_tree.selection()
+        if not selection:
+            return None
+        run_id = str(selection[0])
+        for record in self.recent_runs:
+            if record.run_id == run_id:
+                return record
+        return None
+
+    def _select_recent_run(self) -> None:
+        record = self._selected_recent_run()
+        if record is None:
+            return
+        self.selected_recent_run_id = record.run_id
+        self._set_text_widget(self.recent_detail_text, format_recent_run_summary(record))
+        self._update_recent_preview(record)
+
+    def _update_recent_preview(self, record: RecentRunRecord) -> None:
+        self.preview_image = None
+        if not record.main_output:
+            self.preview_label.configure(text="No output file is recorded for this run.", image="")
+            return
+        path = Path(record.main_output)
+        preview = safe_preview_metadata(path)
+        if not preview.supported_preview:
+            self.preview_label.configure(text=preview.display_text(), image="")
+            return
+        try:
+            from PIL import Image, ImageTk
+
+            with Image.open(path) as image:
+                image.thumbnail((360, 240))
+                self.preview_image = ImageTk.PhotoImage(image.copy())
+            self.preview_label.configure(text=preview.display_text(), image=self.preview_image, compound="top")
+        except Exception as exc:
+            self.preview_image = None
+            self.preview_label.configure(text=f"{preview.display_text()}\nPreview failed: {exc}", image="")
+
+    def _open_selected_recent_output(self) -> None:
+        record = self._selected_recent_run()
+        if record is None or not record.main_output:
+            messagebox.showinfo("Open output", "No recent output is selected.")
+            return
+        self._open_path(Path(record.main_output))
+
+    def _open_selected_recent_folder(self) -> None:
+        record = self._selected_recent_run()
+        if record is None:
+            messagebox.showinfo("Open folder", "No recent run is selected.")
+            return
+        target = Path(record.main_output).parent if record.main_output else OUTPUT_DIR
+        self._open_path(target)
+
+    def _copy_selected_recent_paths(self) -> None:
+        record = self._selected_recent_run()
+        if record is None or not record.outputs:
+            messagebox.showinfo("Copy paths", "No recent output paths are selected.")
+            return
+        self._copy_to_clipboard("\n".join(record.outputs))
+        self._append_log("Recent output path(s) copied to clipboard.")
+
+    def _copy_selected_recent_error(self) -> None:
+        record = self._selected_recent_run()
+        if record is None:
+            messagebox.showinfo("Copy error", "No recent run is selected.")
+            return
+        config = config_from_recent_run(record)
+        report = build_error_report(
+            record.error or f"Recent run status: {record.status}",
+            config,
+            "",
+            [Path(path) for path in record.outputs],
+        )
+        self._copy_to_clipboard(report)
+        self._append_log("Recent run error report copied to clipboard.")
+
+    def _rerun_selected_recent_settings(self) -> None:
+        record = self._selected_recent_run()
+        if record is None:
+            messagebox.showinfo("Re-run settings", "No recent run is selected.")
+            return
+        config = config_from_recent_run(record)
+        if config is None:
+            messagebox.showerror("Re-run settings", "Saved settings for this run could not be loaded.")
+            return
+        self._set_config_vars(config)
+        self.notebook.select(0)
+        self._append_log(f"Loaded settings from recent run {record.run_id}.")
+
+    def _clear_recent_runs(self) -> None:
+        if not messagebox.askokcancel("Clear history", "Clear all recent run history?"):
+            return
+        self.recent_runs = []
+        save_recent_runs([])
+        self._refresh_recent_runs()
+        self._set_text_widget(self.recent_detail_text, "")
+        self.preview_label.configure(text="Recent run history is empty.", image="")
+
+    def _record_recent_run(self, record: RecentRunRecord) -> None:
+        self.recent_runs = append_recent_run(record)
+        self._refresh_recent_runs()
+
+    def _refresh_custom_preset_box(self) -> None:
+        if hasattr(self, "custom_preset_box"):
+            self.custom_preset_box.configure(values=tuple(self.custom_presets))
+
+    def _load_custom_preset(self) -> None:
+        name = self.custom_preset_var.get().strip()
+        if not name:
+            messagebox.showinfo("Load preset", "Choose a custom preset first.")
+            return
+        config = self.custom_presets.get(name)
+        if config is None:
+            messagebox.showerror("Load preset", f"Custom preset not found: {name}")
+            return
+        self._set_config_vars(config)
+        self._write_current_settings()
+        self._append_log(f"Loaded custom preset: {name}")
+
+    def _save_custom_preset(self) -> None:
+        name = self.custom_preset_var.get().strip()
+        try:
+            config = self._read_config()
+            self.custom_presets = save_custom_preset(name, config)
+        except Exception as exc:
+            messagebox.showerror("Save preset", str(exc))
+            return
+        self.custom_preset_var.set(name.strip())
+        self._refresh_custom_preset_box()
+        self._append_log(f"Saved custom preset: {name.strip()}")
+
+    def _delete_custom_preset(self) -> None:
+        name = self.custom_preset_var.get().strip()
+        try:
+            self.custom_presets = delete_custom_preset(name)
+        except Exception as exc:
+            messagebox.showerror("Delete preset", str(exc))
+            return
+        self.custom_preset_var.set("")
+        self._refresh_custom_preset_box()
+        self._append_log(f"Deleted custom preset: {name}")
+
+    def _refresh_ui_mode(self) -> None:
+        if not hasattr(self, "advanced_tab_id"):
+            return
+        tabs = set(self.notebook.tabs())
+        if self.ui_mode_var.get() == "Simple":
+            if self.advanced_tab_id in tabs:
+                self.notebook.hide(self.advanced_tab_id)
+        elif self.advanced_tab_id not in tabs:
+            self.notebook.add(self.advanced_tab_id, text="Advanced")
+
+    def _open_scan_browser(self) -> None:
+        if self.is_running:
+            return
+        self.scan_browser_button.configure(state="disabled")
+        self.status_var.set("Loading recent scans")
+        self._append_log("Loading recent FLDK scan choices from NOAA AWS.")
+
+        def worker() -> None:
+            try:
+                self.messages.put(("scan_choices", find_recent_fldk_scan_choices()))
+            except Exception as exc:
+                self.messages.put(("scan_choices_error", str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_scan_choice_dialog(self, choices: list[RecentScanChoice]) -> None:
+        if not choices:
+            messagebox.showinfo("Choose scan", "No recent FLDK scans were found.")
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Choose Recent FLDK Scan")
+        dialog.geometry("520x360")
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(0, weight=1)
+        listbox = tk.Listbox(dialog, height=12)
+        listbox.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+        scrollbar = ttk.Scrollbar(dialog, orient="vertical", command=listbox.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns", pady=12)
+        listbox.configure(yscrollcommand=scrollbar.set)
+        for choice in choices:
+            listbox.insert("end", choice.label)
+        listbox.selection_set(0)
+
+        def use_selected() -> None:
+            selection = listbox.curselection()
+            if not selection:
+                return
+            choice = choices[int(selection[0])]
+            self.url_var.set(choice.url)
+            self.status_var.set("FLDK scan selected")
+            self._update_setup_status()
+            self._write_current_settings()
+            self._append_log(f"Selected FLDK scan URL: {choice.url}")
+            dialog.destroy()
+
+        button_row = ttk.Frame(dialog)
+        button_row.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 12))
+        button_row.columnconfigure(0, weight=1)
+        ttk.Button(button_row, text="Use Selected", command=use_selected).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(button_row, text="Cancel", command=dialog.destroy).grid(row=0, column=2)
+        listbox.bind("<Double-Button-1>", lambda _event: use_selected())
 
     def _install_setup_watchers(self) -> None:
         watched_vars = (
@@ -3143,6 +4081,7 @@ class HimawariProcessorApp:
             self.border_lines_var,
             self.border_color_var,
             self.border_width_var,
+            self.output_template_var,
         )
         for watched_var in watched_vars:
             watched_var.trace_add("write", lambda *_args: self._update_setup_status())
@@ -3152,9 +4091,15 @@ class HimawariProcessorApp:
             config = self._read_config()
             setup_status = build_setup_status(config, OUTPUT_DIR, TEMP_DIR)
             self.setup_status_var.set(setup_status.display_text())
+            try:
+                summary = build_run_summary(config)
+                self.run_summary_var.set(summary.display_text())
+            except Exception:
+                self.run_summary_var.set("")
         except Exception as exc:
             setup_status = SetupStatus(False, (), (), (f"Invalid setup value: {exc}",))
             self.setup_status_var.set(setup_status.display_text())
+            self.run_summary_var.set("")
         return setup_status
 
     def _refresh_path_fields(self) -> None:
@@ -3179,6 +4124,7 @@ class HimawariProcessorApp:
         self.chunk_var.set(config.dask_chunk_size)
         self.ram_limit_var.set(str(config.ram_limit_gb))
         self.image_format_var.set(config.image_format)
+        self.output_template_var.set(config.output_template)
         self.resampler_var.set(config.resampler)
         self.timelapse_format_var.set(config.timelapse_format)
         self.auto_download_var.set(config.auto_download)
@@ -3219,10 +4165,12 @@ class HimawariProcessorApp:
             getattr(self, "check_env_button", None),
             getattr(self, "quick_fix_button", None),
             getattr(self, "latest_url_button", None),
+            getattr(self, "scan_browser_button", None),
             getattr(self, "overlay_check_button", None),
             getattr(self, "open_last_button", None),
             getattr(self, "copy_paths_button", None),
             getattr(self, "copy_error_button", None),
+            getattr(self, "custom_preset_box", None),
         ):
             if widget is not None:
                 widget.configure(state=mutable_state)
@@ -3378,6 +4326,7 @@ class HimawariProcessorApp:
             timelapse_format=self.timelapse_format_var.get(),
             delete_timelapse_frames=self.delete_frames_var.get(),
             image_format=self.image_format_var.get(),
+            output_template=self.output_template_var.get(),
             resampler=self.resampler_var.get(),
             allow_quality_fallback=self.quality_fallback_var.get(),
             add_border_lines=self.border_lines_var.get(),
@@ -3409,10 +4358,12 @@ class HimawariProcessorApp:
 
         self.progress_var.set(0)
         self.status_var.set("Starting")
+        self.phase_var.set("Checking")
         self.cancel_event.clear()
         self._set_running(True)
         self.last_config = config
         self.last_error_report = ""
+        self.run_started_at_utc = utc_timestamp()
         self._write_current_settings()
         self._append_log(f"Starting processing - version {APP_VERSION}")
         self._append_log(preflight.display_text())
@@ -3425,6 +4376,7 @@ class HimawariProcessorApp:
             return
         self.cancel_event.set()
         self.status_var.set("Canceling")
+        self.phase_var.set("Canceling")
         self.stop_button.configure(state="disabled")
         self._append_log("Stop requested; canceling active downloads and pending processing.")
 
@@ -3459,6 +4411,7 @@ class HimawariProcessorApp:
             elif kind == "progress":
                 message, current, total = payload  # type: ignore[misc]
                 self.status_var.set(str(message))
+                self.phase_var.set(format_phase_status(str(message), current, total))
                 if current is not None and total:
                     self.progress_var.set(min(100.0, (float(current) / float(total)) * 100.0))
             elif kind == "done":
@@ -3467,9 +4420,21 @@ class HimawariProcessorApp:
                 self._set_running(False)
                 self.progress_var.set(100)
                 self.status_var.set("Done")
+                self.phase_var.set("Done")
                 output_lines = "\n".join(str(path) for path in outputs) if outputs else "No output paths returned."
                 self._append_log("Finished. Outputs:\n" + output_lines)
-                messagebox.showinfo("Done", f"Processing finished.\n\nOutputs:\n{output_lines}")
+                if self.last_config is not None:
+                    record = build_recent_run_record(
+                        "complete",
+                        self.last_config,
+                        self.run_started_at_utc or utc_timestamp(),
+                        outputs=self.last_outputs,
+                    )
+                    self._record_recent_run(record)
+                    done_text = completion_message(self.last_outputs, self.last_config, OUTPUT_DIR)
+                else:
+                    done_text = f"Processing finished.\n\nOutputs:\n{output_lines}"
+                messagebox.showinfo("Done", done_text)
             elif kind == "env_results":
                 results = payload
                 text = format_environment_results(results)
@@ -3492,20 +4457,53 @@ class HimawariProcessorApp:
                 self.status_var.set("Latest FLDK failed")
                 self._append_log(f"Latest FLDK lookup failed: {payload}")
                 messagebox.showerror("Latest FLDK failed", str(payload))
+            elif kind == "scan_choices":
+                self.scan_browser_button.configure(state="normal" if not self.is_running else "disabled")
+                self.status_var.set("Recent scans loaded")
+                self._show_scan_choice_dialog(list(payload))
+            elif kind == "scan_choices_error":
+                self.scan_browser_button.configure(state="normal" if not self.is_running else "disabled")
+                self.status_var.set("Scan lookup failed")
+                self._append_log(f"Recent FLDK scan lookup failed: {payload}")
+                messagebox.showerror("Scan lookup failed", str(payload))
             elif kind == "canceled":
                 self._set_running(False)
                 self.status_var.set("Canceled")
-                self._append_log(str(payload))
-                messagebox.showinfo("Canceled", str(payload))
+                self.phase_var.set("Canceled")
+                cancel_text = str(payload)
+                if self.last_config is not None:
+                    cancel_text = cancel_resume_message(self.last_config, self.last_outputs, OUTPUT_DIR)
+                    self._record_recent_run(
+                        build_recent_run_record(
+                            "canceled",
+                            self.last_config,
+                            self.run_started_at_utc or utc_timestamp(),
+                            outputs=self.last_outputs,
+                            error=str(payload),
+                        )
+                    )
+                self._append_log(cancel_text)
+                messagebox.showinfo("Canceled", cancel_text)
             elif kind == "error":
                 self._set_running(False)
                 self.status_var.set("Failed")
+                self.phase_var.set("Failed")
                 self.last_error_report = build_error_report(
                     str(payload),
                     self.last_config,
                     self.log_text.get("1.0", "end"),
                     self.last_outputs,
                 )
+                if self.last_config is not None:
+                    self._record_recent_run(
+                        build_recent_run_record(
+                            "failed",
+                            self.last_config,
+                            self.run_started_at_utc or utc_timestamp(),
+                            outputs=self.last_outputs,
+                            error=str(payload),
+                        )
+                    )
                 messagebox.showerror("Processing failed", str(payload))
 
         self.root.after(100, self._poll_messages)

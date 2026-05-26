@@ -239,6 +239,72 @@ class ProcessorTests(unittest.TestCase):
         finally:
             h.IMAGE_FORMAT = original
 
+    def test_output_template_supports_safe_tokens(self):
+        config = h.default_config()
+        config.composite_choice = "B13 (Infrared Window)"
+        config.output_template = "{scan_time}_{area}_{product}_{mode}_{band}_{format}"
+        info = h.parse_url(h.USER_URL)
+        dt = h.datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
+
+        output = h.output_filename(
+            info,
+            dt,
+            config.composite_choice,
+            config.mode,
+            0,
+            config.image_format,
+            config=config,
+        )
+
+        self.assertIn("20240725_0400_FLDK_B13_Infrared_Window_Single_Image_B13_png", output.name)
+
+    def test_output_template_rejects_unsafe_values(self):
+        with self.assertRaisesRegex(ValueError, "Unknown output template token"):
+            h.validate_output_template("{unknown}")
+        with self.assertRaisesRegex(ValueError, "path separators"):
+            h.validate_output_template("folder/{scan_time}")
+        with self.assertRaisesRegex(ValueError, "required"):
+            h.validate_output_template("")
+
+    def test_scan_choice_listing_extracts_bands(self):
+        xml = """<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+          <Contents><Key>AHI-L1b-FLDK/2026/05/25/0400/HS_H09_20260525_0400_B01_FLDK_R10_S0110.DAT.bz2</Key></Contents>
+          <Contents><Key>AHI-L1b-FLDK/2026/05/25/0400/HS_H09_20260525_0400_B13_FLDK_R20_S0110.DAT.bz2</Key></Contents>
+          <Contents><Key>AHI-L1b-FLDK/2026/05/25/0400/HS_H09_20260525_0400_B13_FLDK_R20_S0210.DAT.bz2</Key></Contents>
+        </ListBucketResult>"""
+
+        choices = h.fldk_scan_choices_from_listing(xml)
+
+        self.assertEqual([choice.band for choice in choices], ["B01", "B13"])
+        self.assertTrue(choices[0].url.startswith(h.NOAA_HIMAWARI9_BUCKET))
+
+    def test_find_recent_scan_choices_handles_network_failures(self):
+        xml = """<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+          <Contents><Key>AHI-L1b-FLDK/2026/05/25/0400/HS_H09_20260525_0400_B01_FLDK_R10_S0110.DAT.bz2</Key></Contents>
+        </ListBucketResult>"""
+        calls = []
+
+        def fetch(prefix):
+            calls.append(prefix)
+            if len(calls) == 1:
+                raise h.requests.RequestException("temporary")
+            return xml
+
+        choices = h.find_recent_fldk_scan_choices(
+            now=h.datetime(2026, 5, 25, 4, 10),
+            lookback_hours=1,
+            fetch_listing=fetch,
+            limit=1,
+        )
+
+        self.assertEqual(len(choices), 1)
+        self.assertEqual(choices[0].band, "B01")
+
+    def test_phase_status_formats_common_messages(self):
+        self.assertEqual(h.phase_from_progress_message("Downloading B13"), "Downloading")
+        self.assertEqual(h.phase_from_progress_message("Resampling"), "Resampling")
+        self.assertIn("2/10", h.format_phase_status("Added frame 2/10", 2, 10))
+
     def test_custom_composites_stay_lazy(self):
         y = [0, 1, 2, 3]
         x = [0, 1, 2, 3]
@@ -517,6 +583,85 @@ class ProcessorTests(unittest.TestCase):
             settings_path.write_text("{bad", encoding="utf-8")
 
             self.assertIsNone(h.load_gui_settings(settings_path))
+
+    def test_custom_presets_round_trip_and_protect_builtins(self):
+        config = h.default_config()
+        config.composite_choice = "B13 (Infrared Window)"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "presets.json"
+
+            presets = h.save_custom_preset("IR check", config, path)
+            loaded = h.load_custom_presets(path)
+
+            self.assertIn("IR check", presets)
+            self.assertEqual(loaded["IR check"].composite_choice, "B13 (Infrared Window)")
+            with self.assertRaisesRegex(ValueError, "Built-in"):
+                h.save_custom_preset("Balanced Single", config, path)
+
+    def test_custom_presets_corrupt_file_returns_empty(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "presets.json"
+            path.write_text("{bad", encoding="utf-8")
+
+            self.assertEqual(h.load_custom_presets(path), {})
+
+    def test_recent_runs_round_trip_caps_and_formats(self):
+        config = h.default_config()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "recent.json"
+            for idx in range(h.RECENT_RUN_LIMIT + 2):
+                record = h.build_recent_run_record(
+                    "complete",
+                    config,
+                    f"2026-05-26T00:{idx:02d}:00Z",
+                    outputs=[h.Path(f"out_{idx}.png")],
+                )
+                h.append_recent_run(record, path)
+
+            loaded = h.load_recent_runs(path)
+
+        self.assertEqual(len(loaded), h.RECENT_RUN_LIMIT)
+        self.assertIn("Status: complete", h.format_recent_run_summary(loaded[0]))
+        self.assertEqual(h.config_from_recent_run(loaded[0]).composite_choice, config.composite_choice)
+
+    def test_recent_runs_corrupt_file_returns_empty(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "recent.json"
+            path.write_text("{bad", encoding="utf-8")
+
+            self.assertEqual(h.load_recent_runs(path), [])
+
+    def test_preview_metadata_handles_missing_unsupported_and_safe_image(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = h.Path(tmp_dir)
+            missing = h.safe_preview_metadata(tmp_path / "missing.png")
+            unsupported = tmp_path / "movie.mp4"
+            unsupported.write_bytes(b"fake")
+            oversized = tmp_path / "big.png"
+            oversized.write_bytes(b"fake")
+            image_path = tmp_path / "small.png"
+
+            from PIL import Image
+
+            Image.new("RGB", (8, 6), color=(1, 2, 3)).save(image_path)
+
+            self.assertFalse(missing.exists)
+            self.assertFalse(h.safe_preview_metadata(unsupported).supported_preview)
+            self.assertFalse(h.safe_preview_metadata(oversized, max_bytes=1).supported_preview)
+            safe = h.safe_preview_metadata(image_path)
+            self.assertTrue(safe.supported_preview)
+            self.assertEqual(safe.dimensions, (8, 6))
+
+    def test_completion_and_cancel_messages_include_manifest_context(self):
+        config = h.default_config()
+        config.mode = "Timelapse"
+
+        done = h.completion_message([h.Path("movie.gif")], config, h.Path("outputs"))
+        canceled = h.cancel_resume_message(config, [h.Path("frame_0000.png")], h.Path("outputs"))
+
+        self.assertIn("movie.gif", done)
+        self.assertIn("Manifest:", done)
+        self.assertIn("Retrying", canceled)
 
     def test_low_ram_resampler_rejects_bilinear(self):
         config = h.default_config()
@@ -1577,15 +1722,23 @@ class ProcessorTests(unittest.TestCase):
         app.choose_output_button = FakeWidget()
         app.choose_temp_button = FakeWidget()
         app.open_temp_button = FakeWidget()
+        app.simple_output_button = FakeWidget()
         app.open_output_button = FakeWidget()
         app.check_env_button = FakeWidget()
         app.quick_fix_button = FakeWidget()
         app.latest_url_button = FakeWidget()
+        app.scan_browser_button = FakeWidget()
         app.overlay_check_button = FakeWidget()
         app.open_last_button = FakeWidget()
         app.copy_paths_button = FakeWidget()
         app.copy_error_button = FakeWidget()
-        app._path_controls = (app.choose_output_button, app.choose_temp_button, app.open_temp_button)
+        app.custom_preset_box = FakeWidget()
+        app._path_controls = (
+            app.choose_output_button,
+            app.choose_temp_button,
+            app.open_temp_button,
+            app.simple_output_button,
+        )
         app._refresh_mode_state = mock.Mock()
 
         h.HimawariProcessorApp._set_running(app, True)
@@ -1598,8 +1751,10 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(app.check_env_button.configured["state"], "disabled")
         self.assertEqual(app.quick_fix_button.configured["state"], "disabled")
         self.assertEqual(app.latest_url_button.configured["state"], "disabled")
+        self.assertEqual(app.scan_browser_button.configured["state"], "disabled")
         self.assertEqual(app.overlay_check_button.configured["state"], "disabled")
         self.assertEqual(app.copy_error_button.configured["state"], "disabled")
+        self.assertEqual(app.custom_preset_box.configured["state"], "disabled")
 
         h.HimawariProcessorApp._set_running(app, False)
 
@@ -1608,6 +1763,44 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(app.choose_output_button.configured["state"], "normal")
         self.assertEqual(app.choose_temp_button.configured["state"], "normal")
         self.assertEqual(app.latest_url_button.configured["state"], "normal")
+        self.assertEqual(app.scan_browser_button.configured["state"], "normal")
+
+    def test_gui_rerun_recent_settings_loads_saved_config(self):
+        app = object.__new__(h.HimawariProcessorApp)
+        config = h.default_config()
+        config.composite_choice = "B13 (Infrared Window)"
+        record = h.build_recent_run_record("complete", config, "2026-05-26T00:00:00Z")
+        app.recent_runs = [record]
+        app.recent_tree = mock.Mock()
+        app.recent_tree.selection.return_value = [record.run_id]
+        app._set_config_vars = mock.Mock()
+        app.notebook = mock.Mock()
+        app._append_log = mock.Mock()
+
+        h.HimawariProcessorApp._rerun_selected_recent_settings(app)
+
+        loaded_config = app._set_config_vars.call_args.args[0]
+        self.assertEqual(loaded_config.composite_choice, "B13 (Infrared Window)")
+        app.notebook.select.assert_called_once_with(0)
+
+    def test_gui_copy_selected_recent_paths_uses_clipboard(self):
+        app = object.__new__(h.HimawariProcessorApp)
+        config = h.default_config()
+        record = h.build_recent_run_record(
+            "complete",
+            config,
+            "2026-05-26T00:00:00Z",
+            outputs=[h.Path("out.png")],
+        )
+        app.root = FakeRoot()
+        app.recent_runs = [record]
+        app.recent_tree = mock.Mock()
+        app.recent_tree.selection.return_value = [record.run_id]
+        app._append_log = mock.Mock()
+
+        h.HimawariProcessorApp._copy_selected_recent_paths(app)
+
+        self.assertEqual(app.root.clipboard, "out.png")
 
     def test_gui_path_fields_refresh_from_selected_directories(self):
         app = object.__new__(h.HimawariProcessorApp)

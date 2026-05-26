@@ -9,6 +9,8 @@ venv/
 outputs/
 temp/
 himawari_gui_settings.json
+himawari_recent_runs.json
+himawari_custom_presets.json
 
 .pytest_cache/
 .mypy_cache/

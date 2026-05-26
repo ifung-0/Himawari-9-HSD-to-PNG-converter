@@ -46,6 +46,8 @@ class CliTests(unittest.TestCase):
                 "1",
                 "--image-format",
                 "tif",
+                "--output-template",
+                "{scan_time}_{product}",
             ]
         )
 
@@ -62,6 +64,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(config.download_workers, 2)
         self.assertEqual(config.dask_num_workers, 1)
         self.assertEqual(config.image_format, "tif")
+        self.assertEqual(config.output_template, "{scan_time}_{product}")
 
     def test_set_output_and_temp_dirs_update_processor_paths(self):
         original_output = processor.OUTPUT_DIR

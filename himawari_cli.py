@@ -74,6 +74,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chunk-size", dest="dask_chunk_size", choices=("32MiB", "64MiB", "128MiB"), default=None)
     parser.add_argument("--ram-limit-gb", type=float, default=None)
     parser.add_argument("--image-format", metavar="png|tif", default=None)
+    parser.add_argument(
+        "--output-template",
+        default=None,
+        help="Output filename template with tokens like {scan_time}, {area}, and {product}.",
+    )
     parser.add_argument("--timelapse-format", metavar="gif|mp4", default=None)
     parser.add_argument("--resampler", metavar="native|nearest", default=None)
 
@@ -222,6 +227,7 @@ def edit_advanced_settings(config: processor.ProcessorConfig) -> processor.Proce
     values["dask_chunk_size"] = prompt_choice("Dask chunk size", config.dask_chunk_size, ("32MiB", "64MiB", "128MiB"))
     values["ram_limit_gb"] = prompt_float("RAM limit GiB", config.ram_limit_gb, 1.0)
     values["resampler"] = prompt_choice("Resampler", config.resampler, ("native", "nearest"))
+    values["output_template"] = prompt_text("Output filename template", config.output_template)
     values["add_border_lines"] = prompt_bool("Draw coastline/country borders", config.add_border_lines)
     values["border_line_color"] = prompt_text("Border line color", config.border_line_color)
     values["border_line_width"] = prompt_float("Border line width", config.border_line_width, 0.25)
