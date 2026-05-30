@@ -211,6 +211,15 @@ class ProcessorTests(unittest.TestCase):
     def test_select_active_composite(self):
         self.assertEqual(
             h.select_active_composite("True Color RGB (Enhanced)", True, use_night_fallback=True),
+            "True Color RGB (Enhanced)",
+        )
+        self.assertEqual(
+            h.select_active_composite(
+                "True Color RGB (Enhanced)",
+                True,
+                use_night_fallback=True,
+                night_fallback_mode="whole_frame_ir",
+            ),
             "B13 (Infrared Window)",
         )
         self.assertEqual(
@@ -221,6 +230,11 @@ class ProcessorTests(unittest.TestCase):
             h.select_active_composite("Night Microphysics RGB", True, use_night_fallback=True),
             "Night Microphysics RGB",
         )
+
+    def test_night_check_band_prefers_b03_then_reflectance_band(self):
+        self.assertEqual(h.night_check_band_for_bands(("B01", "B03", "B13")), "B03")
+        self.assertEqual(h.night_check_band_for_bands(("B05", "B13")), "B05")
+        self.assertIsNone(h.night_check_band_for_bands(("B13", "B14")))
 
     def test_coarse_sample_area_caps_large_full_disk(self):
         projection = {"proj": "geos", "lon_0": 140.7, "h": 35785863, "a": 6378137, "b": 6356752.31414}
@@ -244,6 +258,36 @@ class ProcessorTests(unittest.TestCase):
         area = mock.Mock(width=128, height=96)
 
         self.assertIs(h.coarse_sample_area(area), area)
+
+    def test_visible_sample_is_dark_ignores_small_bright_edge(self):
+        values = da.zeros((10, 10), chunks=(5, 5))
+        values = da.where(da.indices((10, 10), chunks=(5, 5))[1] == 9, 80.0, values)
+        sample = xr.DataArray(values, dims=("y", "x"))
+
+        is_dark, max_reflectance, bright_fraction, valid_pixels = h.visible_sample_is_dark(sample)
+
+        self.assertTrue(is_dark)
+        self.assertEqual(valid_pixels, 36)
+        self.assertEqual(max_reflectance, 0.0)
+        self.assertEqual(bright_fraction, 0.0)
+
+    def test_visible_sample_is_day_when_center_is_bright(self):
+        sample = xr.DataArray(da.ones((10, 10), chunks=(5, 5)) * 20.0, dims=("y", "x"))
+
+        is_dark, _max_reflectance, bright_fraction, _valid_pixels = h.visible_sample_is_dark(sample)
+
+        self.assertFalse(is_dark)
+        self.assertGreater(bright_fraction, h.NIGHT_CHECK_BRIGHT_FRACTION)
+
+    def test_is_visible_dark_fails_toward_night_fallback(self):
+        scene = mock.Mock()
+        scene.load.side_effect = RuntimeError("bad reflectance")
+
+        with self.assertLogs(h.LOG, level="WARNING") as captured:
+            result = h.is_visible_dark(scene, mock.Mock(width=10, height=10))
+
+        self.assertTrue(result)
+        self.assertTrue(any("using night fallback" in message for message in captured.output))
 
     def test_output_filename(self):
         info = h.parse_url(h.USER_URL)
@@ -515,11 +559,25 @@ class ProcessorTests(unittest.TestCase):
 
         self.assertTrue(any("auto-switch to GeoTIFF" in warning for warning in status.warnings))
 
+    def test_setup_status_does_not_use_native_png_warning_for_flat_map(self):
+        config = h.default_config()
+        config.composite_choice = "True Color RGB (Enhanced)"
+        config.image_format = "png"
+        config.map_view = "flat"
+
+        status = h.build_setup_status(config, h.Path("C:/Himawari/outputs"), h.Path("C:/Himawari/temp"))
+
+        self.assertTrue(status.ok)
+        self.assertTrue(any("Map view: flat map" in detail for detail in status.details))
+        self.assertFalse(any("Full-disk 500 m PNG" in warning for warning in status.warnings))
+
     def test_setup_status_warns_for_border_overlay_requirements(self):
         config = h.default_config()
         config.add_border_lines = True
 
-        status = h.build_setup_status(config, h.Path("C:/Himawari/outputs"), h.Path("C:/Himawari/temp"))
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with mock.patch.object(h, "PROJECT_DIR", h.Path(tmp_dir)):
+                status = h.build_setup_status(config, h.Path("C:/Himawari/outputs"), h.Path("C:/Himawari/temp"))
 
         self.assertFalse(status.ok)
         self.assertTrue(any("Border lines require" in warning for warning in status.warnings))
@@ -537,6 +595,45 @@ class ProcessorTests(unittest.TestCase):
         status = h.build_setup_status(config, h.Path("C:/Users/Isaac/OneDrive/out"), h.Path("C:/Himawari/temp"))
 
         self.assertTrue(any("Cloud-sync path detected" in warning for warning in status.warnings))
+
+    @mock.patch.object(h.Path, "resolve", autospec=True)
+    def test_setup_status_ignores_cloud_synced_project_when_output_and_temp_are_local(self, mock_resolve):
+        def fake_resolve(path, strict=False):
+            text = str(path)
+            if "HimawariLocal" in text:
+                return h.Path("C:/HimawariLocal")
+            return h.Path("C:/Users/Isaac/OneDrive/Desktop/Himawari")
+
+        mock_resolve.side_effect = fake_resolve
+        config = h.default_config()
+
+        status = h.build_setup_status(config, h.Path("C:/HimawariLocal/out"), h.Path("C:/HimawariLocal/temp"))
+
+        self.assertFalse(any("Cloud-sync path detected" in warning for warning in status.warnings))
+
+    @mock.patch.object(h.Path, "resolve", autospec=True)
+    def test_saved_project_default_paths_migrate_off_cloud_sync(self, mock_resolve):
+        def fake_resolve(path, strict=False):
+            return path
+
+        mock_resolve.side_effect = fake_resolve
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            settings_path = h.Path(tmp_dir) / "settings.json"
+            project_dir = h.Path(tmp_dir) / "OneDrive" / "project"
+            output_dir = project_dir / "outputs"
+            temp_dir = project_dir / "temp"
+            write_data = h.serialize_gui_settings(h.default_config(), output_dir, temp_dir)
+            h.write_json_file(settings_path, write_data)
+            original_project = h.PROJECT_DIR
+            try:
+                h.PROJECT_DIR = project_dir
+                loaded = h.load_gui_settings(settings_path)
+            finally:
+                h.PROJECT_DIR = original_project
+
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded[1], h.OUTPUT_DIR)
+        self.assertEqual(loaded[2], h.TEMP_DIR)
 
     def test_overlay_status_reports_missing_data(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -562,14 +659,32 @@ class ProcessorTests(unittest.TestCase):
             for path in h.overlay_data_required_paths(h.Path(tmp_dir)):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("fake")
+            for path in h.missing_overlay_sidecar_paths(h.Path(tmp_dir)):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("fake")
 
             status = h.overlay_status(h.Path(tmp_dir), module_checker=lambda _module: True)
 
         self.assertTrue(status.ok)
 
+    def test_overlay_status_requires_nonempty_files_and_sidecars(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            for path in h.overlay_data_required_paths(h.Path(tmp_dir)):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("")
+
+            status = h.overlay_status(h.Path(tmp_dir), module_checker=lambda _module: True)
+
+        self.assertFalse(status.ok)
+        self.assertTrue(any("GSHHS_l_L1.shp" in item for item in status.missing_data))
+        self.assertTrue(any("GSHHS_l_L1.shx" in item for item in status.missing_data))
+
     def test_overlay_status_reports_missing_packages(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             for path in h.overlay_data_required_paths(h.Path(tmp_dir)):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("fake")
+            for path in h.missing_overlay_sidecar_paths(h.Path(tmp_dir)):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("fake")
 
@@ -592,6 +707,195 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(summary.total_segments, 20)
         self.assertIn("B13", summary.display_text())
 
+    def test_required_bands_adds_hybrid_night_inputs_for_true_color(self):
+        bands = h.required_bands(
+            "True Color Reproduction Image",
+            use_night_fallback=True,
+            night_fallback_mode="hybrid",
+        )
+
+        self.assertIn("B03", bands)
+        self.assertIn("B13", bands)
+        self.assertEqual(bands.count("B13"), 1)
+
+    def test_whole_frame_night_fallback_keeps_previous_band_behavior(self):
+        bands = h.required_bands(
+            "Day Convective Storm RGB",
+            use_night_fallback=True,
+            night_fallback_mode="whole_frame_ir",
+        )
+
+        self.assertIn("B14", bands)
+        self.assertIn("B08", bands)
+
+    def test_visible_dark_weight_feathers_between_day_and_night(self):
+        b03 = xr.DataArray(
+            da.from_array([[0.0, 5.0, 12.0]], chunks=(1, 3)),
+            dims=("y", "x"),
+        )
+
+        weight = h.visible_dark_weight(b03).compute()
+
+        self.assertAlmostEqual(float(weight[0, 0]), 1.0)
+        self.assertAlmostEqual(float(weight[0, 1]), 0.5)
+        self.assertAlmostEqual(float(weight[0, 2]), 0.0)
+
+    def test_hybrid_day_night_rgb_preserves_dask_and_fills_dark_pixels(self):
+        day = h.rgb_dataarray(
+            xr.DataArray(da.from_array([[1.0, 0.2]], chunks=(1, 2)), dims=("y", "x")),
+            xr.DataArray(da.from_array([[0.0, 0.2]], chunks=(1, 2)), dims=("y", "x")),
+            xr.DataArray(da.from_array([[0.0, 0.2]], chunks=(1, 2)), dims=("y", "x")),
+            "day",
+            "day",
+        )
+        b03 = xr.DataArray(da.from_array([[0.0, 12.0]], chunks=(1, 2)), dims=("y", "x"))
+        b13 = xr.DataArray(da.from_array([[190.0, 305.0]], chunks=(1, 2)), dims=("y", "x"))
+
+        hybrid = h.create_hybrid_day_night_rgb(day, b03, b13, "True Color Reproduction Image")
+
+        self.assertTrue(hasattr(hybrid.data, "dask"))
+        result = hybrid.compute()
+        self.assertGreater(int(result.sel(bands="R")[0, 0]), 200)
+        self.assertEqual(int(result.sel(bands="R")[0, 1]), int(day.sel(bands="R")[0, 1].compute()))
+        self.assertEqual(result.attrs["night_fallback_mode"], "hybrid")
+
+    def test_custom_composite_hybrid_requires_and_uses_b13(self):
+        attrs = {"area": mock.Mock(), "sensor": "ahi"}
+        arrays = {
+            band: xr.DataArray(da.ones((2, 2), chunks=(1, 1)) * value, dims=("y", "x"), attrs=attrs)
+            for band, value in {
+                "B01": 30.0,
+                "B02": 35.0,
+                "B03": 0.0,
+                "B04": 40.0,
+                "B13": 190.0,
+            }.items()
+        }
+        scene = mock.MagicMock()
+        scene.__contains__.side_effect = lambda key: key in arrays
+        scene.__getitem__.side_effect = lambda key: arrays[key]
+        config = h.default_config()
+        config.use_night_fallback = True
+        config.night_fallback_mode = "hybrid"
+
+        name, dataset = h.build_custom_composite(scene, "True Color Reproduction Image", False, config)
+
+        self.assertEqual(name, h.hybrid_dataset_name("True Color Reproduction Image"))
+        self.assertEqual(dataset.attrs["night_fallback_mode"], "hybrid")
+        self.assertGreater(int(dataset.sel(bands="R")[0, 0].compute()), 200)
+
+    def test_flat_map_area_defaults_are_bounded_himawari_region(self):
+        config = h.default_config()
+        config.map_view = "flat"
+
+        area = h.flat_map_area(config)
+
+        self.assertEqual((area.height, area.width), (2400, 2400))
+        self.assertEqual(area.area_extent, (80.0, -60.0, 200.0, 60.0))
+
+    def test_flat_map_validation_rejects_invalid_numbers_and_bounds(self):
+        cases = [
+            ("flat_resolution_deg", 0, "resolution must be positive"),
+            ("flat_resolution_deg", float("inf"), "resolution must be finite"),
+            ("flat_min_lat", float("nan"), "min latitude must be finite"),
+            ("flat_min_lon", "west", "min longitude must be a finite number"),
+            ("flat_min_lat", 60.0, "min latitude must be less than max latitude"),
+            ("flat_max_lat", 91.0, "latitude bounds must be between -90 and 90"),
+            ("flat_min_lon", 200.0, "min longitude must be less than max longitude"),
+            ("flat_max_lon", 361.0, "longitude bounds must be between -360 and 360"),
+        ]
+
+        for field, value, message in cases:
+            with self.subTest(field=field, value=value):
+                config = h.default_config()
+                config.map_view = "flat"
+                setattr(config, field, value)
+
+                with self.assertRaisesRegex(ValueError, message):
+                    h.validate_flat_map_settings(config)
+
+    def test_flat_map_validation_rejects_empty_output_size(self):
+        config = h.default_config()
+        config.map_view = "flat"
+        config.flat_min_lat = 0.0
+        config.flat_max_lat = 0.01
+        config.flat_min_lon = 100.0
+        config.flat_max_lon = 100.01
+        config.flat_resolution_deg = 1.0
+
+        with self.assertRaisesRegex(ValueError, "empty output"):
+            h.validate_flat_map_settings(config)
+
+    def test_flat_map_settings_reject_excessive_pixel_count(self):
+        config = h.default_config()
+        config.map_view = "flat"
+        config.flat_resolution_deg = 0.005
+
+        with self.assertRaisesRegex(ValueError, "Flat map would be"):
+            h.validate_flat_map_settings(config)
+
+    def test_build_setup_status_reports_invalid_flat_settings_without_crashing(self):
+        config = h.default_config()
+        config.map_view = "flat"
+        config.flat_resolution_deg = float("nan")
+
+        status = h.build_setup_status(config)
+
+        self.assertFalse(status.ok)
+        self.assertTrue(any("Flat map resolution must be finite" in error for error in status.errors))
+
+    def test_preflight_reports_invalid_flat_settings_without_crashing(self):
+        config = h.default_config()
+        config.map_view = "flat"
+        config.flat_min_lon = "west"
+
+        result = h.preflight_run(config)
+
+        self.assertFalse(result.ok)
+        self.assertTrue(any("Flat map min longitude must be a finite number" in error for error in result.errors))
+
+    def test_output_filename_appends_flat_map_suffix(self):
+        config = h.default_config()
+        config.map_view = "flat"
+        info = h.parse_url(h.USER_URL)
+        dt = h.datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
+
+        path = h.output_filename(info, dt, config.composite_choice, "Single Image", 0, "png", config=config)
+
+        self.assertIn("Flat_Map", path.stem)
+
+    def test_flat_map_output_behavior_uses_flat_target_dimensions(self):
+        config = h.default_config()
+        config.map_view = "flat"
+        config.image_format = "png"
+        config.max_safe_png_pixels = 10_000
+        info = h.parse_url(h.USER_URL)
+        start = h.datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
+
+        output = h.output_behavior_for_config(config, info, start)
+
+        self.assertIn("flat target 2400x2400 px", output)
+        self.assertIn(".tif", output)
+
+    def test_flat_map_resampler_forces_nearest_even_when_config_native(self):
+        config = h.default_config()
+        config.map_view = "flat"
+        config.resampler = "native"
+        scene = mock.Mock()
+        target = mock.Mock()
+        expected = mock.Mock()
+        scene.resample.return_value = expected
+
+        result = h.resample_scene_low_ram(scene, target, config, datasets=("B13",))
+
+        self.assertIs(result, expected)
+        scene.resample.assert_called_once_with(
+            target,
+            datasets=("B13",),
+            resampler="nearest",
+            radius_of_influence=10000,
+        )
+
     def test_preflight_blocks_invalid_url(self):
         config = h.default_config()
         config.user_url = "bad"
@@ -605,7 +909,9 @@ class ProcessorTests(unittest.TestCase):
         config = h.default_config()
         config.add_border_lines = True
 
-        result = h.preflight_run(config, h.Path("C:/Himawari/outputs"), h.Path("C:/Himawari/temp"))
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with mock.patch.object(h, "PROJECT_DIR", h.Path(tmp_dir)):
+                result = h.preflight_run(config, h.Path("C:/Himawari/outputs"), h.Path("C:/Himawari/temp"))
 
         self.assertFalse(result.ok)
         self.assertTrue(any("GSHHS_l_L1.shp" in error for error in result.errors))
@@ -618,10 +924,52 @@ class ProcessorTests(unittest.TestCase):
 
         self.assertTrue(all("GSHHS_l_L1" not in error for error in result.errors))
 
-    def test_preset_config_values_are_safe(self):
-        fast = h.preset_config("Fast IR Check")
-        timelapse = h.preset_config("Low-RAM Timelapse")
+    def test_validate_overlay_ready_blocks_missing_data_when_enabled(self):
+        config = h.default_config()
+        config.add_border_lines = True
 
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with mock.patch.object(h, "PROJECT_DIR", h.Path(tmp_dir)):
+                with self.assertRaisesRegex(RuntimeError, "overlay setup is incomplete"):
+                    h.validate_overlay_ready_for_run(config, h.Path(tmp_dir))
+
+    def test_validate_overlay_ready_ignores_missing_data_when_disabled(self):
+        config = h.default_config()
+        config.add_border_lines = False
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            h.validate_overlay_ready_for_run(config, h.Path(tmp_dir))
+
+    def test_balanced_single_preset_allows_missing_overlay_data_from_enabled_base(self):
+        base = h.default_config()
+        base.add_border_lines = True
+        base.border_line_color = "#123456"
+        base.border_line_width = 2.5
+
+        config = h.preset_config("Balanced Single", base)
+        result = h.preflight_run(config, h.Path("C:/Himawari/outputs"), h.Path("C:/Himawari/temp"))
+
+        self.assertFalse(config.add_border_lines)
+        self.assertEqual(config.border_line_color, "#123456")
+        self.assertEqual(config.border_line_width, 2.5)
+        self.assertTrue(all("GSHHS_l_L1" not in error for error in result.errors))
+        self.assertTrue(all("Border lines require" not in warning for warning in result.warnings))
+
+    def test_preset_config_values_are_safe(self):
+        base = h.default_config()
+        base.add_border_lines = True
+        base.border_line_color = "#abcdef"
+        base.border_line_width = 3.0
+
+        balanced = h.preset_config("Balanced Single", base)
+        fast = h.preset_config("Fast IR Check", base)
+        timelapse = h.preset_config("Low-RAM Timelapse", base)
+
+        self.assertFalse(balanced.add_border_lines)
+        self.assertFalse(fast.add_border_lines)
+        self.assertFalse(timelapse.add_border_lines)
+        self.assertEqual(balanced.border_line_color, "#abcdef")
+        self.assertEqual(fast.border_line_width, 3.0)
         self.assertEqual(fast.composite_choice, "B13 (Infrared Window)")
         self.assertEqual(fast.download_workers, 2)
         self.assertEqual(timelapse.mode, "Timelapse")
@@ -631,6 +979,12 @@ class ProcessorTests(unittest.TestCase):
     def test_gui_settings_round_trip_ignores_unknown_fields(self):
         config = h.default_config()
         config.composite_choice = "B13 (Infrared Window)"
+        config.map_view = "flat"
+        config.flat_min_lat = -45.0
+        config.flat_max_lat = 45.0
+        config.flat_min_lon = 90.0
+        config.flat_max_lon = 180.0
+        config.flat_resolution_deg = 0.1
         with tempfile.TemporaryDirectory() as tmp_dir:
             settings_path = h.Path(tmp_dir) / "settings.json"
             data = h.serialize_gui_settings(config, h.Path("C:/out"), h.Path("C:/tmp"))
@@ -642,8 +996,42 @@ class ProcessorTests(unittest.TestCase):
         self.assertIsNotNone(loaded)
         loaded_config, output_dir, temp_dir = loaded
         self.assertEqual(loaded_config.composite_choice, "B13 (Infrared Window)")
+        self.assertEqual(loaded_config.map_view, "flat")
+        self.assertEqual(loaded_config.flat_min_lat, -45.0)
+        self.assertEqual(loaded_config.flat_max_lat, 45.0)
+        self.assertEqual(loaded_config.flat_min_lon, 90.0)
+        self.assertEqual(loaded_config.flat_max_lon, 180.0)
+        self.assertEqual(loaded_config.flat_resolution_deg, 0.1)
         self.assertEqual(output_dir, h.Path("C:/out").resolve())
         self.assertEqual(temp_dir, h.Path("C:/tmp").resolve())
+
+    def test_gui_settings_old_schema_loads_flat_defaults(self):
+        config = h.default_config()
+        data = h.serialize_gui_settings(config, h.Path("C:/out"), h.Path("C:/tmp"))
+        for key in (
+            "map_view",
+            "flat_min_lat",
+            "flat_max_lat",
+            "flat_min_lon",
+            "flat_max_lon",
+            "flat_resolution_deg",
+        ):
+            data["config"].pop(key)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            settings_path = h.Path(tmp_dir) / "settings.json"
+            settings_path.write_text(h.json.dumps(data), encoding="utf-8")
+
+            loaded = h.load_gui_settings(settings_path)
+
+        self.assertIsNotNone(loaded)
+        loaded_config = loaded[0]
+        self.assertEqual(loaded_config.map_view, h.MAP_VIEW)
+        self.assertEqual(loaded_config.flat_min_lat, h.FLAT_MIN_LAT)
+        self.assertEqual(loaded_config.flat_max_lat, h.FLAT_MAX_LAT)
+        self.assertEqual(loaded_config.flat_min_lon, h.FLAT_MIN_LON)
+        self.assertEqual(loaded_config.flat_max_lon, h.FLAT_MAX_LON)
+        self.assertEqual(loaded_config.flat_resolution_deg, h.FLAT_RESOLUTION_DEG)
 
     def test_gui_settings_corrupt_file_returns_none(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1035,6 +1423,16 @@ class ProcessorTests(unittest.TestCase):
             ["true_color"],
         )
 
+    def test_satpy_resample_datasets_adds_hybrid_inputs(self):
+        config = h.default_config()
+        config.composite_choice = "True Color Reproduction Image"
+        config.use_night_fallback = True
+        config.night_fallback_mode = "hybrid"
+
+        datasets = h.satpy_resample_datasets("True Color Reproduction Image", "true_color_reproduction", config)
+
+        self.assertEqual(datasets, ["true_color_reproduction", "B03", "B13"])
+
     @mock.patch("himawari_lowram_processor.cleanup_paths")
     @mock.patch("himawari_lowram_processor.save_dataset_with_optional_overlay")
     @mock.patch("himawari_lowram_processor.resample_scene_low_ram")
@@ -1111,13 +1509,19 @@ class ProcessorTests(unittest.TestCase):
         config = h.default_config()
         config.composite_choice = "True Color Reproduction Image"
         config.use_night_fallback = False
+        config.night_fallback_mode = "whole_frame_ir"
         info = h.parse_url(h.USER_URL)
         dt = h.datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
 
         result = h.process_frame(dt, info, mock.Mock(width=10, height=10), 0, 1, config=config)
 
         self.assertEqual(result, h.Path("out.png"))
-        mock_resample.assert_called_once_with(original_scene, mock.ANY, config, datasets=None)
+        mock_resample.assert_called_once_with(
+            original_scene,
+            mock.ANY,
+            config,
+            datasets=None,
+        )
         mock_save.assert_called_once()
         self.assertIs(mock_save.call_args.args[0], resampled_scene)
         self.assertEqual(mock_save.call_args.args[1], "true_color_reproduction")
@@ -1596,9 +2000,25 @@ class ProcessorTests(unittest.TestCase):
 
         self.assertEqual(
             mock_common_area.call_args.kwargs["compatibility_bands"],
-            h.area_compatibility_bands("True Color Reproduction Image"),
+            h.area_compatibility_bands("True Color Reproduction Image", True, "hybrid"),
         )
-        self.assertNotIn("B13", mock_common_area.call_args.kwargs["compatibility_bands"])
+        self.assertIn("B13", mock_common_area.call_args.kwargs["compatibility_bands"])
+
+    @mock.patch("himawari_lowram_processor.process_frame")
+    @mock.patch("himawari_lowram_processor.validate_runtime_dependencies")
+    @mock.patch("himawari_lowram_processor.common_area_from_frames")
+    def test_run_flat_map_skips_native_common_area(self, mock_common_area, mock_validate, mock_process):
+        config = h.default_config()
+        config.mode = "Single Image"
+        config.map_view = "flat"
+        mock_process.return_value = h.Path("out.png")
+
+        h.run(config)
+
+        mock_common_area.assert_not_called()
+        area = mock_validate.call_args.args[3]
+        self.assertEqual((area.height, area.width), (2400, 2400))
+        self.assertEqual(mock_process.call_args.args[2].area_id, "himawari_flat_map")
 
     @mock.patch("himawari_lowram_processor.process_frame")
     @mock.patch("himawari_lowram_processor.validate_runtime_dependencies")
@@ -1744,6 +2164,19 @@ class ProcessorTests(unittest.TestCase):
         self.assertIn("--fix", command)
         app._append_log.assert_called_once()
 
+    @mock.patch("himawari_lowram_processor.subprocess.Popen")
+    def test_gui_environment_auto_fix_uses_auto_flag(self, mock_popen):
+        app = object.__new__(h.HimawariProcessorApp)
+        app._append_log = mock.Mock()
+
+        h.HimawariProcessorApp._open_environment_auto_fix(app)
+
+        command = mock_popen.call_args.args[0]
+        self.assertIn(h.sys.executable, command)
+        self.assertIn(str(h.PROJECT_DIR / "check_environment.py"), command)
+        self.assertIn("--auto", command)
+        app._append_log.assert_called_once()
+
     def test_gui_copy_output_paths_uses_clipboard(self):
         app = object.__new__(h.HimawariProcessorApp)
         app.root = FakeRoot()
@@ -1812,6 +2245,7 @@ class ProcessorTests(unittest.TestCase):
         app.open_output_button = FakeWidget()
         app.check_env_button = FakeWidget()
         app.quick_fix_button = FakeWidget()
+        app.auto_fix_button = FakeWidget()
         app.latest_url_button = FakeWidget()
         app.scan_browser_button = FakeWidget()
         app.overlay_check_button = FakeWidget()
@@ -1836,6 +2270,7 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(app.open_output_button.configured["state"], "disabled")
         self.assertEqual(app.check_env_button.configured["state"], "disabled")
         self.assertEqual(app.quick_fix_button.configured["state"], "disabled")
+        self.assertEqual(app.auto_fix_button.configured["state"], "disabled")
         self.assertEqual(app.latest_url_button.configured["state"], "disabled")
         self.assertEqual(app.scan_browser_button.configured["state"], "disabled")
         self.assertEqual(app.overlay_check_button.configured["state"], "disabled")
@@ -1889,7 +2324,8 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(app.root.clipboard, "out.png")
 
     @mock.patch("himawari_lowram_processor.messagebox.showwarning")
-    def test_gui_overlay_check_creates_overlay_folder(self, mock_warning):
+    @mock.patch("himawari_lowram_processor.has_module", return_value=True)
+    def test_gui_overlay_check_creates_overlay_folder(self, _mock_has_module, mock_warning):
         app = object.__new__(h.HimawariProcessorApp)
         app._append_log = mock.Mock()
         original_project = h.PROJECT_DIR
@@ -1923,6 +2359,41 @@ class ProcessorTests(unittest.TestCase):
         finally:
             h.OUTPUT_DIR = original_output
             h.TEMP_DIR = original_temp
+
+    def test_gui_read_config_rejects_non_finite_flat_value(self):
+        app = object.__new__(h.HimawariProcessorApp)
+        config = h.default_config()
+        app.url_var = FakeVar(config.user_url)
+        app.mode_var = FakeVar(config.mode)
+        app.composite_var = FakeVar(config.composite_choice)
+        app.hours_var = FakeVar(str(config.hours_back))
+        app.interval_var = FakeVar(str(config.interval_minutes))
+        app.fps_var = FakeVar(str(config.fps))
+        app.auto_download_var = FakeVar(config.auto_download)
+        app.night_fallback_var = FakeVar(config.use_night_fallback)
+        app.night_fallback_mode_var = FakeVar(config.night_fallback_mode)
+        app.download_workers_var = FakeVar(str(config.download_workers))
+        app.timelapse_format_var = FakeVar(config.timelapse_format)
+        app.delete_frames_var = FakeVar(config.delete_timelapse_frames)
+        app.image_format_var = FakeVar(config.image_format)
+        app.output_template_var = FakeVar(config.output_template)
+        app.resampler_var = FakeVar(config.resampler)
+        app.quality_fallback_var = FakeVar(config.allow_quality_fallback)
+        app.border_lines_var = FakeVar(config.add_border_lines)
+        app.border_color_var = FakeVar(config.border_line_color)
+        app.border_width_var = FakeVar(str(config.border_line_width))
+        app.map_view_var = FakeVar("flat")
+        app.flat_min_lat_var = FakeVar("nan")
+        app.flat_max_lat_var = FakeVar(str(config.flat_max_lat))
+        app.flat_min_lon_var = FakeVar(str(config.flat_min_lon))
+        app.flat_max_lon_var = FakeVar(str(config.flat_max_lon))
+        app.flat_resolution_var = FakeVar(str(config.flat_resolution_deg))
+        app.ram_limit_var = FakeVar(str(config.ram_limit_gb))
+        app.chunk_var = FakeVar(config.dask_chunk_size)
+        app.dask_workers_var = FakeVar(str(config.dask_num_workers))
+
+        with self.assertRaisesRegex(ValueError, "Flat map min latitude must be finite"):
+            h.HimawariProcessorApp._read_config(app)
 
 
 if __name__ == "__main__":

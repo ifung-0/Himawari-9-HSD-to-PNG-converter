@@ -48,6 +48,20 @@ class CliTests(unittest.TestCase):
                 "tif",
                 "--output-template",
                 "{scan_time}_{product}",
+                "--night-fallback-mode",
+                "whole_frame_ir",
+                "--map-view",
+                "flat",
+                "--flat-min-lat",
+                "-45",
+                "--flat-max-lat",
+                "45",
+                "--flat-min-lon",
+                "90",
+                "--flat-max-lon",
+                "180",
+                "--flat-resolution-deg",
+                "0.1",
             ]
         )
 
@@ -65,6 +79,13 @@ class CliTests(unittest.TestCase):
         self.assertEqual(config.dask_num_workers, 1)
         self.assertEqual(config.image_format, "tif")
         self.assertEqual(config.output_template, "{scan_time}_{product}")
+        self.assertEqual(config.night_fallback_mode, "whole_frame_ir")
+        self.assertEqual(config.map_view, "flat")
+        self.assertEqual(config.flat_min_lat, -45)
+        self.assertEqual(config.flat_max_lat, 45)
+        self.assertEqual(config.flat_min_lon, 90)
+        self.assertEqual(config.flat_max_lon, 180)
+        self.assertEqual(config.flat_resolution_deg, 0.1)
 
     def test_set_output_and_temp_dirs_update_processor_paths(self):
         original_output = processor.OUTPUT_DIR

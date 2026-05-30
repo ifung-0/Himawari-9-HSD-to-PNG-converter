@@ -46,9 +46,10 @@ python check_environment.py --fix
 The checker verifies the active Python executable, installed package versions,
 Satpy's AHI reader/composite configuration, `pyspectral`, and GeoTIFF/overlay
 helpers. With `--fix`, it upgrades packages from `requirements.txt` using the
-current Python. With `--auto`, it does the same repair automatically and, if
-the active Python is unsupported, tries to create/use a local `.venv` with
-Python 3.12 or 3.13 from the Windows `py` launcher.
+current Python and installs the overlay data used by border lines. With
+`--auto`, it does the same repair automatically and, if the active Python is
+unsupported, tries to create/use a local `.venv` with Python 3.12 or 3.13 from
+the Windows `py` launcher.
 
 ## First Thing To Try
 
@@ -95,10 +96,18 @@ processing is blocked when border lines are enabled but those files are missing.
 The progress bar advances while segment downloads and timelapse frame assembly
 run, the phase/status strip summarizes the current stage, and the live log panel
 shows memory checkpoints and processing details.
+Night fallback now defaults to `hybrid` for true-color products: the sunlit side
+stays true color while the dark side is filled with B13 infrared grayscale, with
+a soft transition near the terminator. Choose `whole_frame_ir` if you prefer the
+older behavior of switching the entire frame to infrared when a scene is dark.
+Advanced users can enable `flat` map view to reproject the output to a bounded
+lat/lon map. The default flat extent is lat `-60..60`, lon `80E..200E`, at
+`0.05` degrees; native disk output remains the low-RAM default.
 Use `Stop Processing` to cancel the current run, including active segment
 downloads and pending frames. `Check Env` runs the diagnostic checker inline;
-`Quick Fix` opens the repair command in a separate console. Before processing,
-the GUI shows a run summary with source, frames, bands, segment estimate, output
+`Quick Fix` repairs the current Python in a separate console; `Auto Fix` uses
+the stronger `.venv` repair path for wrong or unsupported Python installs.
+Before processing, the GUI shows a run summary with source, frames, bands, segment estimate, output
 behavior, warnings, timelapse resume details, and blocking setup errors. After
 completion, use `Open Last` and `Copy Paths`; after a failure, use `Copy Error`
 for a support report. The `Recent Runs` tab persists completed, canceled, and
@@ -120,6 +129,8 @@ flags for repeatable commands:
 
 ```powershell
 python himawari_cli.py --run --composite "B13 (Infrared Window)" --mode "Single Image"
+python himawari_cli.py --run --composite "True Color Reproduction Image" --night-fallback-mode hybrid
+python himawari_cli.py --run --map-view flat --flat-min-lat -60 --flat-max-lat 60 --flat-min-lon 80 --flat-max-lon 200 --flat-resolution-deg 0.05
 ```
 
 Windows helper launchers prefer `.venv\Scripts\python.exe` when it exists,
@@ -252,7 +263,8 @@ Symptom: one full-disk true color frame downloads 40 or 50 files.
 
 Likely cause: full-disk (`FLDK`) Himawari files are split into 10 scan segments
 per band. True color reproduction needs `B01`, `B02`, `B03`, and `B04`; with
-night fallback enabled the app also downloads `B13`.
+hybrid night fallback enabled the app also downloads `B13` so the night side can
+be filled without producing a black half-disk.
 
 Quick fix:
 
@@ -263,6 +275,16 @@ python himawari_cli.py --run --composite "True Color Reproduction Image" --night
 Or in the GUI, turn off `Use night fallback for day-only products` for faster
 daytime single images. Already-downloaded complete `.DAT` files are kept under
 `temp/`, so retrying the same timestamp can reuse them.
+
+### True color has a black night side
+
+Symptom: a partly-lit FLDK true-color image shows a black side at night.
+
+Fix: leave `Use night fallback for day-only products` enabled and keep Night
+Fallback Mode set to `hybrid`. The app blends B13 infrared into dark visible
+pixels lazily with xarray/Dask, so it avoids full-frame materialization. If you
+want the whole image to become infrared at night, set the mode to
+`whole_frame_ir`.
 
 After pressing `Stop Processing`, wait for the canceled message before starting
 again. The app lets active download workers close their `.part` files first so
@@ -396,9 +418,12 @@ python himawari_cli.py --menu
 In the menu, set output and temp folders to local non-synced folders such as:
 
 ```text
-C:\Himawari\outputs
-C:\Himawari\temp
+%LOCALAPPDATA%\Himawari9LowRamProcessor\outputs
+%LOCALAPPDATA%\Himawari9LowRamProcessor\temp
 ```
+
+New installs use these local folders by default, even when the project code
+lives in OneDrive.
 
 ### Timelapse finishes with no GIF/MP4
 
@@ -481,9 +506,11 @@ Quick fix:
 python check_environment.py --fix
 ```
 
-Then add pycoast-compatible GSHHS/WDBII coastline and border data to the project
-`overlays/` folder. For the default low-resolution overlay setting, the app
-expects these files:
+Quick Fix installs/upgrades the overlay Python packages in the current Python,
+creates the project
+`overlays/` folder if needed, downloads the official GSHHG shapefile archive,
+and extracts the low-resolution GSHHS/WDBII files the app needs. For the default
+low-resolution overlay setting, the app expects these files:
 
 ```text
 overlays/GSHHS_shp/l/GSHHS_l_L1.shp
@@ -492,9 +519,11 @@ overlays/WDBII_shp/l/WDBII_border_l_L1.shp
 overlays/WDBII_shp/l/WDBII_border_l_L1.dbf
 ```
 
-If border lines are enabled and these files are missing, the GUI blocks Start
-before running the long image-processing job. Disable border lines to process
-without overlays.
+If border lines are enabled and these files or the `.shx` sidecars are missing
+or empty, the GUI and CLI block Start before running the long image-processing
+job. Check Env also reports a `pycoast overlay runtime` result so package/data
+problems are visible before processing. Disable border lines to process without
+overlays.
 
 ### MP4 output falls back to GIF
 

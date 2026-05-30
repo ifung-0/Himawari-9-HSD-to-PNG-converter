@@ -23,13 +23,24 @@ from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, ttk
 from typing import Callable, Iterable
 
-import dask
-import dask.array as da
-import numpy as np
-import requests
-import xarray as xr
-from pyresample.geometry import AreaDefinition
-from satpy import Scene
+if __name__ == "__main__":
+    print("Loading scientific packages; first startup can take a few seconds...", flush=True)
+
+try:
+    import dask
+    import dask.array as da
+    import numpy as np
+    import requests
+    import xarray as xr
+    from pyresample.geometry import AreaDefinition
+    from satpy import Scene
+except KeyboardInterrupt:
+    print(
+        "\nStartup was canceled while loading scientific packages. "
+        "Run the app again and wait for the GUI to open.",
+        file=sys.stderr,
+    )
+    raise SystemExit(130) from None
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +57,7 @@ INTERVAL_MINUTES = 20
 FPS = 10
 AUTO_DOWNLOAD = True
 USE_NIGHT_FALLBACK = True
+NIGHT_FALLBACK_MODE = "hybrid"
 DOWNLOAD_WORKERS = 4
 TIMELAPSE_FORMAT = "gif"  # "gif" or "mp4"
 DELETE_TIMELAPSE_FRAMES = True
@@ -56,19 +68,33 @@ ADD_BORDER_LINES = False
 BORDER_LINE_COLOR = "green"
 BORDER_LINE_WIDTH = 1.0
 MAX_SAFE_PNG_PIXELS = 120_000_000
+MAP_VIEW = "native"
+FLAT_MIN_LAT = -60.0
+FLAT_MAX_LAT = 60.0
+FLAT_MIN_LON = 80.0
+FLAT_MAX_LON = 200.0
+FLAT_RESOLUTION_DEG = 0.05
+MAX_FLAT_MAP_PIXELS = 30_000_000
 
 RAM_LIMIT_GB = 10.0
 DASK_CHUNK_SIZE = "64MiB"  # Use "128MiB" only if the machine has headroom.
 DASK_NUM_WORKERS = 1  # Keep at 1 or 2.
 NIGHT_CHECK_SAMPLE_PIXELS = 512
+NIGHT_CHECK_CENTER_FRACTION = 0.65
+NIGHT_CHECK_BRIGHT_REFLECTANCE = 2.0
+NIGHT_CHECK_BRIGHT_FRACTION = 0.03
+HYBRID_NIGHT_DARK_REFLECTANCE = 2.0
+HYBRID_NIGHT_DAY_REFLECTANCE = 8.0
 MAX_NATIVE_COMPATIBILITY_CROP_PIXELS = 32
 NATIVE_GRID_INDEX_TOLERANCE = 1e-7
 
 PROJECT_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = PROJECT_DIR / "outputs"
-TEMP_DIR = PROJECT_DIR / "temp"
 CLOUD_SYNC_PREFIXES = ("onedrive", "dropbox", "google drive", "icloud")
 CLOUD_SYNC_EXACT = ("box",)
+LOCAL_APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+APP_DATA_DIR = LOCAL_APP_DATA_DIR / "Himawari9LowRamProcessor"
+OUTPUT_DIR = APP_DATA_DIR / "outputs"
+TEMP_DIR = APP_DATA_DIR / "temp"
 GUI_SETTINGS_FILE = PROJECT_DIR / "himawari_gui_settings.json"
 RECENT_RUNS_FILE = PROJECT_DIR / "himawari_recent_runs.json"
 CUSTOM_PRESETS_FILE = PROJECT_DIR / "himawari_custom_presets.json"
@@ -274,6 +300,7 @@ class ProcessorConfig:
     fps: int = FPS
     auto_download: bool = AUTO_DOWNLOAD
     use_night_fallback: bool = USE_NIGHT_FALLBACK
+    night_fallback_mode: str = NIGHT_FALLBACK_MODE
     download_workers: int = DOWNLOAD_WORKERS
     timelapse_format: str = TIMELAPSE_FORMAT
     delete_timelapse_frames: bool = DELETE_TIMELAPSE_FRAMES
@@ -284,6 +311,12 @@ class ProcessorConfig:
     add_border_lines: bool = ADD_BORDER_LINES
     border_line_color: str = BORDER_LINE_COLOR
     border_line_width: float = BORDER_LINE_WIDTH
+    map_view: str = MAP_VIEW
+    flat_min_lat: float = FLAT_MIN_LAT
+    flat_max_lat: float = FLAT_MAX_LAT
+    flat_min_lon: float = FLAT_MIN_LON
+    flat_max_lon: float = FLAT_MAX_LON
+    flat_resolution_deg: float = FLAT_RESOLUTION_DEG
     max_safe_png_pixels: int = MAX_SAFE_PNG_PIXELS
     ram_limit_gb: float = RAM_LIMIT_GB
     dask_chunk_size: str = DASK_CHUNK_SIZE
@@ -310,8 +343,8 @@ class OverlayStatus:
             lines.append("Overlay setup looks ready.")
         else:
             lines.append(
-                "Install requirements with Quick Fix and place pycoast-compatible "
-                "GSHHS/WDBII data under overlays/."
+                "Run Quick Fix to install pycoast-compatible GSHHS/WDBII overlay data, "
+                "or disable border lines."
             )
         return "\n".join(lines)
 
@@ -939,39 +972,97 @@ def required_bands(
     composite_choice: str,
     include_night_fallback: bool = True,
     use_night_fallback: bool | None = None,
+    night_fallback_mode: str | None = None,
 ) -> tuple[str, ...]:
     if use_night_fallback is None:
         use_night_fallback = USE_NIGHT_FALLBACK
+    if night_fallback_mode is None:
+        night_fallback_mode = NIGHT_FALLBACK_MODE
     if composite_choice not in COMPOSITE_BANDS:
         raise KeyError(f"Unknown composite: {composite_choice}")
     bands = list(COMPOSITE_BANDS[composite_choice])
     if include_night_fallback and composite_choice in DAY_ONLY_COMPOSITES and use_night_fallback:
-        fallback = NIGHT_FALLBACK_MAP.get(composite_choice)
-        if fallback:
-            bands.extend(b for b in COMPOSITE_BANDS[fallback] if b not in bands)
+        if uses_hybrid_night_fallback(composite_choice, night_fallback_mode):
+            for band in ("B03", "B13"):
+                if band not in bands:
+                    bands.append(band)
+        else:
+            fallback = NIGHT_FALLBACK_MAP.get(composite_choice)
+            if fallback:
+                bands.extend(b for b in COMPOSITE_BANDS[fallback] if b not in bands)
     return tuple(dict.fromkeys(bands))
 
 
-def area_compatibility_bands(composite_choice: str) -> tuple[str, ...]:
+def area_compatibility_bands(
+    composite_choice: str,
+    use_night_fallback: bool = False,
+    night_fallback_mode: str | None = None,
+) -> tuple[str, ...]:
     """Bands that must align for the requested daytime product area."""
+    if use_night_fallback and uses_hybrid_night_fallback(composite_choice, night_fallback_mode):
+        return required_bands(
+            composite_choice,
+            include_night_fallback=True,
+            use_night_fallback=True,
+            night_fallback_mode=night_fallback_mode,
+        )
     return required_bands(composite_choice, include_night_fallback=False)
+
+
+def normalized_night_fallback_mode(mode: str | None) -> str:
+    normalized = (mode or NIGHT_FALLBACK_MODE).strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "auto": "hybrid",
+        "blend": "hybrid",
+        "day_ir": "hybrid",
+        "infrared": "whole_frame_ir",
+        "ir": "whole_frame_ir",
+        "whole": "whole_frame_ir",
+        "whole_frame": "whole_frame_ir",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def uses_hybrid_night_fallback(composite_choice: str, mode: str | None = None) -> bool:
+    return (
+        normalized_night_fallback_mode(mode) == "hybrid"
+        and composite_choice in {"True Color RGB (Enhanced)", "True Color Reproduction Image"}
+    )
 
 
 def select_active_composite(
     composite_choice: str,
     is_night: bool,
     use_night_fallback: bool | None = None,
+    night_fallback_mode: str | None = None,
 ) -> str:
     if use_night_fallback is None:
         use_night_fallback = USE_NIGHT_FALLBACK
+    if uses_hybrid_night_fallback(composite_choice, night_fallback_mode):
+        return composite_choice
     if is_night and use_night_fallback and composite_choice in DAY_ONLY_COMPOSITES:
         return NIGHT_FALLBACK_MAP.get(composite_choice, "B13 (Infrared Window)")
     return composite_choice
 
 
-def target_pixel_size_m(composite_choice: str, use_night_fallback: bool | None = None) -> int:
+def night_check_band_for_bands(bands: Iterable[str]) -> str | None:
+    band_list = list(bands)
+    if "B03" in band_list:
+        return "B03"
+    return next((band for band in band_list if band in REFLECTANCE_BANDS), None)
+
+
+def target_pixel_size_m(
+    composite_choice: str,
+    use_night_fallback: bool | None = None,
+    night_fallback_mode: str | None = None,
+) -> int:
     """Choose the finest native pixel size needed by the requested product."""
-    bands = required_bands(composite_choice, use_night_fallback=use_night_fallback)
+    bands = required_bands(
+        composite_choice,
+        use_night_fallback=use_night_fallback,
+        night_fallback_mode=night_fallback_mode,
+    )
     return min(BAND_PIXEL_SIZE_M[band] for band in bands)
 
 
@@ -1002,25 +1093,82 @@ def coarse_sample_area(area: AreaDefinition, max_pixels: int = NIGHT_CHECK_SAMPL
     )
 
 
-def is_visible_dark(scene: Scene, area: AreaDefinition) -> bool:
+def centered_slice(length: int, fraction: float) -> slice:
+    if length <= 0:
+        return slice(0, 0)
+    fraction = min(1.0, max(0.05, fraction))
+    size = max(1, int(round(length * fraction)))
+    start = max(0, (length - size) // 2)
+    return slice(start, start + size)
+
+
+def center_crop_sample(data: xr.DataArray, fraction: float = NIGHT_CHECK_CENTER_FRACTION) -> xr.DataArray:
+    if len(data.dims) < 2:
+        return data
+    y_dim, x_dim = data.dims[-2], data.dims[-1]
+    return data.isel(
+        {
+            y_dim: centered_slice(data.sizes[y_dim], fraction),
+            x_dim: centered_slice(data.sizes[x_dim], fraction),
+        }
+    )
+
+
+def visible_sample_is_dark(
+    b03_sample: xr.DataArray,
+    bright_reflectance: float = NIGHT_CHECK_BRIGHT_REFLECTANCE,
+    bright_fraction_threshold: float = NIGHT_CHECK_BRIGHT_FRACTION,
+) -> tuple[bool, float, float, int]:
+    """Classify a small visible/near-IR reflectance sample without materializing a full disk.
+
+    Full-disk scenes can have a bright limb even when the central view is night.
+    A max-only test is therefore too optimistic and can leave true-color output
+    mostly black. Use the center crop and the fraction of visibly bright pixels
+    so a few sunlit edge pixels do not prevent the infrared night fallback.
+    """
+    center = center_crop_sample(b03_sample)
+    valid = center.notnull()
+    bright = (center > bright_reflectance) & valid
+    stats = xr.Dataset(
+        {
+            "max_reflectance": center.max(skipna=True),
+            "valid_pixels": valid.sum(),
+            "bright_pixels": bright.sum(),
+        }
+    ).compute()
+    valid_pixels = int(stats["valid_pixels"].item())
+    bright_pixels = int(stats["bright_pixels"].item())
+    max_reflectance = float(stats["max_reflectance"].item()) if valid_pixels else float("nan")
+    bright_fraction = bright_pixels / valid_pixels if valid_pixels else 0.0
+    return bright_fraction < bright_fraction_threshold, max_reflectance, bright_fraction, valid_pixels
+
+
+def is_visible_dark(scene: Scene, area: AreaDefinition, band: str = "B03") -> bool:
     try:
-        scene.load(["B03"], calibration="reflectance")
+        scene.load([band], calibration="reflectance")
         sample_area = coarse_sample_area(area)
         LOG.info(
-            "Night check sampling B03 at %sx%s px instead of %sx%s full target",
+            "Night check sampling %s at %sx%s px instead of %sx%s full target",
+            band,
             sample_area.width,
             sample_area.height,
             area.width,
             area.height,
         )
         sampled = scene.resample(sample_area, resampler="nearest", radius_of_influence=10000)
-        max_value = sampled["B03"].max(skipna=True).compute()
-        result = float(max_value) < 2.0
-        LOG.info("Night check: B03 max reflectance %.4f -> %s", float(max_value), result)
+        result, max_value, bright_fraction, valid_pixels = visible_sample_is_dark(sampled[band])
+        LOG.info(
+            "Night check: center %s max reflectance %.4f, bright %.2f%% of %s valid px -> %s",
+            band,
+            max_value,
+            bright_fraction * 100.0,
+            valid_pixels,
+            result,
+        )
         return result
     except Exception as exc:
-        LOG.warning("Night check failed, keeping requested composite: %s", exc)
-        return False
+        LOG.warning("Night check failed; using night fallback to avoid black visible output: %s", exc)
+        return True
 
 
 def calibration_for_band(band: str) -> str:
@@ -1115,6 +1263,76 @@ def single_band_to_rgb(data: xr.DataArray, band: str, name: str) -> xr.DataArray
     return rgb_dataarray(red, green, blue, name=name, standard_name=standard_name)
 
 
+def create_b13_night_rgb(b13: xr.DataArray, name: str = "custom_b13_night_rgb") -> xr.DataArray:
+    return single_band_to_rgb(b13, "B13", name)
+
+
+def visible_dark_weight(
+    b03: xr.DataArray,
+    dark_reflectance: float = HYBRID_NIGHT_DARK_REFLECTANCE,
+    day_reflectance: float = HYBRID_NIGHT_DAY_REFLECTANCE,
+) -> xr.DataArray:
+    if day_reflectance <= dark_reflectance:
+        raise ValueError("day_reflectance must be greater than dark_reflectance.")
+    reflectance = b03.fillna(0.0)
+    weight = (day_reflectance - reflectance) / (day_reflectance - dark_reflectance)
+    return xr_clip(weight, 0.0, 1.0)
+
+
+def rgb_to_unit_float(rgb: xr.DataArray) -> xr.DataArray:
+    data = rgb.fillna(0.0)
+    if np.issubdtype(data.dtype, np.integer):
+        return xr_clip(data.astype(np.float32) / 255.0, 0.0, 1.0)
+    return xr_clip(xr.where(data > 1.0, data / 255.0, data), 0.0, 1.0)
+
+
+def blend_day_night_rgb(
+    day_rgb: xr.DataArray,
+    night_rgb: xr.DataArray,
+    b03: xr.DataArray,
+    name: str,
+    standard_name: str = "custom_hybrid_day_night_rgb",
+) -> xr.DataArray:
+    weight = visible_dark_weight(b03)
+    day = rgb_to_unit_float(day_rgb)
+    night = rgb_to_unit_float(night_rgb)
+    blended = day * (1.0 - weight) + night * weight
+    blended = (xr_clip(blended, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+    if "bands" in day_rgb.coords:
+        blended = blended.assign_coords(bands=day_rgb.coords["bands"])
+    attrs = day_rgb.attrs.copy()
+    attrs.update(
+        {
+            "name": name,
+            "standard_name": standard_name,
+            "mode": "RGB",
+            "sensor": "ahi",
+            "night_fallback_mode": "hybrid",
+        }
+    )
+    attrs["_FillValue"] = np.uint8(0)
+    attrs.pop("calibration", None)
+    attrs.pop("wavelength", None)
+    attrs.pop("units", None)
+    blended.attrs = attrs
+    return blended
+
+
+def hybrid_dataset_name(composite_choice: str) -> str:
+    return f"hybrid_{safe_filename_component(composite_choice).lower()}_rgb"
+
+
+def create_hybrid_day_night_rgb(
+    day_rgb: xr.DataArray,
+    b03: xr.DataArray,
+    b13: xr.DataArray,
+    composite_choice: str,
+) -> xr.DataArray:
+    dataset_name = hybrid_dataset_name(composite_choice)
+    night_rgb = create_b13_night_rgb(b13, name=f"{dataset_name}_ir")
+    return blend_day_night_rgb(day_rgb, night_rgb, b03, name=dataset_name)
+
+
 def create_sandwich_composite(b03: xr.DataArray, b13: xr.DataArray) -> xr.DataArray:
     vis = scale_reflectance(b03, max_value=100.0, gamma=1.2)
     ir = scale_ir_temperature(b13, warm_k=305.0, cold_k=190.0, gamma=1.05)
@@ -1200,7 +1418,27 @@ def create_true_color_reproduction_fallback(
     )
 
 
-def build_custom_composite(scene: Scene, composite_choice: str, is_night: bool) -> tuple[str, xr.DataArray]:
+def apply_hybrid_night_if_needed(
+    dataset: xr.DataArray,
+    scene: Scene,
+    composite_choice: str,
+    use_night_fallback: bool,
+    night_fallback_mode: str,
+) -> xr.DataArray:
+    if not use_night_fallback or not uses_hybrid_night_fallback(composite_choice, night_fallback_mode):
+        return dataset
+    if "B03" not in scene or "B13" not in scene:
+        raise KeyError("Hybrid day/night fallback requires B03 and B13 to be loaded and resampled.")
+    return create_hybrid_day_night_rgb(dataset, scene["B03"], scene["B13"], composite_choice)
+
+
+def build_custom_composite(
+    scene: Scene,
+    composite_choice: str,
+    is_night: bool,
+    config: ProcessorConfig | None = None,
+) -> tuple[str, xr.DataArray]:
+    config = config or default_config()
     if composite_choice in SINGLE_BAND_LABELS:
         band = SINGLE_BAND_LABELS[composite_choice]
         dataset_name = f"custom_{band.lower()}_rgb"
@@ -1214,6 +1452,13 @@ def build_custom_composite(scene: Scene, composite_choice: str, is_night: bool) 
             scene["B04"],
             name=CUSTOM_DATASET_NAMES[composite_choice],
             standard_name=CUSTOM_DATASET_NAMES[composite_choice],
+        )
+        dataset = apply_hybrid_night_if_needed(
+            dataset,
+            scene,
+            composite_choice,
+            config.use_night_fallback,
+            config.night_fallback_mode,
         )
         return dataset.attrs["name"], dataset
 
@@ -1327,9 +1572,109 @@ def output_filename(
             if config
             else output_stem(info, dt, composite_choice)
         )
+        if config and is_flat_map(config):
+            stem = f"{stem}_Flat_Map"
         return OUTPUT_DIR / f"{stem}{suffix}"
     base_dir = frame_dir or OUTPUT_DIR
     return base_dir / f"frame_{frame_idx:04d}{suffix}"
+
+
+def normalized_map_view(value: str | None) -> str:
+    raw_value = MAP_VIEW if value is None else str(value)
+    normalized = raw_value.strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "disk": "native",
+        "native_disk": "native",
+        "geostationary": "native",
+        "latlon": "flat",
+        "lat_lon": "flat",
+        "equirectangular": "flat",
+        "flat_map": "flat",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def is_flat_map(config: ProcessorConfig) -> bool:
+    return normalized_map_view(config.map_view) == "flat"
+
+
+def finite_float(value: object, label: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be a finite number.")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a finite number.") from exc
+    if not np.isfinite(numeric):
+        raise ValueError(f"{label} must be finite.")
+    return numeric
+
+
+def flat_map_shape(
+    min_lat: float,
+    max_lat: float,
+    min_lon: float,
+    max_lon: float,
+    resolution_deg: float,
+) -> tuple[int, int]:
+    min_lat = finite_float(min_lat, "Flat map min latitude")
+    max_lat = finite_float(max_lat, "Flat map max latitude")
+    min_lon = finite_float(min_lon, "Flat map min longitude")
+    max_lon = finite_float(max_lon, "Flat map max longitude")
+    resolution_deg = finite_float(resolution_deg, "Flat map resolution")
+    if resolution_deg <= 0:
+        raise ValueError("Flat map resolution must be positive.")
+    width = int(round((max_lon - min_lon) / resolution_deg))
+    height = int(round((max_lat - min_lat) / resolution_deg))
+    return height, width
+
+
+def checked_flat_map_parameters(config: ProcessorConfig) -> tuple[float, float, float, float, float, int, int]:
+    min_lat = finite_float(config.flat_min_lat, "Flat map min latitude")
+    max_lat = finite_float(config.flat_max_lat, "Flat map max latitude")
+    min_lon = finite_float(config.flat_min_lon, "Flat map min longitude")
+    max_lon = finite_float(config.flat_max_lon, "Flat map max longitude")
+    resolution_deg = finite_float(config.flat_resolution_deg, "Flat map resolution")
+    if resolution_deg <= 0:
+        raise ValueError("Flat map resolution must be positive.")
+    if min_lat >= max_lat:
+        raise ValueError("Flat map min latitude must be less than max latitude.")
+    if min_lon >= max_lon:
+        raise ValueError("Flat map min longitude must be less than max longitude.")
+    if not (-90.0 <= min_lat <= 90.0 and -90.0 <= max_lat <= 90.0):
+        raise ValueError("Flat map latitude bounds must be between -90 and 90.")
+    if not (-360.0 <= min_lon <= 360.0 and -360.0 <= max_lon <= 360.0):
+        raise ValueError("Flat map longitude bounds must be between -360 and 360.")
+    height, width = flat_map_shape(min_lat, max_lat, min_lon, max_lon, resolution_deg)
+    if width <= 0 or height <= 0:
+        raise ValueError("Flat map bounds/resolution produce an empty output.")
+    if width * height > MAX_FLAT_MAP_PIXELS:
+        raise ValueError(
+            f"Flat map would be {width:,}x{height:,} pixels. "
+            f"Increase resolution degrees or shrink bounds to stay under {MAX_FLAT_MAP_PIXELS:,} pixels."
+        )
+    return min_lat, max_lat, min_lon, max_lon, resolution_deg, height, width
+
+
+def validate_flat_map_settings(config: ProcessorConfig) -> None:
+    if normalized_map_view(config.map_view) not in {"native", "flat"}:
+        raise ValueError('Map view must be "native" or "flat".')
+    if not is_flat_map(config):
+        return
+    checked_flat_map_parameters(config)
+
+
+def flat_map_area(config: ProcessorConfig) -> AreaDefinition:
+    min_lat, max_lat, min_lon, max_lon, _resolution_deg, height, width = checked_flat_map_parameters(config)
+    return AreaDefinition(
+        "himawari_flat_map",
+        "Himawari Flat Equirectangular Map",
+        "latlon",
+        {"proj": "longlat", "datum": "WGS84", "no_defs": None},
+        width,
+        height,
+        (min_lon, min_lat, max_lon, max_lat),
+    )
 
 
 def enforce_safe_output_format(path: Path, area: AreaDefinition, config: ProcessorConfig) -> Path:
@@ -1347,10 +1692,30 @@ def enforce_safe_output_format(path: Path, area: AreaDefinition, config: Process
 
 def output_behavior_for_config(config: ProcessorConfig, info: UrlInfo, start: datetime) -> str:
     suffix = ".tif" if config.image_format.lower() in {"tif", "tiff", "geotiff"} else ".png"
-    if (
+    if is_flat_map(config):
+        area = flat_map_area(config)
+        preview_name = output_filename(
+            info,
+            start,
+            config.composite_choice,
+            config.mode,
+            0,
+            config.image_format,
+            config=config,
+        )
+        safe_name = enforce_safe_output_format(preview_name, area, config)
+        suffix = ".tif" if writer_for_output(safe_name) == "geotiff" else ".png"
+        pixel_count = int(area.width) * int(area.height)
+        note = f"flat target {area.width}x{area.height} px, {pixel_count:,} pixels"
+    elif (
         info.area == "FLDK"
         and suffix == ".png"
-        and target_pixel_size_m(config.composite_choice, config.use_night_fallback) <= 500
+        and target_pixel_size_m(
+            config.composite_choice,
+            config.use_night_fallback,
+            config.night_fallback_mode,
+        )
+        <= 500
     ):
         suffix = ".tif"
         note = "auto-switch likely for full-disk low-RAM writing"
@@ -1383,13 +1748,35 @@ def overlay_data_required_paths(
     )
 
 
+def overlay_required_base_paths(
+    project_dir: Path = PROJECT_DIR,
+    resolution: str = OVERLAY_RESOLUTION,
+    level: int = OVERLAY_LEVEL,
+) -> tuple[Path, ...]:
+    overlays_dir = project_dir / "overlays"
+    return (
+        overlays_dir / "GSHHS_shp" / resolution / f"GSHHS_{resolution}_L{level}",
+        overlays_dir / "WDBII_shp" / resolution / f"WDBII_border_{resolution}_L{level}",
+    )
+
+
 def overlay_data_layout_text(project_dir: Path = PROJECT_DIR) -> str:
     paths = overlay_data_required_paths(project_dir)
-    return "Expected overlay data files:\n" + "\n".join(f"- {path}" for path in paths)
+    sidecars = tuple(base.with_suffix(".shx") for base in overlay_required_base_paths(project_dir))
+    return "Expected overlay data files:\n" + "\n".join(f"- {path}" for path in (*paths, *sidecars))
 
 
 def missing_overlay_data_paths(project_dir: Path = PROJECT_DIR) -> tuple[Path, ...]:
-    return tuple(path for path in overlay_data_required_paths(project_dir) if not path.exists())
+    return tuple(path for path in overlay_data_required_paths(project_dir) if not path.exists() or path.stat().st_size <= 0)
+
+
+def missing_overlay_sidecar_paths(project_dir: Path = PROJECT_DIR) -> tuple[Path, ...]:
+    missing = []
+    for base in overlay_required_base_paths(project_dir):
+        sidecar = base.with_suffix(".shx")
+        if not sidecar.exists() or sidecar.stat().st_size <= 0:
+            missing.append(sidecar)
+    return tuple(missing)
 
 
 def overlay_status(
@@ -1409,6 +1796,10 @@ def overlay_status(
     if missing_paths:
         missing_data.append("Missing required pycoast overlay data file(s):")
         missing_data.extend(str(path) for path in missing_paths)
+    missing_sidecars = missing_overlay_sidecar_paths(project_dir)
+    if missing_sidecars:
+        missing_data.append("Missing required shapefile sidecar file(s):")
+        missing_data.extend(str(path) for path in missing_sidecars)
     return OverlayStatus(
         ok=not missing_packages and not missing_data,
         details=tuple(details),
@@ -2008,6 +2399,13 @@ def resample_scene_low_ram(
     config: ProcessorConfig,
     datasets: Iterable[str] | None = None,
 ) -> Scene:
+    if is_flat_map(config):
+        return scene.resample(
+            target_area,
+            datasets=datasets,
+            resampler="nearest",
+            radius_of_influence=10000,
+        )
     resampler = config.resampler.lower()
     if resampler == "native":
         return scene.resample(target_area, datasets=datasets, resampler="native")
@@ -2032,6 +2430,16 @@ def satpy_resample_datasets_for_composite(active: str, satpy_name: str) -> list[
     if active == "True Color Reproduction Image":
         return None
     return [satpy_name]
+
+
+def satpy_resample_datasets(
+    active: str,
+    satpy_name: str,
+    config: ProcessorConfig,
+) -> list[str] | None:
+    if config.use_night_fallback and uses_hybrid_night_fallback(active, config.night_fallback_mode):
+        return [satpy_name, "B03", "B13"]
+    return satpy_resample_datasets_for_composite(active, satpy_name)
 
 
 def missing_optional_dependency(exc: BaseException, module_name: str) -> bool:
@@ -2131,6 +2539,41 @@ def save_dataset_with_optional_overlay(
     return output_path
 
 
+def save_satpy_dataset_output(
+    resampled: Scene,
+    active: str,
+    satpy_name: str,
+    output_path: Path,
+    config: ProcessorConfig,
+    overlay_options: dict | None,
+) -> Path:
+    dataset_name = satpy_name
+    enhance = True
+    fill_value: int | float | None = None
+    if config.use_night_fallback and uses_hybrid_night_fallback(active, config.night_fallback_mode):
+        dataset = apply_hybrid_night_if_needed(
+            resampled[satpy_name],
+            resampled,
+            active,
+            config.use_night_fallback,
+            config.night_fallback_mode,
+        )
+        dataset_name = dataset.attrs["name"]
+        resampled[dataset_name] = dataset
+        enhance = False
+        fill_value = 0
+        LOG.info("Hybrid day/night fallback enabled for %s; filling dark side with B13 infrared.", active)
+    return save_dataset_with_optional_overlay(
+        resampled,
+        dataset_name,
+        output_path,
+        writer_for_output(output_path),
+        enhance=enhance,
+        fill_value=fill_value,
+        overlay=overlay_options,
+    )
+
+
 def save_custom_composite_output(
     scene: Scene,
     active: str,
@@ -2142,7 +2585,11 @@ def save_custom_composite_output(
     progress: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
 ) -> Path:
-    custom_bands = COMPOSITE_BANDS[active]
+    custom_bands = required_bands(
+        active,
+        use_night_fallback=config.use_night_fallback,
+        night_fallback_mode=config.night_fallback_mode,
+    )
     emit_progress(progress, f"Loading {active}", None, None)
     load_bands(scene, custom_bands)
     log_memory("after load", config)
@@ -2165,7 +2612,7 @@ def save_custom_composite_output(
     log_memory("after resample", config)
     check_cancel(cancel_event)
     emit_progress(progress, f"Building {active}", None, None)
-    dataset_name, dataset = build_custom_composite(resampled, active, is_night)
+    dataset_name, dataset = build_custom_composite(resampled, active, is_night, config)
     resampled[dataset_name] = dataset
     check_cancel(cancel_event)
     emit_progress(progress, f"Saving {output_path.name}", None, None)
@@ -2249,7 +2696,11 @@ def process_frame(
     config = config or default_config()
     check_cancel(cancel_event)
     requested = config.composite_choice
-    bands = required_bands(requested, use_night_fallback=config.use_night_fallback)
+    bands = required_bands(
+        requested,
+        use_night_fallback=config.use_night_fallback,
+        night_fallback_mode=config.night_fallback_mode,
+    )
     tasks = make_download_tasks(info, dt, bands, TEMP_DIR)
     frame_dir = tasks[0].destination.parent if tasks else TEMP_DIR
     local_files: list[Path] = []
@@ -2282,14 +2733,26 @@ def process_frame(
             emit_progress(progress, "Checking day/night fallback", None, None)
             night_scene = Scene(filenames=[str(path) for path in local_files], reader="ahi_hsd")
             try:
-                is_night = is_visible_dark(night_scene, master_area)
+                night_check_band = night_check_band_for_bands(bands)
+                if night_check_band:
+                    is_night = is_visible_dark(night_scene, master_area, night_check_band)
+                else:
+                    LOG.warning(
+                        "Night fallback requested but no reflectance band is available; using night fallback."
+                    )
+                    is_night = True
             finally:
                 night_scene = None
                 gc.collect()
             log_memory("night check", config)
             check_cancel(cancel_event)
 
-        active = select_active_composite(requested, is_night, config.use_night_fallback)
+        active = select_active_composite(
+            requested,
+            is_night,
+            config.use_night_fallback,
+            config.night_fallback_mode,
+        )
         if active != requested:
             LOG.info("Night fallback: %s -> %s", requested, active)
 
@@ -2353,20 +2816,27 @@ def process_frame(
                 scene.load([satpy_name])
             log_memory("after load", config)
             check_cancel(cancel_event)
+            hybrid_inputs = (
+                config.use_night_fallback
+                and uses_hybrid_night_fallback(active, config.night_fallback_mode)
+            )
+            if hybrid_inputs:
+                scene.load(["B03"], calibration="reflectance")
+                scene.load(["B13"], calibration="brightness_temperature")
             emit_progress(progress, "Resampling", None, None)
             try:
-                resample_datasets = satpy_resample_datasets_for_composite(active, satpy_name)
+                resample_datasets = satpy_resample_datasets(active, satpy_name, config)
                 resampled = resample_scene_low_ram(scene, master_area, config, datasets=resample_datasets)
                 log_memory("after resample", config)
                 check_cancel(cancel_event)
                 emit_progress(progress, f"Saving {output_path.name}", None, None)
-                output_path = save_dataset_with_optional_overlay(
+                output_path = save_satpy_dataset_output(
                     resampled,
+                    active,
                     satpy_name,
                     output_path,
-                    writer_for_output(output_path),
-                    enhance=True,
-                    overlay=overlay_options,
+                    config,
+                    overlay_options,
                 )
             except Exception as exc:
                 if use_custom_satpy_missing_dataset_fallback(exc, active, satpy_name):
@@ -2492,14 +2962,38 @@ def validate_configuration(config: ProcessorConfig | None = None) -> None:
         raise ValueError('TIMELAPSE_FORMAT must be "gif" or "mp4".')
     if config.resampler.lower() not in {"native", "nearest"}:
         raise ValueError('RESAMPLER must be "native" or "nearest" for low-RAM processing.')
+    if normalized_night_fallback_mode(config.night_fallback_mode) not in {"hybrid", "whole_frame_ir"}:
+        raise ValueError('Night fallback mode must be "hybrid" or "whole_frame_ir".')
+    validate_flat_map_settings(config)
     if config.add_border_lines:
         parse_rgb_color(config.border_line_color)
         if config.border_line_width <= 0:
             raise ValueError("Border line width must be positive.")
-        require_module("pycoast", "coastline and border overlays")
+        validate_overlay_ready_for_run(config)
+
+
+def validate_overlay_ready_for_run(config: ProcessorConfig, project_dir: Path = PROJECT_DIR) -> None:
+    if not config.add_border_lines:
+        return
+    parse_rgb_color(config.border_line_color)
+    if config.border_line_width <= 0:
+        raise ValueError("Border line width must be positive.")
+    status = overlay_status(project_dir)
+    if status.ok:
+        return
+    details = []
+    if status.missing_packages:
+        details.append("Missing package(s): " + ", ".join(status.missing_packages))
+    details.extend(status.missing_data)
+    raise RuntimeError(
+        "Border lines are enabled, but overlay setup is incomplete. "
+        + " ".join(details)
+        + " Run Quick Fix to install overlay data, or disable border lines."
+    )
 
 
 def validate_runtime_dependencies(config: ProcessorConfig, info: UrlInfo, start: datetime, area: AreaDefinition) -> None:
+    validate_overlay_ready_for_run(config)
     preview_name = output_filename(
         info,
         start,
@@ -2523,11 +3017,19 @@ def build_run_summary(config: ProcessorConfig) -> RunSummary:
     info = parse_url(config.user_url)
     start = datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
     steps = frame_datetimes(start, config.mode, config.hours_back, config.interval_minutes)
-    bands = required_bands(config.composite_choice, use_night_fallback=config.use_night_fallback)
+    bands = required_bands(
+        config.composite_choice,
+        use_night_fallback=config.use_night_fallback,
+        night_fallback_mode=config.night_fallback_mode,
+    )
     total_segments = len(steps) * len(bands) * info.total_segments
     warnings: list[str] = []
     if config.mode == "Timelapse" and config.composite_choice in QUALITY_CRITICAL_COMPOSITES:
         warnings.append("True color timelapses can be slow and memory-sensitive; IR products are safer.")
+    if config.use_night_fallback and uses_hybrid_night_fallback(config.composite_choice, config.night_fallback_mode):
+        warnings.append("Hybrid night fallback fills the dark side with B13 infrared while keeping sunlit true color.")
+    if is_flat_map(config):
+        warnings.append("Flat map output uses nearest-neighbor reprojection and a bounded regional extent.")
     if config.download_workers > 4:
         warnings.append("Download workers will be capped to 4.")
     if config.dask_num_workers > 2:
@@ -2562,7 +3064,7 @@ def preflight_run(config: ProcessorConfig, output_dir: Path = OUTPUT_DIR, temp_d
             errors.append(error)
 
     if config.add_border_lines:
-        status = overlay_status()
+        status = overlay_status(PROJECT_DIR)
         if not status.ok:
             for error in status.missing_data:
                 if error not in errors:
@@ -2589,11 +3091,14 @@ def preset_config(name: str, base: ProcessorConfig | None = None) -> ProcessorCo
             image_format="png",
             auto_download=True,
             use_night_fallback=True,
+            night_fallback_mode="hybrid",
             download_workers=4,
             dask_num_workers=1,
             dask_chunk_size="64MiB",
             ram_limit_gb=10.0,
             resampler="native",
+            map_view="native",
+            add_border_lines=False,
         )
     elif name == "Fast IR Check":
         values.update(
@@ -2602,11 +3107,14 @@ def preset_config(name: str, base: ProcessorConfig | None = None) -> ProcessorCo
             image_format="png",
             auto_download=True,
             use_night_fallback=False,
+            night_fallback_mode="whole_frame_ir",
             download_workers=2,
             dask_num_workers=1,
             dask_chunk_size="64MiB",
             ram_limit_gb=6.0,
             resampler="native",
+            map_view="native",
+            add_border_lines=False,
         )
     elif name == "Low-RAM Timelapse":
         values.update(
@@ -2620,11 +3128,14 @@ def preset_config(name: str, base: ProcessorConfig | None = None) -> ProcessorCo
             delete_timelapse_frames=False,
             auto_download=True,
             use_night_fallback=False,
+            night_fallback_mode="whole_frame_ir",
             download_workers=2,
             dask_num_workers=1,
             dask_chunk_size="32MiB",
             ram_limit_gb=8.0,
             resampler="native",
+            map_view="native",
+            add_border_lines=False,
         )
     else:
         raise KeyError(f"Unknown preset: {name}")
@@ -2669,6 +3180,8 @@ def load_gui_settings(settings_path: Path = GUI_SETTINGS_FILE) -> tuple[Processo
         return None
     output_dir = Path(str(data.get("output_dir") or OUTPUT_DIR)).expanduser().resolve()
     temp_dir = Path(str(data.get("temp_dir") or TEMP_DIR)).expanduser().resolve()
+    output_dir = migrate_default_cloud_sync_path(output_dir, "outputs", OUTPUT_DIR)
+    temp_dir = migrate_default_cloud_sync_path(temp_dir, "temp", TEMP_DIR)
     return config, output_dir, temp_dir
 
 
@@ -3073,19 +3586,41 @@ def run(
         )
         LOG.info("Timelapse run id: %s", run_id)
         LOG.info("Timelapse manifest: %s", manifest_path)
-    area_band = area_reference_band(config.composite_choice)
     check_cancel(cancel_event)
     log_memory("startup", config)
-    master_area = common_area_from_frames(
-        info,
-        steps,
-        target_pixel_size_m(config.composite_choice, config.use_night_fallback),
-        area_band,
-        compatibility_bands=area_compatibility_bands(config.composite_choice),
-        config=config,
-        progress=progress,
-        cancel_event=cancel_event,
-    )
+    if is_flat_map(config):
+        min_lat, max_lat, min_lon, max_lon, resolution_deg, _height, _width = checked_flat_map_parameters(config)
+        master_area = flat_map_area(config)
+        LOG.info(
+            "Flat map area locked: %sx%s px, lat %.3f..%.3f lon %.3f..%.3f at %.4g deg",
+            master_area.width,
+            master_area.height,
+            min_lat,
+            max_lat,
+            min_lon,
+            max_lon,
+            resolution_deg,
+        )
+    else:
+        area_band = area_reference_band(config.composite_choice)
+        master_area = common_area_from_frames(
+            info,
+            steps,
+            target_pixel_size_m(
+                config.composite_choice,
+                config.use_night_fallback,
+                config.night_fallback_mode,
+            ),
+            area_band,
+            compatibility_bands=area_compatibility_bands(
+                config.composite_choice,
+                config.use_night_fallback,
+                config.night_fallback_mode,
+            ),
+            config=config,
+            progress=progress,
+            cancel_event=cancel_event,
+        )
     check_cancel(cancel_event)
     validate_runtime_dependencies(config, info, start, master_area)
 
@@ -3195,6 +3730,17 @@ def cloud_sync_marker(path: Path) -> str | None:
     return None
 
 
+def migrate_default_cloud_sync_path(path: Path, project_child_name: str, local_default: Path) -> Path:
+    try:
+        resolved = path.expanduser().resolve(strict=False)
+        old_default = (PROJECT_DIR / project_child_name).resolve(strict=False)
+    except Exception:
+        return path
+    if resolved == old_default and cloud_sync_marker(resolved):
+        return local_default
+    return path
+
+
 def setup_configuration_errors(config: ProcessorConfig) -> list[str]:
     errors: list[str] = []
     if not config.user_url.strip():
@@ -3225,6 +3771,12 @@ def setup_configuration_errors(config: ProcessorConfig) -> list[str]:
         errors.append('Timelapse format must be "gif" or "mp4".')
     if config.resampler.lower() not in {"native", "nearest"}:
         errors.append('Resampler must be "native" or "nearest".')
+    if normalized_night_fallback_mode(config.night_fallback_mode) not in {"hybrid", "whole_frame_ir"}:
+        errors.append('Night fallback mode must be "hybrid" or "whole_frame_ir".')
+    try:
+        validate_flat_map_settings(config)
+    except ValueError as exc:
+        errors.append(str(exc))
     if config.add_border_lines:
         try:
             parse_rgb_color(config.border_line_color)
@@ -3255,7 +3807,11 @@ def build_setup_status(
             errors.append(str(exc))
 
     if config.composite_choice in COMPOSITE_BANDS:
-        bands = required_bands(config.composite_choice, use_night_fallback=config.use_night_fallback)
+        bands = required_bands(
+            config.composite_choice,
+            use_night_fallback=config.use_night_fallback,
+            night_fallback_mode=config.night_fallback_mode,
+        )
         band_list = ", ".join(bands)
         details.append(f"Product: {config.composite_choice} ({len(bands)} band(s): {band_list})")
         if info is not None and start is not None:
@@ -3268,29 +3824,46 @@ def build_setup_status(
                 errors.append(str(exc))
             if (
                 info.area == "FLDK"
+                and not is_flat_map(config)
                 and config.image_format.lower() == "png"
-                and target_pixel_size_m(config.composite_choice) <= 500
+                and target_pixel_size_m(
+                    config.composite_choice,
+                    config.use_night_fallback,
+                    config.night_fallback_mode,
+                )
+                <= 500
             ):
                 warnings.append(
                     "Full-disk 500 m PNG jobs may auto-switch to GeoTIFF for low-RAM writing."
                 )
 
     if config.add_border_lines:
-        overlay_notes = ["pycoast", "aggdraw", "GSHHS/WDBII shapefiles under overlays/"]
-        missing_packages = [module for module in ("pycoast", "aggdraw") if not has_module(module)]
-        if missing_packages:
-            overlay_notes.append("missing package(s): " + ", ".join(missing_packages))
-        missing_paths = missing_overlay_data_paths(PROJECT_DIR)
-        if missing_paths:
-            overlay_notes.append("missing required data file(s): " + ", ".join(str(path) for path in missing_paths))
-        warnings.append("Border lines require " + "; ".join(overlay_notes) + ".")
-        status = overlay_status()
+        status = overlay_status(PROJECT_DIR)
         if not status.ok:
+            warnings.append("Border lines require pycoast, aggdraw, and GSHHS/WDBII shapefiles under overlays/.")
             errors.extend(status.missing_data)
             errors.extend(f"Missing package needed for border overlays: {package}" for package in status.missing_packages)
+        else:
+            details.append("Border overlays: ready")
+
+    if is_flat_map(config):
+        try:
+            min_lat, max_lat, min_lon, max_lon, _resolution_deg, height, width = checked_flat_map_parameters(config)
+            details.append(
+                "Map view: flat map "
+                f"{min_lat:g}..{max_lat:g} lat, "
+                f"{min_lon:g}..{max_lon:g} lon, "
+                f"{width}x{height} px"
+            )
+            warnings.append(
+                "Flat map output uses nearest-neighbor reprojection and may be slower than native disk output."
+            )
+        except ValueError as exc:
+            if str(exc) not in errors:
+                errors.append(str(exc))
 
     cloud_matches = []
-    for label, path in (("project", PROJECT_DIR), ("output", output_dir), ("temp", temp_dir)):
+    for label, path in (("output", output_dir), ("temp", temp_dir)):
         marker = cloud_sync_marker(path)
         if marker:
             cloud_matches.append(f"{label}: {path} ({marker})")
@@ -3347,6 +3920,13 @@ class HimawariProcessorApp:
         self.image_format_var = tk.StringVar(value=initial_config.image_format)
         self.output_template_var = tk.StringVar(value=initial_config.output_template)
         self.resampler_var = tk.StringVar(value=initial_config.resampler)
+        self.night_fallback_mode_var = tk.StringVar(value=initial_config.night_fallback_mode)
+        self.map_view_var = tk.StringVar(value=initial_config.map_view)
+        self.flat_min_lat_var = tk.StringVar(value=str(initial_config.flat_min_lat))
+        self.flat_max_lat_var = tk.StringVar(value=str(initial_config.flat_max_lat))
+        self.flat_min_lon_var = tk.StringVar(value=str(initial_config.flat_min_lon))
+        self.flat_max_lon_var = tk.StringVar(value=str(initial_config.flat_max_lon))
+        self.flat_resolution_var = tk.StringVar(value=str(initial_config.flat_resolution_deg))
         self.timelapse_format_var = tk.StringVar(value=initial_config.timelapse_format)
         self.auto_download_var = tk.BooleanVar(value=initial_config.auto_download)
         self.night_fallback_var = tk.BooleanVar(value=initial_config.use_night_fallback)
@@ -3589,11 +4169,18 @@ class HimawariProcessorApp:
             text="Use night fallback for day-only products",
             variable=self.night_fallback_var,
         ).grid(row=0, column=1, sticky="w", pady=(2, 4))
+        ttk.Label(options_frame, text="Night Fallback Mode").grid(row=1, column=1, sticky="w", pady=(4, 4))
+        ttk.Combobox(
+            options_frame,
+            textvariable=self.night_fallback_mode_var,
+            values=("hybrid", "whole_frame_ir"),
+            state="readonly",
+        ).grid(row=1, column=1, sticky="e", padx=(150, 8), pady=(4, 4))
         ttk.Checkbutton(
             options_frame,
             text="Allow lower-quality fallback if true color dependencies are missing",
             variable=self.quality_fallback_var,
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 4))
+        ).grid(row=1, column=0, sticky="w", pady=(4, 4))
         ttk.Checkbutton(
             options_frame,
             text="Draw coastline and country border lines",
@@ -3694,37 +4281,69 @@ class HimawariProcessorApp:
             state="readonly",
         ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 10))
 
-        ttk.Label(paths_frame, text="Output Filename Template").grid(row=2, column=0, columnspan=2, sticky="w")
-        ttk.Entry(paths_frame, textvariable=self.output_template_var).grid(
-            row=3, column=0, columnspan=2, sticky="ew", pady=(2, 8)
+        ttk.Label(paths_frame, text="Map View").grid(row=2, column=0, sticky="w")
+        self.map_view_box = ttk.Combobox(
+            paths_frame,
+            textvariable=self.map_view_var,
+            values=("native", "flat"),
+            state="readonly",
+        )
+        self.map_view_box.grid(row=3, column=0, sticky="ew", padx=(0, 8), pady=(2, 8))
+        ttk.Label(paths_frame, text="Flat Resolution Deg").grid(row=2, column=1, sticky="w")
+        ttk.Entry(paths_frame, textvariable=self.flat_resolution_var).grid(
+            row=3, column=1, sticky="ew", pady=(2, 8)
         )
 
-        ttk.Label(paths_frame, text="Output Folder").grid(row=4, column=0, columnspan=2, sticky="w")
-        ttk.Entry(paths_frame, textvariable=self.output_dir_var, state="readonly").grid(
-            row=5, column=0, columnspan=2, sticky="ew", pady=(2, 8)
+        ttk.Label(paths_frame, text="Flat Min/Max Lat").grid(row=4, column=0, sticky="w")
+        flat_lat_row = ttk.Frame(paths_frame)
+        flat_lat_row.grid(row=5, column=0, sticky="ew", padx=(0, 8), pady=(2, 8))
+        flat_lat_row.columnconfigure(0, weight=1)
+        flat_lat_row.columnconfigure(1, weight=1)
+        ttk.Entry(flat_lat_row, textvariable=self.flat_min_lat_var, width=8).grid(row=0, column=0, sticky="ew")
+        ttk.Entry(flat_lat_row, textvariable=self.flat_max_lat_var, width=8).grid(
+            row=0, column=1, sticky="ew", padx=(8, 0)
         )
-        ttk.Label(paths_frame, text="Temp Folder").grid(row=6, column=0, columnspan=2, sticky="w")
-        ttk.Entry(paths_frame, textvariable=self.temp_dir_var, state="readonly").grid(
+        ttk.Label(paths_frame, text="Flat Min/Max Lon").grid(row=4, column=1, sticky="w")
+        flat_lon_row = ttk.Frame(paths_frame)
+        flat_lon_row.grid(row=5, column=1, sticky="ew", pady=(2, 8))
+        flat_lon_row.columnconfigure(0, weight=1)
+        flat_lon_row.columnconfigure(1, weight=1)
+        ttk.Entry(flat_lon_row, textvariable=self.flat_min_lon_var, width=8).grid(row=0, column=0, sticky="ew")
+        ttk.Entry(flat_lon_row, textvariable=self.flat_max_lon_var, width=8).grid(
+            row=0, column=1, sticky="ew", padx=(8, 0)
+        )
+
+        ttk.Label(paths_frame, text="Output Filename Template").grid(row=6, column=0, columnspan=2, sticky="w")
+        ttk.Entry(paths_frame, textvariable=self.output_template_var).grid(
             row=7, column=0, columnspan=2, sticky="ew", pady=(2, 8)
+        )
+
+        ttk.Label(paths_frame, text="Output Folder").grid(row=8, column=0, columnspan=2, sticky="w")
+        ttk.Entry(paths_frame, textvariable=self.output_dir_var, state="readonly").grid(
+            row=9, column=0, columnspan=2, sticky="ew", pady=(2, 8)
+        )
+        ttk.Label(paths_frame, text="Temp Folder").grid(row=10, column=0, columnspan=2, sticky="w")
+        ttk.Entry(paths_frame, textvariable=self.temp_dir_var, state="readonly").grid(
+            row=11, column=0, columnspan=2, sticky="ew", pady=(2, 8)
         )
         self.choose_output_button = ttk.Button(
             paths_frame,
             text="Choose Output Folder",
             command=self._choose_output_dir,
         )
-        self.choose_output_button.grid(row=8, column=0, sticky="ew", padx=(0, 8), pady=(2, 8))
+        self.choose_output_button.grid(row=12, column=0, sticky="ew", padx=(0, 8), pady=(2, 8))
         self.choose_temp_button = ttk.Button(
             paths_frame,
             text="Choose Temp Folder",
             command=self._choose_temp_dir,
         )
-        self.choose_temp_button.grid(row=8, column=1, sticky="ew", pady=(2, 8))
+        self.choose_temp_button.grid(row=12, column=1, sticky="ew", pady=(2, 8))
         self.open_temp_button = ttk.Button(
             paths_frame,
             text="Open Temp Folder",
             command=self._open_temp_folder,
         )
-        self.open_temp_button.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+        self.open_temp_button.grid(row=13, column=0, columnspan=2, sticky="ew", pady=(2, 0))
 
         preset_frame = ttk.LabelFrame(advanced, text="Custom Presets", style="Section.TLabelframe")
         preset_frame.grid(row=1, column=0, columnspan=2, sticky="ew")
@@ -3777,6 +4396,7 @@ class HimawariProcessorApp:
         buttons = ttk.Frame(self.root, padding=(16, 0, 16, 16))
         buttons.grid(row=2, column=0, sticky="ew")
         buttons.columnconfigure(0, weight=1)
+        buttons.columnconfigure(7, weight=1)
         self.start_button = ttk.Button(buttons, text="Start Processing", command=self._start, style="Primary.TButton")
         self.start_button.grid(row=0, column=1, padx=(0, 8))
         self.stop_button = ttk.Button(buttons, text="Stop", command=self._stop_current_task)
@@ -3787,19 +4407,21 @@ class HimawariProcessorApp:
         )
         self.check_env_button = ttk.Button(buttons, text="Check Env", command=self._open_environment_check)
         self.check_env_button.grid(
-            row=0, column=4, padx=(0, 8)
+            row=1, column=1, padx=(0, 8), pady=(8, 0)
         )
         self.quick_fix_button = ttk.Button(buttons, text="Quick Fix", command=self._open_environment_fix)
         self.quick_fix_button.grid(
-            row=0, column=5, padx=(0, 8)
+            row=1, column=2, padx=(0, 8), pady=(8, 0)
         )
+        self.auto_fix_button = ttk.Button(buttons, text="Auto Fix", command=self._open_environment_auto_fix)
+        self.auto_fix_button.grid(row=1, column=3, padx=(0, 8), pady=(8, 0))
         self.open_last_button = ttk.Button(buttons, text="Open Last", command=self._open_last_output)
-        self.open_last_button.grid(row=0, column=6, padx=(0, 8))
+        self.open_last_button.grid(row=0, column=4, padx=(0, 8))
         self.copy_paths_button = ttk.Button(buttons, text="Copy Paths", command=self._copy_output_paths)
-        self.copy_paths_button.grid(row=0, column=7, padx=(0, 8))
+        self.copy_paths_button.grid(row=0, column=5, padx=(0, 8))
         self.copy_error_button = ttk.Button(buttons, text="Copy Error", command=self._copy_error_report)
-        self.copy_error_button.grid(row=0, column=8, padx=(0, 8))
-        ttk.Button(buttons, text="Close", command=self._terminate_app).grid(row=0, column=9)
+        self.copy_error_button.grid(row=0, column=6, padx=(0, 8))
+        ttk.Button(buttons, text="Close", command=self._terminate_app).grid(row=0, column=8)
         self._refresh_mode_state()
         self._configure_main_split()
 
@@ -4118,6 +4740,13 @@ class HimawariProcessorApp:
             self.ram_limit_var,
             self.image_format_var,
             self.resampler_var,
+            self.night_fallback_mode_var,
+            self.map_view_var,
+            self.flat_min_lat_var,
+            self.flat_max_lat_var,
+            self.flat_min_lon_var,
+            self.flat_max_lon_var,
+            self.flat_resolution_var,
             self.timelapse_format_var,
             self.auto_download_var,
             self.night_fallback_var,
@@ -4171,6 +4800,13 @@ class HimawariProcessorApp:
         self.image_format_var.set(config.image_format)
         self.output_template_var.set(config.output_template)
         self.resampler_var.set(config.resampler)
+        self.night_fallback_mode_var.set(config.night_fallback_mode)
+        self.map_view_var.set(config.map_view)
+        self.flat_min_lat_var.set(str(config.flat_min_lat))
+        self.flat_max_lat_var.set(str(config.flat_max_lat))
+        self.flat_min_lon_var.set(str(config.flat_min_lon))
+        self.flat_max_lon_var.set(str(config.flat_max_lon))
+        self.flat_resolution_var.set(str(config.flat_resolution_deg))
         self.timelapse_format_var.set(config.timelapse_format)
         self.auto_download_var.set(config.auto_download)
         self.night_fallback_var.set(config.use_night_fallback)
@@ -4209,6 +4845,7 @@ class HimawariProcessorApp:
             getattr(self, "open_output_button", None),
             getattr(self, "check_env_button", None),
             getattr(self, "quick_fix_button", None),
+            getattr(self, "auto_fix_button", None),
             getattr(self, "latest_url_button", None),
             getattr(self, "scan_browser_button", None),
             getattr(self, "overlay_check_button", None),
@@ -4325,10 +4962,13 @@ class HimawariProcessorApp:
     def _open_environment_fix(self) -> None:
         self._open_environment_command(["--fix"], "Environment quick fix")
 
+    def _open_environment_auto_fix(self) -> None:
+        self._open_environment_command(["--auto"], "Environment auto fix")
+
     def _check_overlays(self) -> None:
         overlays_dir = PROJECT_DIR / "overlays"
         overlays_dir.mkdir(parents=True, exist_ok=True)
-        status = overlay_status()
+        status = overlay_status(PROJECT_DIR)
         self._append_log(status.display_text())
         try:
             if os.name == "nt":
@@ -4364,6 +5004,9 @@ class HimawariProcessorApp:
         if hex_value:
             self.border_color_var.set(hex_value)
 
+    def _read_float_var(self, variable: tk.StringVar, label: str) -> float:
+        return finite_float(variable.get(), label)
+
     def _read_config(self) -> ProcessorConfig:
         return ProcessorConfig(
             user_url=self.url_var.get().strip(),
@@ -4374,6 +5017,7 @@ class HimawariProcessorApp:
             fps=int(self.fps_var.get()),
             auto_download=self.auto_download_var.get(),
             use_night_fallback=self.night_fallback_var.get(),
+            night_fallback_mode=self.night_fallback_mode_var.get(),
             download_workers=int(self.download_workers_var.get()),
             timelapse_format=self.timelapse_format_var.get(),
             delete_timelapse_frames=self.delete_frames_var.get(),
@@ -4383,8 +5027,14 @@ class HimawariProcessorApp:
             allow_quality_fallback=self.quality_fallback_var.get(),
             add_border_lines=self.border_lines_var.get(),
             border_line_color=self.border_color_var.get(),
-            border_line_width=float(self.border_width_var.get()),
-            ram_limit_gb=float(self.ram_limit_var.get()),
+            border_line_width=self._read_float_var(self.border_width_var, "Border line width"),
+            map_view=self.map_view_var.get(),
+            flat_min_lat=self._read_float_var(self.flat_min_lat_var, "Flat map min latitude"),
+            flat_max_lat=self._read_float_var(self.flat_max_lat_var, "Flat map max latitude"),
+            flat_min_lon=self._read_float_var(self.flat_min_lon_var, "Flat map min longitude"),
+            flat_max_lon=self._read_float_var(self.flat_max_lon_var, "Flat map max longitude"),
+            flat_resolution_deg=self._read_float_var(self.flat_resolution_var, "Flat map resolution"),
+            ram_limit_gb=self._read_float_var(self.ram_limit_var, "RAM limit"),
             dask_chunk_size=self.chunk_var.get(),
             dask_num_workers=int(self.dask_workers_var.get()),
         )

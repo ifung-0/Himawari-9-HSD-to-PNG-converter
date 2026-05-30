@@ -6,6 +6,7 @@ requests>=2.32
 imageio>=2.37
 pillow>=10.2
 numpy>=2.0
+scipy>=1.15
 psutil>=5.9
 pyspectral>=0.13
 pycoast>=1.7

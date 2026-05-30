@@ -8,6 +8,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,8 +18,20 @@ from pathlib import Path
 PROJECT_DIR = Path(__file__).resolve().parent
 REQUIREMENTS_FILE = PROJECT_DIR / "requirements.txt"
 VENV_DIR = PROJECT_DIR / ".venv"
+LOCAL_APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+APP_DATA_DIR = LOCAL_APP_DATA_DIR / "Himawari9LowRamProcessor"
 APP_IMPORT_NAME = "himawari_lowram_processor"
 MIN_SATPY_VERSION = (0, 60)
+OVERLAY_RESOLUTION = "l"
+OVERLAY_LEVEL = 1
+GSHHG_SHAPEFILE_ARCHIVE = "gshhg-shp-2.3.7.zip"
+GSHHG_ARCHIVE_URLS = (
+    "https://www.ngdc.noaa.gov/mgg/shorelines/data/gshhs/latest/gshhg-shp-2.3.7.zip",
+    "https://ftp.soest.hawaii.edu/gshhg/gshhg-shp-2.3.7.zip",
+    "http://www.soest.hawaii.edu/pwessel/gshhg/gshhg-shp-2.3.7.zip",
+)
+OVERLAY_CACHE_DIR = APP_DATA_DIR / "cache" / "overlays"
+SHAPEFILE_SIDECAR_SUFFIXES = (".shp", ".dbf", ".shx", ".prj", ".cpg")
 SUPPORTED_PYTHON_MAJOR = 3
 SUPPORTED_PYTHON_MINOR_MIN = 12
 SUPPORTED_PYTHON_MINOR_MAX = 13
@@ -24,7 +39,7 @@ TRUE_COLOR = "true_color"
 TRUE_COLOR_UI = "True Color RGB (Enhanced)"
 TRUE_COLOR_REPRODUCTION = "true_color_reproduction"
 TRUE_COLOR_REPRODUCTION_UI = "True Color Reproduction Image"
-GROUP_ORDER = ("Python", "Packages", "Satpy", "Project", "Paths")
+GROUP_ORDER = ("Python", "Packages", "Satpy", "Project", "Overlays", "Paths")
 SATPY_CONFIG_ENV_VARS = ("SATPY_CONFIG_PATH", "PPP_CONFIG_DIR")
 CLOUD_SYNC_PREFIXES = ("onedrive", "dropbox", "google drive", "icloud")
 CLOUD_SYNC_EXACT = ("box",)
@@ -51,6 +66,15 @@ class CheckResult:
     critical: bool = True
 
 
+@dataclass(frozen=True)
+class OverlayInstallResult:
+    ok: bool
+    installed: bool
+    detail: str
+    attempted_urls: tuple[str, ...] = ()
+    missing_paths: tuple[Path, ...] = ()
+
+
 PACKAGE_CHECKS = (
     PackageCheck("satpy", "satpy", "Satpy scene processing"),
     PackageCheck("dask", "dask", "lazy array processing"),
@@ -60,6 +84,7 @@ PACKAGE_CHECKS = (
     PackageCheck("imageio", "imageio", "GIF/MP4 assembly"),
     PackageCheck("PIL", "pillow", "PNG image writing"),
     PackageCheck("numpy", "numpy", "array metadata and dtype handling"),
+    PackageCheck("scipy", "scipy", "Dask array helpers and scientific routines"),
     PackageCheck("pyspectral", "pyspectral", "official true color correction"),
     PackageCheck("rasterio", "rasterio", "chunked GeoTIFF output"),
     PackageCheck("psutil", "psutil", "memory reporting", critical=False),
@@ -67,7 +92,6 @@ PACKAGE_CHECKS = (
     PackageCheck("aggdraw", "aggdraw", "pycoast overlay drawing", critical=False),
     PackageCheck("imageio_ffmpeg", "imageio-ffmpeg", "MP4 timelapse writing", critical=False),
 )
-
 
 def version_tuple(version: str) -> tuple[int, ...]:
     parts: list[int] = []
@@ -246,6 +270,15 @@ def create_venv(venv_dir: Path = VENV_DIR) -> Path | None:
 def check_package(package: PackageCheck, minimums: dict[str, str]) -> CheckResult:
     version = package_version(package.distribution_name)
     minimum = minimum_version_for(package, minimums)
+
+    if version is not None and minimum is not None and not version_meets_minimum(version, minimum):
+        return CheckResult(
+            package.import_name,
+            False,
+            f"{version} is older than required {minimum}; needed for {package.purpose}",
+            critical=package.critical,
+        )
+
     import_ok, import_detail = module_import_result(package.import_name)
 
     if not import_ok:
@@ -268,14 +301,6 @@ def check_package(package: PackageCheck, minimums: dict[str, str]) -> CheckResul
             critical=package.critical,
         )
 
-    if minimum is not None and not version_meets_minimum(version, minimum):
-        return CheckResult(
-            package.import_name,
-            False,
-            f"{version} is older than required {minimum}; needed for {package.purpose}",
-            critical=package.critical,
-        )
-
     shown_version = f"{version} >= {minimum}" if minimum else version
     return CheckResult(
         package.import_name,
@@ -288,6 +313,287 @@ def check_package(package: PackageCheck, minimums: dict[str, str]) -> CheckResul
 def check_packages() -> list[CheckResult]:
     minimums = minimum_versions_from_requirements()
     return [check_package(package, minimums) for package in PACKAGE_CHECKS]
+
+
+def overlay_data_required_paths(project_dir: Path = PROJECT_DIR) -> tuple[Path, ...]:
+    overlays_dir = project_dir / "overlays"
+    return (
+        overlays_dir / "GSHHS_shp" / OVERLAY_RESOLUTION / f"GSHHS_{OVERLAY_RESOLUTION}_L{OVERLAY_LEVEL}.shp",
+        overlays_dir / "GSHHS_shp" / OVERLAY_RESOLUTION / f"GSHHS_{OVERLAY_RESOLUTION}_L{OVERLAY_LEVEL}.dbf",
+        overlays_dir
+        / "WDBII_shp"
+        / OVERLAY_RESOLUTION
+        / f"WDBII_border_{OVERLAY_RESOLUTION}_L{OVERLAY_LEVEL}.shp",
+        overlays_dir
+        / "WDBII_shp"
+        / OVERLAY_RESOLUTION
+        / f"WDBII_border_{OVERLAY_RESOLUTION}_L{OVERLAY_LEVEL}.dbf",
+    )
+
+
+def overlay_required_base_paths(project_dir: Path = PROJECT_DIR) -> tuple[Path, ...]:
+    overlays_dir = project_dir / "overlays"
+    return (
+        overlays_dir / "GSHHS_shp" / OVERLAY_RESOLUTION / f"GSHHS_{OVERLAY_RESOLUTION}_L{OVERLAY_LEVEL}",
+        overlays_dir / "WDBII_shp" / OVERLAY_RESOLUTION / f"WDBII_border_{OVERLAY_RESOLUTION}_L{OVERLAY_LEVEL}",
+    )
+
+
+def overlay_archive_member_suffixes() -> tuple[str, ...]:
+    suffixes = []
+    for base in (
+        f"GSHHS_shp/{OVERLAY_RESOLUTION}/GSHHS_{OVERLAY_RESOLUTION}_L{OVERLAY_LEVEL}",
+        f"WDBII_shp/{OVERLAY_RESOLUTION}/WDBII_border_{OVERLAY_RESOLUTION}_L{OVERLAY_LEVEL}",
+    ):
+        suffixes.extend(f"{base}{suffix}" for suffix in SHAPEFILE_SIDECAR_SUFFIXES)
+    return tuple(suffixes)
+
+
+def overlay_data_layout_text(project_dir: Path = PROJECT_DIR) -> str:
+    sidecars = tuple(base.with_suffix(".shx") for base in overlay_required_base_paths(project_dir))
+    return "\n".join(str(path) for path in (*overlay_data_required_paths(project_dir), *sidecars))
+
+
+def missing_overlay_data_paths(project_dir: Path = PROJECT_DIR) -> tuple[Path, ...]:
+    return tuple(path for path in overlay_data_required_paths(project_dir) if not path.exists() or path.stat().st_size <= 0)
+
+
+def missing_overlay_sidecar_paths(project_dir: Path = PROJECT_DIR) -> tuple[Path, ...]:
+    missing = []
+    for base in overlay_required_base_paths(project_dir):
+        sidecar = base.with_suffix(".shx")
+        if not sidecar.exists() or sidecar.stat().st_size <= 0:
+            missing.append(sidecar)
+    return tuple(missing)
+
+
+def check_overlay_data(project_dir: Path = PROJECT_DIR) -> CheckResult:
+    overlays_dir = project_dir / "overlays"
+    missing = missing_overlay_data_paths(project_dir)
+    missing_sidecars = missing_overlay_sidecar_paths(project_dir)
+    if missing or missing_sidecars:
+        folder_note = "overlays/ folder is missing; " if not overlays_dir.exists() else ""
+        missing_text = "; ".join(str(path) for path in missing)
+        if missing_sidecars:
+            sidecar_text = "; ".join(str(path) for path in missing_sidecars)
+            missing_text = (missing_text + "; " if missing_text else "") + "missing/empty sidecar file(s): " + sidecar_text
+        return CheckResult(
+            "overlay data files",
+            False,
+            (
+                folder_note
+                + "border lines require pycoast-compatible GSHHS/WDBII files at: "
+                + missing_text
+                + "; Quick Fix can download and install the needed low-resolution overlay files"
+            ),
+            critical=False,
+        )
+    return CheckResult(
+        "overlay data files",
+        True,
+        f"required low-resolution GSHHS/WDBII files found under {overlays_dir}",
+        critical=False,
+    )
+
+
+def check_pycoast_overlay_runtime(project_dir: Path = PROJECT_DIR) -> CheckResult:
+    missing = (*missing_overlay_data_paths(project_dir), *missing_overlay_sidecar_paths(project_dir))
+    if missing:
+        return CheckResult(
+            "pycoast overlay runtime",
+            False,
+            "skipped until overlay data files are installed",
+            critical=False,
+        )
+    missing_packages = [
+        module
+        for module in ("pycoast", "aggdraw")
+        if importlib.util.find_spec(module) is None
+    ]
+    if missing_packages:
+        return CheckResult(
+            "pycoast overlay runtime",
+            False,
+            "missing overlay package(s): " + ", ".join(missing_packages),
+            critical=False,
+        )
+    try:
+        import aggdraw  # noqa: F401
+        import pycoast  # noqa: F401
+    except Exception as exc:
+        return CheckResult(
+            "pycoast overlay runtime",
+            False,
+            f"overlay imports failed: {exc}",
+            critical=False,
+        )
+    return CheckResult(
+        "pycoast overlay runtime",
+        True,
+        "pycoast and aggdraw import successfully with required overlay data present",
+        critical=False,
+    )
+
+
+def ensure_overlay_folder(project_dir: Path = PROJECT_DIR, open_folder: bool = False) -> Path:
+    overlays_dir = project_dir / "overlays"
+    overlays_dir.mkdir(parents=True, exist_ok=True)
+    print()
+    print(f"Overlay folder is ready: {overlays_dir}")
+    print("Border overlays also need pycoast-compatible GSHHS/WDBII data at:")
+    for path in (*overlay_data_required_paths(project_dir), *missing_overlay_sidecar_paths(project_dir)):
+        print(f"  {path}")
+    print("Quick Fix can download and install the needed low-resolution shapefiles automatically.")
+    if open_folder and os.name == "nt":
+        try:
+            os.startfile(str(overlays_dir))
+        except OSError as exc:
+            print(f"Could not open overlay folder: {exc}", file=sys.stderr)
+    return overlays_dir
+
+
+def open_overlay_folder(project_dir: Path = PROJECT_DIR) -> None:
+    overlays_dir = project_dir / "overlays"
+    if os.name == "nt":
+        try:
+            os.startfile(str(overlays_dir))
+        except OSError as exc:
+            print(f"Could not open overlay folder: {exc}", file=sys.stderr)
+
+
+def download_file(urls: tuple[str, ...], destination: Path, timeout: int = 60) -> tuple[bool, str]:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    errors = []
+    for url in urls:
+        print(f"Downloading overlay data: {url}")
+        tmp_path = destination.with_suffix(destination.suffix + ".part")
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as response:
+                total_text = response.headers.get("Content-Length")
+                total = int(total_text) if total_text and total_text.isdigit() else None
+                downloaded = 0
+                with tmp_path.open("wb") as handle:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        handle.write(chunk)
+                        downloaded += len(chunk)
+                        if total:
+                            print(f"  {downloaded / total:.0%}", end="\r")
+                if total:
+                    print("  100%")
+            tmp_path.replace(destination)
+            return True, url
+        except (OSError, urllib.error.URLError, TimeoutError) as exc:
+            errors.append(f"{url}: {exc}")
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return False, "; ".join(errors)
+
+
+def archive_members_by_suffix(zip_file: zipfile.ZipFile, suffixes: tuple[str, ...]) -> dict[str, str]:
+    normalized_suffixes = {suffix.replace("\\", "/").lower(): suffix for suffix in suffixes}
+    matches: dict[str, str] = {}
+    for member in zip_file.namelist():
+        normalized_member = member.replace("\\", "/").lower()
+        for normalized_suffix, original_suffix in normalized_suffixes.items():
+            if normalized_member.endswith(normalized_suffix):
+                matches[original_suffix] = member
+    return matches
+
+
+def extract_overlay_archive(archive_path: Path, project_dir: Path = PROJECT_DIR, force: bool = False) -> tuple[int, tuple[Path, ...]]:
+    extracted = 0
+    required_suffixes = overlay_archive_member_suffixes()
+    overlays_dir = project_dir / "overlays"
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            matches = archive_members_by_suffix(archive, required_suffixes)
+            missing_required = [
+                suffix
+                for suffix in required_suffixes
+                if suffix.endswith((".shp", ".dbf")) and suffix not in matches
+            ]
+            if missing_required:
+                missing_text = ", ".join(missing_required)
+                raise RuntimeError(f"archive is missing required overlay members: {missing_text}")
+
+            for suffix, member in matches.items():
+                destination = overlays_dir / Path(suffix)
+                if destination.exists() and not force:
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(member) as source, destination.open("wb") as target:
+                    target.write(source.read())
+                extracted += 1
+    except zipfile.BadZipFile as exc:
+        raise RuntimeError(f"overlay archive is not a valid ZIP file: {archive_path}") from exc
+
+    return extracted, (*missing_overlay_data_paths(project_dir), *missing_overlay_sidecar_paths(project_dir))
+
+
+def install_overlay_data(
+    project_dir: Path = PROJECT_DIR,
+    open_folder: bool = True,
+    force: bool = False,
+    archive_path: Path | None = None,
+    urls: tuple[str, ...] = GSHHG_ARCHIVE_URLS,
+) -> OverlayInstallResult:
+    overlays_dir = ensure_overlay_folder(project_dir, open_folder=False)
+    if not force and not missing_overlay_data_paths(project_dir) and not missing_overlay_sidecar_paths(project_dir):
+        detail = f"Overlay data already installed under {overlays_dir}"
+        print(detail)
+        if open_folder:
+            open_overlay_folder(project_dir)
+        return OverlayInstallResult(True, False, detail)
+
+    archive_path = archive_path or (OVERLAY_CACHE_DIR / GSHHG_SHAPEFILE_ARCHIVE)
+    attempted_urls: tuple[str, ...] = ()
+    if force or not archive_path.exists():
+        ok, detail = download_file(urls, archive_path)
+        attempted_urls = urls
+        if not ok:
+            missing = (*missing_overlay_data_paths(project_dir), *missing_overlay_sidecar_paths(project_dir))
+            message = (
+                "Could not download overlay data archive. Attempted URLs: "
+                + "; ".join(urls)
+                + f". Destination folder: {overlays_dir}. Missing files: "
+                + "; ".join(str(path) for path in missing)
+                + ". Manual fallback: download gshhg-shp-2.3.7.zip and extract the listed GSHHS/WDBII files under overlays/."
+                + f" Details: {detail}"
+            )
+            print(message, file=sys.stderr)
+            return OverlayInstallResult(False, False, message, attempted_urls, missing)
+    else:
+        print(f"Using cached overlay archive: {archive_path}")
+
+    try:
+        extracted, missing = extract_overlay_archive(archive_path, project_dir, force=force)
+    except RuntimeError as exc:
+        missing = (*missing_overlay_data_paths(project_dir), *missing_overlay_sidecar_paths(project_dir))
+        message = (
+            f"Could not install overlay data from {archive_path}: {exc}. "
+            f"Destination folder: {overlays_dir}. Missing files: "
+            + "; ".join(str(path) for path in missing)
+        )
+        print(message, file=sys.stderr)
+        return OverlayInstallResult(False, False, message, attempted_urls, missing)
+
+    if missing:
+        message = "Overlay archive was processed but required files are still missing: " + "; ".join(
+            str(path) for path in missing
+        )
+        print(message, file=sys.stderr)
+        return OverlayInstallResult(False, extracted > 0, message, attempted_urls, missing)
+
+    detail = f"Overlay data installed under {overlays_dir} ({extracted} file(s) extracted)."
+    print(detail)
+    if open_folder:
+        open_overlay_folder(project_dir)
+    return OverlayInstallResult(True, extracted > 0, detail, attempted_urls)
 
 
 def satpy_config_env_paths() -> list[tuple[str, Path]]:
@@ -443,9 +749,13 @@ def check_cloud_sync_locations(paths: list[Path] | None = None) -> CheckResult:
         try:
             import himawari_lowram_processor as app
 
-            paths = [PROJECT_DIR, Path(app.OUTPUT_DIR), Path(app.TEMP_DIR)]
+            paths = [
+                Path(app.OUTPUT_DIR),
+                Path(app.TEMP_DIR),
+                OVERLAY_CACHE_DIR,
+            ]
         except Exception:
-            paths = [PROJECT_DIR]
+            paths = [APP_DATA_DIR, OVERLAY_CACHE_DIR]
 
     matches = []
     for path in paths:
@@ -469,7 +779,7 @@ def check_cloud_sync_locations(paths: list[Path] | None = None) -> CheckResult:
     return CheckResult(
         "cloud sync location",
         True,
-        "project/output/temp paths are not under a known cloud-sync folder",
+        "output/temp/cache paths are not under a known cloud-sync folder",
         critical=False,
     )
 
@@ -485,6 +795,24 @@ def check_satpy_version() -> CheckResult:
         False,
         f"{version} is older than {'.'.join(map(str, MIN_SATPY_VERSION))}; upgrade Satpy.",
     )
+
+
+def check_pip_available(python_executable: str | Path | None = None) -> CheckResult:
+    python_executable = str(python_executable or sys.executable)
+    try:
+        completed = subprocess.run(
+            [python_executable, "-m", "pip", "--version"],
+            cwd=PROJECT_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        return CheckResult("pip repair tool", False, f"could not run pip: {exc}")
+    detail = (completed.stdout or completed.stderr).strip()
+    if completed.returncode != 0:
+        return CheckResult("pip repair tool", False, f"pip is unavailable: {detail}")
+    return CheckResult("pip repair tool", True, detail or "pip is available", critical=False)
 
 
 def check_satpy_ahi_configs() -> list[CheckResult]:
@@ -683,14 +1011,36 @@ def run_checks() -> list[CheckResult]:
         ),
         CheckResult("requirements file", REQUIREMENTS_FILE.exists(), str(REQUIREMENTS_FILE)),
     ]
-    results.extend(check_packages())
+    results.append(check_pip_available())
+    package_results = check_packages()
+    results.extend(package_results)
     results.append(check_satpy_version())
     results.append(check_satpy_config_environment())
-    results.extend(check_satpy_ahi_configs())
-    results.append(check_satpy_true_color_registry())
-    results.append(check_app_version())
-    results.append(check_project_import())
-    results.append(check_project_true_color_fallback_runtime())
+    if has_critical_failures(package_results):
+        results.extend(
+            [
+                CheckResult(
+                    "AHI config and project import checks",
+                    False,
+                    "skipped until critical package checks pass; run --fix first",
+                    critical=False,
+                ),
+                CheckResult(
+                    "app version",
+                    False,
+                    "skipped until critical package checks pass; run --fix first",
+                    critical=False,
+                ),
+            ]
+        )
+    else:
+        results.extend(check_satpy_ahi_configs())
+        results.append(check_satpy_true_color_registry())
+        results.append(check_app_version())
+        results.append(check_project_import())
+        results.append(check_project_true_color_fallback_runtime())
+    results.append(check_overlay_data())
+    results.append(check_pycoast_overlay_runtime())
     results.append(check_launcher_helpers())
     results.extend(check_default_path_writability())
     results.append(check_cloud_sync_locations())
@@ -703,12 +1053,14 @@ def has_critical_failures(results: list[CheckResult]) -> bool:
 
 def result_group(result: CheckResult) -> str:
     package_names = {package.import_name for package in PACKAGE_CHECKS}
-    if result.name in {"python executable", "python version", "requirements file"}:
+    if result.name in {"python executable", "python version", "requirements file", "pip repair tool"}:
         return "Python"
     if result.name in package_names:
         return "Packages"
     if result.name.startswith("satpy") or result.name.startswith("Satpy") or "AHI" in result.name:
         return "Satpy"
+    if result.name in {"overlay data files", "pycoast overlay runtime"}:
+        return "Overlays"
     if result.name in {
         "launcher helpers",
         "default output folder",
@@ -796,6 +1148,7 @@ def print_next_steps(results: list[CheckResult]) -> None:
         print("  border overlays, MP4 writing, or official Satpy true color may be limited.")
         print("  To repair optional helpers, run:")
         print("     " + command_text([sys.executable, str(Path(__file__).resolve()), "--fix"]))
+        print("  For border overlays, Quick Fix downloads the needed low-resolution GSHHS/WDBII shapefiles.")
         print("  For path warnings, choose local non-synced output/temp folders such as C:\\Himawari\\outputs.")
         print("  You can also use the custom low-RAM true color fallback from the GUI or CLI.")
         return
@@ -809,13 +1162,64 @@ def has_failures(results: list[CheckResult]) -> bool:
     return any(not result.ok for result in results)
 
 
-def run_fix(python_executable: str | Path | None = None) -> int:
+def final_status_code(results: list[CheckResult]) -> int:
+    return 1 if has_critical_failures(results) else 0
+
+
+def recheck_after_repair(grouped: bool = True) -> list[CheckResult]:
+    print()
+    print("Re-checking after repair...")
+    results = run_checks()
+    print_results(results, grouped=grouped)
+    if has_failures(results):
+        unresolved = [result.name for result in results if not result.ok]
+        print("Remaining issue(s): " + ", ".join(unresolved))
+    else:
+        print("Final status: all checks passed.")
+    return results
+
+
+def recheck_after_repair_fresh(grouped: bool = True, python_executable: str | Path | None = None) -> list[CheckResult]:
+    python_executable = str(python_executable or sys.executable)
+    command = [python_executable, str(Path(__file__).resolve())]
+    if not grouped:
+        command.append("--plain")
+    print()
+    print("Re-checking after repair in a fresh Python process...")
+    print(command_text(command))
+    code = subprocess.call(command, cwd=PROJECT_DIR)
+    if code == 0:
+        return [CheckResult("fresh recheck", True, "fresh process reported no critical failures", critical=False)]
+    return [CheckResult("fresh recheck", False, f"fresh process exited with status {code}", critical=True)]
+
+
+def run_fix(
+    python_executable: str | Path | None = None,
+    open_overlays: bool = True,
+    install_overlays: bool = True,
+    force_overlay_data: bool = False,
+) -> int:
     if not REQUIREMENTS_FILE.exists():
         print(f"Cannot repair: missing requirements file: {REQUIREMENTS_FILE}", file=sys.stderr)
         return 1
+    pip_result = check_pip_available(python_executable)
+    if not pip_result.ok:
+        print(f"Cannot repair: {pip_result.detail}", file=sys.stderr)
+        return 1
     command = pip_install_command(upgrade=True, python_executable=python_executable)
+    print(f"Current Python: {sys.executable}")
+    print(f"Target Python:  {python_executable or sys.executable}")
     print("Running:", command_text(command))
-    return subprocess.call(command, cwd=PROJECT_DIR)
+    result = subprocess.call(command, cwd=PROJECT_DIR)
+    if result != 0:
+        return result
+    if install_overlays:
+        overlay_result = install_overlay_data(open_folder=open_overlays, force=force_overlay_data)
+        if not overlay_result.ok:
+            return 1
+    else:
+        ensure_overlay_folder(open_folder=open_overlays)
+    return result
 
 
 def run_environment_check_with(python_executable: str | Path) -> int:
@@ -824,7 +1228,11 @@ def run_environment_check_with(python_executable: str | Path) -> int:
     return subprocess.call(command, cwd=PROJECT_DIR)
 
 
-def run_auto_fix(results: list[CheckResult]) -> int:
+def run_auto_fix(
+    results: list[CheckResult],
+    install_overlays: bool = True,
+    force_overlay_data: bool = False,
+) -> int:
     python_result = next((result for result in results if result.name == "python version"), None)
     if python_result is not None and not python_result.ok:
         python_path = venv_python_path()
@@ -833,7 +1241,11 @@ def run_auto_fix(results: list[CheckResult]) -> int:
             if created_path is None:
                 return 1
             python_path = created_path
-        fix_code = run_fix(python_path)
+        fix_code = run_fix(
+            python_path,
+            install_overlays=install_overlays,
+            force_overlay_data=force_overlay_data,
+        )
         if fix_code != 0:
             return fix_code
         print()
@@ -845,7 +1257,10 @@ def run_auto_fix(results: list[CheckResult]) -> int:
         print()
         return run_environment_check_with(python_path)
 
-    return run_fix()
+    return run_fix(
+        install_overlays=install_overlays,
+        force_overlay_data=force_overlay_data,
+    )
 
 
 def main() -> int:
@@ -870,6 +1285,16 @@ def main() -> int:
         action="store_true",
         help="Print compact one-line-per-check output.",
     )
+    parser.add_argument(
+        "--skip-overlay-data",
+        action="store_true",
+        help="Repair Python packages but do not download/install GSHHS/WDBII overlay data.",
+    )
+    parser.add_argument(
+        "--force-overlay-data",
+        action="store_true",
+        help="Re-download/reinstall GSHHS/WDBII overlay data even if required files already exist.",
+    )
     args = parser.parse_args()
 
     print_banner()
@@ -877,36 +1302,41 @@ def main() -> int:
     results = run_checks()
     print_results(results, grouped=not args.plain)
 
-    if args.auto and has_failures(results):
+    if args.auto:
         print()
-        fix_code = run_auto_fix(results)
+        python_result = next((result for result in results if result.name == "python version"), None)
+        current_python_supported = python_result is None or python_result.ok
+        fix_code = run_auto_fix(
+            results,
+            install_overlays=not args.skip_overlay_data,
+            force_overlay_data=args.force_overlay_data,
+        )
         if fix_code != 0:
             return fix_code
+        if current_python_supported:
+            results = recheck_after_repair_fresh(grouped=not args.plain)
+        else:
+            return 0
+    elif args.fix:
         print()
-        if supported_python_version():
-            print("Re-checking after repair...")
-            results = run_checks()
-            print_results(results, grouped=not args.plain)
-    elif args.fix and has_failures(results):
-        print()
-        fix_code = run_fix()
+        fix_code = run_fix(
+            install_overlays=not args.skip_overlay_data,
+            force_overlay_data=args.force_overlay_data,
+        )
         if fix_code != 0:
             return fix_code
-        print()
-        print("Re-checking after repair...")
-        results = run_checks()
-        print_results(results, grouped=not args.plain)
+        results = recheck_after_repair_fresh(grouped=not args.plain)
 
     if has_critical_failures(results):
         print_next_steps(results)
-        return 1
+        return final_status_code(results)
 
     if has_failures(results):
         print_next_steps(results)
         return 0
 
     print_next_steps(results)
-    return 0
+    return final_status_code(results)
 
 
 if __name__ == "__main__":

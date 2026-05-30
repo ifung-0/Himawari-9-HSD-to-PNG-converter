@@ -81,6 +81,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--timelapse-format", metavar="gif|mp4", default=None)
     parser.add_argument("--resampler", metavar="native|nearest", default=None)
+    parser.add_argument("--night-fallback-mode", metavar="hybrid|whole_frame_ir", default=None)
+    parser.add_argument("--map-view", metavar="native|flat", default=None)
+    parser.add_argument("--flat-min-lat", type=float, default=None)
+    parser.add_argument("--flat-max-lat", type=float, default=None)
+    parser.add_argument("--flat-min-lon", type=float, default=None)
+    parser.add_argument("--flat-max-lon", type=float, default=None)
+    parser.add_argument("--flat-resolution-deg", type=float, default=None)
 
     parser.add_argument("--auto-download", type=parse_bool, default=None)
     parser.add_argument("--night-fallback", dest="use_night_fallback", type=parse_bool, default=None)
@@ -120,8 +127,17 @@ def print_config(config: processor.ProcessorConfig) -> None:
     print(f"Image format:       {config.image_format}")
     print(f"Timelapse format:   {config.timelapse_format}")
     print(f"Resampler:          {config.resampler}")
+    print(f"Map view:           {config.map_view}")
+    if processor.is_flat_map(config):
+        print(
+            "Flat bounds:        "
+            f"lat {config.flat_min_lat:g}..{config.flat_max_lat:g}, "
+            f"lon {config.flat_min_lon:g}..{config.flat_max_lon:g}, "
+            f"{config.flat_resolution_deg:g} deg"
+        )
     print(f"Auto-download:      {yes_no(config.auto_download)}")
     print(f"Night fallback:     {yes_no(config.use_night_fallback)}")
+    print(f"Night mode:         {config.night_fallback_mode}")
     print(f"Delete frames:      {yes_no(config.delete_timelapse_frames)}")
     print(f"Quality fallback:   {yes_no(config.allow_quality_fallback)}")
     print(f"Border lines:       {yes_no(config.add_border_lines)}")
@@ -216,6 +232,11 @@ def edit_basic_settings(config: processor.ProcessorConfig) -> processor.Processo
         values["delete_timelapse_frames"] = prompt_bool("Delete frame images after assembly", config.delete_timelapse_frames)
     values["auto_download"] = prompt_bool("Auto-download missing files", config.auto_download)
     values["use_night_fallback"] = prompt_bool("Use night fallback for day-only products", config.use_night_fallback)
+    values["night_fallback_mode"] = prompt_choice(
+        "Night fallback mode",
+        config.night_fallback_mode,
+        ("hybrid", "whole_frame_ir"),
+    )
     values["allow_quality_fallback"] = prompt_bool("Allow lower-quality true color fallback", config.allow_quality_fallback)
     return processor.ProcessorConfig(**values)
 
@@ -227,6 +248,13 @@ def edit_advanced_settings(config: processor.ProcessorConfig) -> processor.Proce
     values["dask_chunk_size"] = prompt_choice("Dask chunk size", config.dask_chunk_size, ("32MiB", "64MiB", "128MiB"))
     values["ram_limit_gb"] = prompt_float("RAM limit GiB", config.ram_limit_gb, 1.0)
     values["resampler"] = prompt_choice("Resampler", config.resampler, ("native", "nearest"))
+    values["map_view"] = prompt_choice("Map view", config.map_view, ("native", "flat"))
+    if processor.normalized_map_view(values["map_view"]) == "flat":
+        values["flat_min_lat"] = prompt_float("Flat min latitude", config.flat_min_lat, -90.0)
+        values["flat_max_lat"] = prompt_float("Flat max latitude", config.flat_max_lat, -90.0)
+        values["flat_min_lon"] = prompt_float("Flat min longitude", config.flat_min_lon, -360.0)
+        values["flat_max_lon"] = prompt_float("Flat max longitude", config.flat_max_lon, -360.0)
+        values["flat_resolution_deg"] = prompt_float("Flat resolution degrees", config.flat_resolution_deg, 0.001)
     values["output_template"] = prompt_text("Output filename template", config.output_template)
     values["add_border_lines"] = prompt_bool("Draw coastline/country borders", config.add_border_lines)
     values["border_line_color"] = prompt_text("Border line color", config.border_line_color)
