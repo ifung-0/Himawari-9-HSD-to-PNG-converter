@@ -1,14 +1,15 @@
 import unittest
 import bz2
+import io
 import tempfile
 import threading
+import warnings
 from unittest import mock
 
+import himawari_lowram_processor as h
 import dask.array as da
 import xarray as xr
 from pyresample.geometry import AreaDefinition
-
-import himawari_lowram_processor as h
 
 
 class FakeWidget:
@@ -45,6 +46,30 @@ class FakeRoot:
         self.updated = True
 
 
+def write_test_png(path):
+    from PIL import Image
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (2, 2), (10, 20, 30)).save(path)
+
+
+def fake_imageio_writer_creating_file():
+    writer = mock.Mock()
+    writer.__enter__ = mock.Mock(return_value=writer)
+
+    def exit_writer(*_args):
+        h.Path(writer.output_path).write_bytes(b"movie")
+        return None
+
+    writer.__exit__ = mock.Mock(side_effect=exit_writer)
+
+    def get_writer(path, **_kwargs):
+        writer.output_path = path
+        return writer
+
+    return writer, get_writer
+
+
 class FakeScheduledRoot(FakeRoot):
     def __init__(self):
         super().__init__()
@@ -71,6 +96,22 @@ class FakePane:
         self.sash_positions.append((index, position))
 
 
+class FakeNotebook:
+    def __init__(self):
+        self.hidden = []
+        self.added = []
+        self.selected = None
+
+    def hide(self, tab_id):
+        self.hidden.append(tab_id)
+
+    def add(self, tab_id, **kwargs):
+        self.added.append((tab_id, kwargs))
+
+    def select(self, tab_id):
+        self.selected = tab_id
+
+
 class FakeEvent:
     def __init__(self, delta=0, num=None):
         self.delta = delta
@@ -78,6 +119,34 @@ class FakeEvent:
 
 
 class ProcessorTests(unittest.TestCase):
+    def test_configure_known_warning_filters_suppresses_noisy_optional_gpu_and_projection_warnings(self):
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            h.configure_known_warning_filters()
+            warnings.warn_explicit(
+                "CUDA path could not be detected. Set CUDA_PATH environment variable if CuPy fails to load.",
+                UserWarning,
+                "cupy/_environment.py",
+                284,
+                module="cupy._environment",
+            )
+            warnings.warn_explicit(
+                "invalid value encountered in cos",
+                RuntimeWarning,
+                "dask/_task_spec.py",
+                768,
+                module="dask._task_spec",
+            )
+            warnings.warn_explicit(
+                "invalid value encountered in sin",
+                RuntimeWarning,
+                "dask/_task_spec.py",
+                768,
+                module="dask._task_spec",
+            )
+
+        self.assertEqual(captured, [])
+
     def test_app_version_label(self):
         self.assertRegex(h.APP_VERSION, r"^\d{4}\.\d{2}\.\d{2}\.\d+$")
         self.assertIn(h.APP_VERSION, h.app_version_label())
@@ -181,6 +250,180 @@ class ProcessorTests(unittest.TestCase):
                 expected_calibration = "brightness_temperature" if band in h.IR_BANDS else "reflectance"
                 self.assertEqual(h.calibration_for_band(band), expected_calibration)
 
+    def test_parse_local_hsd_segment_accepts_dat_and_bz2(self):
+        dat = h.parse_local_hsd_segment("HS_H09_20240725_0400_B13_FLDK_R20_S0110.DAT")
+        compressed = h.parse_local_hsd_segment("HS_H09_20240725_0400_B13_FLDK_R20_S0210.dat.bz2")
+
+        self.assertEqual(dat.timestamp, "20240725_0400")
+        self.assertEqual(dat.band, "B13")
+        self.assertEqual(dat.area, "FLDK")
+        self.assertEqual(dat.segment, 1)
+        self.assertFalse(dat.compressed)
+        self.assertTrue(compressed.compressed)
+
+    def test_parse_local_hsd_segment_rejects_bad_name_and_resolution(self):
+        with self.assertRaisesRegex(ValueError, "file name"):
+            h.parse_local_hsd_segment("bad-file.bz2")
+        with self.assertRaisesRegex(ValueError, "B13 files must use R20"):
+            h.parse_local_hsd_segment("HS_H09_20240725_0400_B13_FLDK_R05_S0110.DAT")
+
+    def test_sorted_local_segments_rejects_duplicates_and_mixed_scans(self):
+        with self.assertRaisesRegex(ValueError, "Duplicate local segment"):
+            h.sorted_local_segments([
+                "HS_H09_20240725_0400_B13_FLDK_R20_S0110.DAT",
+                "HS_H09_20240725_0400_B13_FLDK_R20_S0110.dat.bz2",
+            ])
+        with self.assertRaisesRegex(ValueError, "one scan at a time"):
+            h.sorted_local_segments([
+                "HS_H09_20240725_0400_B13_FLDK_R20_S0110.DAT",
+                "HS_H09_20240725_0410_B13_FLDK_R20_S0210.DAT",
+            ])
+
+    def test_import_local_hsd_segments_sorts_and_streams_to_cache(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_dir = h.Path(tmp_dir) / "source"
+            temp_dir = h.Path(tmp_dir) / "temp"
+            source_dir.mkdir()
+            s02 = source_dir / "HS_H09_20240725_0400_B13_FLDK_R20_S0210.DAT.bz2"
+            s01 = source_dir / "HS_H09_20240725_0400_B13_FLDK_R20_S0110.DAT"
+            s02.write_bytes(bz2.compress(b"two"))
+            s01.write_bytes(b"one")
+
+            result = h.import_local_hsd_segments([s02, s01], temp_dir)
+
+            self.assertEqual(result.bands, ("B13",))
+            self.assertEqual(len(result.imported_paths), 2)
+            self.assertEqual(result.imported_paths[0].name, "HS_H09_20240725_0400_B13_FLDK_R20_S0110.DAT")
+            self.assertEqual(result.imported_paths[0].read_bytes(), b"one")
+            self.assertEqual(result.imported_paths[1].read_bytes(), b"two")
+            self.assertIn("AHI-L1b-FLDK/2024/07/25/0400/", result.synthetic_url)
+
+    def test_import_local_hsd_segments_reuses_existing_cache_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_dir = h.Path(tmp_dir) / "source"
+            temp_dir = h.Path(tmp_dir) / "temp"
+            source_dir.mkdir()
+            source = source_dir / "HS_H09_20240725_0400_B13_FLDK_R20_S0110.DAT"
+            source.write_bytes(b"new")
+            destination = temp_dir / "20240725_0400" / source.name
+            destination.parent.mkdir(parents=True)
+            destination.write_bytes(b"existing")
+
+            result = h.import_local_hsd_segments([source], temp_dir)
+
+            self.assertEqual(result.imported_paths, ())
+            self.assertEqual(result.reused_paths, (destination,))
+            self.assertEqual(destination.read_bytes(), b"existing")
+
+    def test_import_local_hsd_segments_reports_missing_selected_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            missing = h.Path(tmp_dir) / "HS_H09_20240725_0400_B13_FLDK_R20_S0110.DAT"
+
+            with self.assertRaisesRegex(FileNotFoundError, "Local HSD import file"):
+                h.import_local_hsd_segments([missing], h.Path(tmp_dir) / "temp")
+
+    def test_import_local_hsd_segments_reports_empty_selected_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source = h.Path(tmp_dir) / "HS_H09_20240725_0400_B13_FLDK_R20_S0110.DAT"
+            source.write_bytes(b"")
+
+            with self.assertRaisesRegex(FileNotFoundError, "empty"):
+                h.import_local_hsd_segments([source], h.Path(tmp_dir) / "temp")
+
+    def test_parse_local_hsd_segment_rejects_invalid_timestamp(self):
+        with self.assertRaisesRegex(ValueError, "Invalid local HSD timestamp"):
+            h.parse_local_hsd_segment("HS_H09_20241399_0400_B13_FLDK_R20_S0110.DAT")
+
+    def test_offline_source_url_for_target_area_uses_target_folder(self):
+        result = h.LocalImportResult(
+            sat_id="HS_H09",
+            timestamp="20240725_0400",
+            area="R301",
+            total_segments=1,
+            imported_paths=(),
+            reused_paths=(),
+            bands=("B13",),
+        )
+
+        url = h.offline_source_url_for_import(result)
+        info = h.parse_url(url)
+
+        self.assertIn("AHI-L1b-Target", url)
+        self.assertEqual(info.area, "R301")
+
+    def test_import_local_hsd_segments_cleans_failed_bz2_part(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_dir = h.Path(tmp_dir) / "source"
+            temp_dir = h.Path(tmp_dir) / "temp"
+            source_dir.mkdir()
+            source = source_dir / "HS_H09_20240725_0400_B13_FLDK_R20_S0110.DAT.bz2"
+            source.write_bytes(b"not bz2")
+
+            with self.assertRaises(Exception):
+                h.import_local_hsd_segments([source], temp_dir)
+
+            part = temp_dir / "20240725_0400" / "HS_H09_20240725_0400_B13_FLDK_R20_S0110.DAT.part"
+            self.assertFalse(part.exists())
+
+    def test_offline_preflight_blocks_missing_cached_segments(self):
+        config = h.default_config()
+        config.auto_download = False
+        config.composite_choice = "B13 (Infrared Window)"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            result = h.preflight_run(config, temp_dir=h.Path(tmp_dir))
+
+        self.assertFalse(result.ok)
+        self.assertTrue(any("Offline cache is missing" in error for error in result.errors))
+
+    def test_offline_preflight_passes_complete_cached_segments(self):
+        config = h.default_config()
+        config.auto_download = False
+        config.composite_choice = "B13 (Infrared Window)"
+        info = h.parse_url(config.user_url)
+        dt = h.datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            temp_dir = h.Path(tmp_dir)
+            for task in h.make_download_tasks(info, dt, ("B13",), temp_dir):
+                task.destination.write_bytes(b"cached")
+
+            result = h.preflight_run(config, temp_dir=temp_dir)
+
+        self.assertTrue(result.ok)
+
+    def test_offline_preflight_requires_product_bands_not_only_imported_band(self):
+        config = h.default_config()
+        config.auto_download = False
+        config.composite_choice = "True Color Reproduction Image"
+        info = h.parse_url(config.user_url)
+        dt = h.datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            temp_dir = h.Path(tmp_dir)
+            for task in h.make_download_tasks(info, dt, ("B13",), temp_dir):
+                task.destination.write_bytes(b"cached")
+
+            result = h.preflight_run(config, temp_dir=temp_dir)
+
+        self.assertFalse(result.ok)
+        self.assertTrue(any("Offline cache is missing" in error for error in result.errors))
+
+    def test_download_segments_offline_ignores_empty_cache_files(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            empty = h.Path(tmp_dir) / "empty.dat"
+            full = h.Path(tmp_dir) / "full.dat"
+            empty.write_bytes(b"")
+            full.write_bytes(b"cached")
+            tasks = [
+                h.DownloadTask("https://example.test/empty.bz2", empty),
+                h.DownloadTask("https://example.test/full.bz2", full),
+            ]
+
+            found = h.download_segments(tasks, workers=1, auto_download=False)
+
+        self.assertEqual(found, [full])
+
     def test_target_pixel_size_uses_finest_required_band(self):
         self.assertEqual(h.target_pixel_size_m("True Color RGB (Enhanced)"), 500)
         self.assertEqual(h.target_pixel_size_m("B13 (Infrared Window)"), 2000)
@@ -199,6 +442,343 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(h.clamp_download_workers(0), 1)
         self.assertEqual(h.clamp_dask_workers(7), 2)
         self.assertEqual(h.clamp_dask_workers(0), 1)
+
+    def test_recommend_performance_settings_safe_mode_is_conservative(self):
+        profile = h.SystemPerformanceProfile(total_ram_gb=16.0, available_ram_gb=10.0, cpu_count=8, cpu_percent=20.0)
+
+        result = h.recommend_performance_settings(profile, "safe")
+
+        self.assertEqual(result.download_workers, 2)
+        self.assertEqual(result.dask_num_workers, 1)
+        self.assertEqual(result.dask_chunk_size, "32MiB")
+        self.assertLessEqual(result.ram_limit_gb, 8.0)
+
+    def test_recommend_performance_settings_best_performance_uses_headroom(self):
+        profile = h.SystemPerformanceProfile(total_ram_gb=64.0, available_ram_gb=32.0, cpu_count=12, cpu_percent=10.0)
+
+        result = h.recommend_performance_settings(profile, "best_performance")
+
+        self.assertEqual(result.download_workers, 4)
+        self.assertEqual(result.dask_num_workers, 2)
+        self.assertEqual(result.dask_chunk_size, "128MiB")
+        self.assertGreaterEqual(result.ram_limit_gb, 12.0)
+
+    @mock.patch("himawari_lowram_processor.importlib.util.find_spec", return_value=None)
+    def test_gpu_support_status_reports_missing_cupy(self, _mock_spec):
+        status = h.gpu_support_status()
+
+        self.assertFalse(status.ok)
+        self.assertIn("CuPy is not installed", status.detail)
+
+    @mock.patch("himawari_lowram_processor.importlib.util.find_spec", return_value=object())
+    def test_gpu_support_status_reports_kernel_test_failure(self, _mock_spec):
+        class FakeRuntime:
+            @staticmethod
+            def getDeviceCount():
+                return 1
+
+            @staticmethod
+            def getDeviceProperties(_device):
+                return {"name": b"Fake GPU"}
+
+        class FakeCuda:
+            runtime = FakeRuntime()
+            Stream = mock.Mock(null=mock.Mock(synchronize=mock.Mock()))
+
+        fake_cupy = mock.Mock(
+            __version__="13.0",
+            cuda=FakeCuda(),
+            float32=float,
+            asarray=mock.Mock(side_effect=RuntimeError("missing headers")),
+        )
+
+        with mock.patch.dict("sys.modules", {"cupy": fake_cupy}):
+            status = h.gpu_support_status()
+
+        self.assertFalse(status.ok)
+        self.assertIn("CUDA kernel test failed", status.detail)
+        self.assertIn("GPU Fix", status.detail)
+
+    @mock.patch("himawari_lowram_processor.importlib.util.find_spec", return_value=object())
+    def test_gpu_support_status_accepts_kernel_test_success(self, _mock_spec):
+        class FakeArray:
+            def __init__(self, value):
+                self.value = float(value)
+
+            def __add__(self, other):
+                return FakeArray(self.value + float(other))
+
+            def astype(self, _dtype):
+                return self
+
+        class FakeRuntime:
+            @staticmethod
+            def getDeviceCount():
+                return 1
+
+            @staticmethod
+            def getDeviceProperties(_device):
+                return {"name": b"Fake GPU"}
+
+        class FakeCuda:
+            runtime = FakeRuntime()
+            Stream = mock.Mock(null=mock.Mock(synchronize=mock.Mock()))
+
+        fake_cupy = mock.Mock(
+            __version__="13.0",
+            cuda=FakeCuda(),
+            float32=float,
+            asarray=mock.Mock(return_value=FakeArray(1.0)),
+            asnumpy=mock.Mock(side_effect=lambda array: [array.value]),
+            get_default_memory_pool=mock.Mock(return_value=mock.Mock(free_all_blocks=mock.Mock())),
+        )
+
+        with mock.patch.dict("sys.modules", {"cupy": fake_cupy}):
+            status = h.gpu_support_status()
+
+        self.assertTrue(status.ok)
+        self.assertEqual(status.device_name, "Fake GPU")
+
+    @mock.patch("himawari_lowram_processor.gpu_support_status")
+    def test_require_gpu_ready_raises_when_unavailable(self, mock_status):
+        mock_status.return_value = h.GpuSupportStatus(False, "missing")
+
+        with self.assertRaisesRegex(RuntimeError, "GPU acceleration is enabled"):
+            h.require_gpu_ready()
+
+    @mock.patch("himawari_lowram_processor.gpu_support_status")
+    def test_require_gpu_ready_returns_status_when_available(self, mock_status):
+        ready = h.GpuSupportStatus(True, "ready", device_name="Test GPU", device_count=1, package_version="13")
+        mock_status.return_value = ready
+
+        self.assertEqual(h.require_gpu_ready(), ready)
+
+    @mock.patch("himawari_lowram_processor.gpu_support_status")
+    def test_config_validation_blocks_unavailable_gpu(self, mock_status):
+        config = h.default_config()
+        config.gpu_acceleration = True
+        mock_status.return_value = h.GpuSupportStatus(False, "missing")
+
+        with self.assertRaisesRegex(RuntimeError, "GPU acceleration is enabled"):
+            h.validate_configuration(config)
+
+    @mock.patch("himawari_lowram_processor.gpu_support_status")
+    def test_setup_status_reports_unavailable_gpu(self, mock_status):
+        config = h.default_config()
+        config.gpu_acceleration = True
+        mock_status.return_value = h.GpuSupportStatus(False, "missing")
+
+        status = h.build_setup_status(config, h.Path("C:/Himawari/outputs"), h.Path("C:/Himawari/temp"))
+
+        self.assertFalse(status.ok)
+        self.assertTrue(any("GPU acceleration is enabled" in error for error in status.errors))
+
+    @mock.patch("himawari_lowram_processor.gpu_support_status")
+    def test_preflight_blocks_unavailable_gpu(self, mock_status):
+        config = h.default_config()
+        config.gpu_acceleration = True
+        mock_status.return_value = h.GpuSupportStatus(False, "missing")
+
+        result = h.preflight_run(config, h.Path("C:/Himawari/outputs"), h.Path("C:/Himawari/temp"))
+
+        self.assertFalse(result.ok)
+        self.assertTrue(any("GPU acceleration is enabled" in error for error in result.errors))
+
+    @mock.patch("himawari_lowram_processor.gpu_support_status")
+    def test_setup_status_reports_ready_gpu(self, mock_status):
+        config = h.default_config()
+        config.gpu_acceleration = True
+        mock_status.return_value = h.GpuSupportStatus(True, "ready", device_name="Test GPU", device_count=1)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            status = h.build_setup_status(config, h.Path(tmp_dir) / "outputs", h.Path(tmp_dir) / "temp")
+
+        self.assertTrue(status.ok)
+        self.assertIn("GPU acceleration: experimental", status.display_text())
+
+    @mock.patch("himawari_lowram_processor.gpu_support_status")
+    def test_preflight_blocks_gpu_for_unsupported_product(self, mock_status):
+        config = h.default_config()
+        config.gpu_acceleration = True
+        config.composite_choice = "B13 (Infrared Window)"
+        mock_status.return_value = h.GpuSupportStatus(True, "ready", device_name="Test GPU", device_count=1)
+
+        result = h.preflight_run(config, h.Path("C:/Himawari/outputs"), h.Path("C:/Himawari/temp"))
+
+        self.assertFalse(result.ok)
+        self.assertTrue(any("GPU acceleration is currently limited" in error for error in result.errors))
+
+    def test_gpu_true_color_reproduction_block_returns_cpu_uint8_rgb(self):
+        if not h.gpu_support_status().ok:
+            self.skipTest("CuPy GPU support is not available")
+        b01 = h.np.array([[20.0, 40.0], [60.0, h.np.nan]], dtype=h.np.float32)
+        b02 = h.np.array([[30.0, 50.0], [70.0, 90.0]], dtype=h.np.float32)
+        b03 = h.np.array([[40.0, 60.0], [80.0, 100.0]], dtype=h.np.float32)
+        b04 = h.np.array([[25.0, 45.0], [65.0, 85.0]], dtype=h.np.float32)
+
+        result = h.gpu_true_color_reproduction_block(b01, b02, b03, b04)
+
+        self.assertIsInstance(result, h.np.ndarray)
+        self.assertEqual(result.shape, (3, 2, 2))
+        self.assertEqual(result.dtype, h.np.uint8)
+        self.assertGreater(int(result.max()), 0)
+
+    def test_gpu_true_color_reproduction_block_rejects_mismatched_shapes(self):
+        if not h.gpu_support_status().ok:
+            self.skipTest("CuPy GPU support is not available")
+        b01 = h.np.ones((2, 2), dtype=h.np.float32)
+        b02 = h.np.ones((2, 3), dtype=h.np.float32)
+        b03 = h.np.ones((2, 2), dtype=h.np.float32)
+        b04 = h.np.ones((2, 2), dtype=h.np.float32)
+
+        with self.assertRaisesRegex(ValueError, "mismatched visible band shapes"):
+            h.gpu_true_color_reproduction_block(b01, b02, b03, b04)
+
+    def test_gpu_true_color_reproduction_block_hybrid_returns_cpu_uint8_rgb(self):
+        if not h.gpu_support_status().ok:
+            self.skipTest("CuPy GPU support is not available")
+        b01 = h.np.ones((2, 2), dtype=h.np.float32) * 20.0
+        b02 = h.np.ones((2, 2), dtype=h.np.float32) * 30.0
+        b03 = h.np.array([[1.0, 3.0], [8.0, 12.0]], dtype=h.np.float32)
+        b04 = h.np.ones((2, 2), dtype=h.np.float32) * 25.0
+        b13 = h.np.ones((2, 2), dtype=h.np.float32) * 230.0
+
+        result = h.gpu_true_color_reproduction_block(b01, b02, b03, b04, b13, use_hybrid=True)
+
+        self.assertIsInstance(result, h.np.ndarray)
+        self.assertEqual(result.shape, (3, 2, 2))
+        self.assertEqual(result.dtype, h.np.uint8)
+        self.assertGreater(int(result[:, 0, 0].mean()), int(result[:, 1, 1].mean()))
+
+    @mock.patch("himawari_lowram_processor.gpu_support_status")
+    def test_build_gpu_custom_composite_returns_cpu_backed_dask_chunks(self, mock_status):
+        mock_status.return_value = h.GpuSupportStatus(True, "ready", device_name="Test GPU", device_count=1)
+        if not h.gpu_support_status().ok:
+            self.skipTest("CuPy GPU support is not available")
+        area = AreaDefinition(
+            "test",
+            "test",
+            "latlon",
+            {"proj": "longlat", "datum": "WGS84"},
+            2,
+            2,
+            (100.0, -10.0, 102.0, -8.0),
+        )
+        attrs = {"area": area, "sensor": "ahi"}
+        scene = mock.MagicMock()
+        data = {
+            band: xr.DataArray(
+                da.ones((2, 2), chunks=(1, 1)) * value,
+                dims=("y", "x"),
+                attrs=attrs,
+            )
+            for band, value in {"B01": 20.0, "B02": 30.0, "B03": 40.0, "B04": 25.0}.items()
+        }
+        scene.__getitem__.side_effect = lambda key: data[key]
+        config = h.default_config()
+        config.gpu_acceleration = True
+        config.use_night_fallback = False
+
+        name, dataset = h.build_gpu_custom_composite(scene, "True Color Reproduction Image", config)
+        computed = dataset.data.compute()
+
+        self.assertEqual(name, h.CUSTOM_DATASET_NAMES["True Color Reproduction Image"])
+        self.assertIsInstance(computed, h.np.ndarray)
+        self.assertEqual(computed.shape, (3, 2, 2))
+        self.assertEqual(computed.dtype, h.np.uint8)
+
+    @mock.patch("himawari_lowram_processor.gpu_support_status")
+    def test_build_gpu_custom_composite_reports_missing_band(self, mock_status):
+        mock_status.return_value = h.GpuSupportStatus(True, "ready", device_name="Test GPU", device_count=1)
+        area = AreaDefinition(
+            "test",
+            "test",
+            "latlon",
+            {"proj": "longlat", "datum": "WGS84"},
+            2,
+            2,
+            (100.0, -10.0, 102.0, -8.0),
+        )
+        attrs = {"area": area, "sensor": "ahi"}
+        data = {
+            band: xr.DataArray(da.ones((2, 2), chunks=(1, 1)), dims=("y", "x"), attrs=attrs)
+            for band in ("B01", "B02", "B03")
+        }
+        scene = mock.MagicMock()
+
+        def get_band(key):
+            if key not in data:
+                raise KeyError(key)
+            return data[key]
+
+        scene.__getitem__.side_effect = get_band
+        config = h.default_config()
+        config.gpu_acceleration = True
+        config.use_night_fallback = False
+
+        with self.assertRaisesRegex(RuntimeError, "missing required resampled band"):
+            h.build_gpu_custom_composite(scene, "True Color Reproduction Image", config)
+
+    @mock.patch("himawari_lowram_processor.gpu_support_status")
+    def test_build_gpu_custom_composite_reports_mismatched_band_shape(self, mock_status):
+        mock_status.return_value = h.GpuSupportStatus(True, "ready", device_name="Test GPU", device_count=1)
+        area = AreaDefinition(
+            "test",
+            "test",
+            "latlon",
+            {"proj": "longlat", "datum": "WGS84"},
+            2,
+            2,
+            (100.0, -10.0, 102.0, -8.0),
+        )
+        attrs = {"area": area, "sensor": "ahi"}
+        data = {
+            "B01": xr.DataArray(da.ones((2, 2), chunks=(1, 1)), dims=("y", "x"), attrs=attrs),
+            "B02": xr.DataArray(da.ones((2, 2), chunks=(1, 1)), dims=("y", "x"), attrs=attrs),
+            "B03": xr.DataArray(da.ones((2, 2), chunks=(1, 1)), dims=("y", "x"), attrs=attrs),
+            "B04": xr.DataArray(da.ones((3, 2), chunks=(1, 1)), dims=("y", "x"), attrs=attrs),
+        }
+        scene = mock.MagicMock()
+        scene.__getitem__.side_effect = lambda key: data[key]
+        config = h.default_config()
+        config.gpu_acceleration = True
+        config.use_night_fallback = False
+
+        with self.assertRaisesRegex(RuntimeError, "expected \\(2, 2\\)"):
+            h.build_gpu_custom_composite(scene, "True Color Reproduction Image", config)
+
+    def test_dataarray_to_cpu_chunks_preserves_lazy_dask_array(self):
+        source = xr.DataArray(da.ones((2, 2), chunks=(1, 1)), dims=("y", "x"), attrs={"name": "demo"})
+
+        with mock.patch("himawari_lowram_processor.dask_array_to_cpu_chunks", return_value=source.data) as mock_cpu:
+            result = h.dataarray_to_cpu_chunks(source)
+
+        self.assertIsInstance(result.data, da.Array)
+        self.assertEqual(result.attrs["name"], "demo")
+        mock_cpu.assert_called_once()
+
+    def test_dask_array_to_cpu_chunks_leaves_numpy_blocks_unchanged(self):
+        source = da.ones((2, 2), chunks=(1, 1))
+
+        result = h.dask_array_to_cpu_chunks(source)
+
+        self.assertIsInstance(result.compute(), h.np.ndarray)
+
+    def test_maybe_cpu_scene_after_gpu_converts_named_datasets(self):
+        config = h.default_config()
+        config.gpu_acceleration = True
+        scene = mock.MagicMock()
+        first = xr.DataArray(da.ones((2, 2), chunks=(1, 1)), dims=("y", "x"))
+        second = xr.DataArray(da.ones((2, 2), chunks=(1, 1)), dims=("y", "x"))
+        scene.__getitem__.side_effect = lambda name: {"B03": first, "rgb": second}[name]
+
+        with mock.patch("himawari_lowram_processor.dataarray_to_cpu_chunks", side_effect=lambda data: data) as mock_cpu:
+            result = h.maybe_cpu_scene_after_gpu(scene, ("B03", "missing", "rgb"), config)
+
+        self.assertIs(result, scene)
+        self.assertEqual(mock_cpu.call_count, 2)
+        assigned = [call.args[0] for call in scene.__setitem__.call_args_list]
+        self.assertEqual(assigned, ["B03", "rgb"])
 
     def test_required_bands_include_night_fallback(self):
         bands = h.required_bands("True Color RGB (Enhanced)", use_night_fallback=True)
@@ -335,6 +915,8 @@ class ProcessorTests(unittest.TestCase):
             h.validate_output_template("folder/{scan_time}")
         with self.assertRaisesRegex(ValueError, "required"):
             h.validate_output_template("")
+        with self.assertRaisesRegex(ValueError, "reserved device name"):
+            h.validate_output_template("CON")
 
     def test_scan_choice_listing_extracts_bands(self):
         xml = """<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -518,10 +1100,13 @@ class ProcessorTests(unittest.TestCase):
             ("hours_back", 0, "HOURS_BACK"),
             ("fps", 0, "FPS"),
             ("dask_num_workers", 0, "Dask workers"),
+            ("dask_chunk_size", "256MiB", "Dask chunk size"),
             ("ram_limit_gb", 0, "RAM limit"),
             ("image_format", "jpg", "IMAGE_FORMAT"),
             ("timelapse_format", "avi", "TIMELAPSE_FORMAT"),
             ("resampler", "bilinear", "RESAMPLER"),
+            ("ram_limit_gb", float("nan"), "RAM limit"),
+            ("max_safe_png_pixels", 0, "Max safe PNG pixels"),
         ]
         for field, value, message in bad_values:
             with self.subTest(field=field):
@@ -530,10 +1115,23 @@ class ProcessorTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     h.validate_configuration(config)
 
+    def test_setup_status_reports_non_numeric_values_without_crashing(self):
+        config = h.default_config()
+        config.ram_limit_gb = float("nan")
+        config.border_line_width = float("inf")
+        config.add_border_lines = True
+
+        status = h.build_setup_status(config, h.Path("C:/Himawari/out"), h.Path("C:/Himawari/temp"))
+
+        self.assertFalse(status.ok)
+        self.assertTrue(any("RAM limit" in error for error in status.errors))
+        self.assertTrue(any("Border line width" in error for error in status.errors))
+
     def test_setup_status_summarizes_valid_fldk_source(self):
         config = h.default_config()
 
-        status = h.build_setup_status(config, h.Path("C:/Himawari/outputs"), h.Path("C:/Himawari/temp"))
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            status = h.build_setup_status(config, h.Path(tmp_dir) / "outputs", h.Path(tmp_dir) / "temp")
 
         text = status.display_text()
         self.assertTrue(status.ok)
@@ -565,10 +1163,11 @@ class ProcessorTests(unittest.TestCase):
         config.image_format = "png"
         config.map_view = "flat"
 
-        status = h.build_setup_status(config, h.Path("C:/Himawari/outputs"), h.Path("C:/Himawari/temp"))
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            status = h.build_setup_status(config, h.Path(tmp_dir) / "outputs", h.Path(tmp_dir) / "temp")
 
         self.assertTrue(status.ok)
-        self.assertTrue(any("Map view: flat map" in detail for detail in status.details))
+        self.assertTrue(any("Map view: Web Mercator flat map" in detail for detail in status.details))
         self.assertFalse(any("Full-disk 500 m PNG" in warning for warning in status.warnings))
 
     def test_setup_status_warns_for_border_overlay_requirements(self):
@@ -610,6 +1209,19 @@ class ProcessorTests(unittest.TestCase):
         status = h.build_setup_status(config, h.Path("C:/HimawariLocal/out"), h.Path("C:/HimawariLocal/temp"))
 
         self.assertFalse(any("Cloud-sync path detected" in warning for warning in status.warnings))
+
+    def test_setup_status_reports_unwritable_output_folder(self):
+        config = h.default_config()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_file = h.Path(tmp_dir) / "not-a-folder"
+            output_file.write_text("blocked", encoding="utf-8")
+            temp_dir = h.Path(tmp_dir) / "temp"
+
+            status = h.build_setup_status(config, output_file, temp_dir)
+
+        self.assertFalse(status.ok)
+        self.assertTrue(any("Output folder is not writable" in error for error in status.errors))
 
     @mock.patch.object(h.Path, "resolve", autospec=True)
     def test_saved_project_default_paths_migrate_off_cloud_sync(self, mock_resolve):
@@ -730,7 +1342,7 @@ class ProcessorTests(unittest.TestCase):
 
     def test_visible_dark_weight_feathers_between_day_and_night(self):
         b03 = xr.DataArray(
-            da.from_array([[0.0, 5.0, 12.0]], chunks=(1, 3)),
+            da.from_array([[0.0, 0.9, 2.0]], chunks=(1, 3)),
             dims=("y", "x"),
         )
 
@@ -790,8 +1402,14 @@ class ProcessorTests(unittest.TestCase):
 
         area = h.flat_map_area(config)
 
-        self.assertEqual((area.height, area.width), (2400, 2400))
-        self.assertEqual(area.area_extent, (80.0, -60.0, 200.0, 60.0))
+        self.assertEqual((area.height, area.width), (3018, 2400))
+        self.assertIn("Mercator", area.crs.coordinate_operation.method_name)
+        self.assertEqual(area.proj_id, "webmerc")
+        self.assertAlmostEqual(area.area_extent[0], 8905559.263461886)
+        self.assertAlmostEqual(area.area_extent[1], -8399737.889818357)
+        self.assertAlmostEqual(area.area_extent[2], 22263898.158654712)
+        self.assertAlmostEqual(area.area_extent[3], 8399737.889818357)
+        self.assertGreater(area.area_extent[2], 20037508.342789244)
 
     def test_flat_map_validation_rejects_invalid_numbers_and_bounds(self):
         cases = [
@@ -800,7 +1418,7 @@ class ProcessorTests(unittest.TestCase):
             ("flat_min_lat", float("nan"), "min latitude must be finite"),
             ("flat_min_lon", "west", "min longitude must be a finite number"),
             ("flat_min_lat", 60.0, "min latitude must be less than max latitude"),
-            ("flat_max_lat", 91.0, "latitude bounds must be between -90 and 90"),
+            ("flat_max_lat", 86.0, "latitude bounds must be between"),
             ("flat_min_lon", 200.0, "min longitude must be less than max longitude"),
             ("flat_max_lon", 361.0, "longitude bounds must be between -360 and 360"),
         ]
@@ -874,8 +1492,16 @@ class ProcessorTests(unittest.TestCase):
 
         output = h.output_behavior_for_config(config, info, start)
 
-        self.assertIn("flat target 2400x2400 px", output)
+        self.assertIn("flat target 2400x3018 px", output)
         self.assertIn(".tif", output)
+
+    def test_timelapse_frame_size_guard_blocks_large_targets(self):
+        config = h.default_config()
+        config.mode = "Timelapse"
+        area = mock.Mock(width=8000, height=6000)
+
+        with self.assertRaisesRegex(RuntimeError, "Timelapse frame target"):
+            h.validate_timelapse_frame_size(area, config)
 
     def test_flat_map_resampler_forces_nearest_even_when_config_native(self):
         config = h.default_config()
@@ -960,6 +1586,12 @@ class ProcessorTests(unittest.TestCase):
         base.add_border_lines = True
         base.border_line_color = "#abcdef"
         base.border_line_width = 3.0
+        base.map_view = "flat"
+        base.flat_min_lat = -45.0
+        base.flat_max_lat = 45.0
+        base.flat_min_lon = 100.0
+        base.flat_max_lon = 180.0
+        base.flat_resolution_deg = 0.1
 
         balanced = h.preset_config("Balanced Single", base)
         fast = h.preset_config("Fast IR Check", base)
@@ -971,10 +1603,20 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(balanced.border_line_color, "#abcdef")
         self.assertEqual(fast.border_line_width, 3.0)
         self.assertEqual(fast.composite_choice, "B13 (Infrared Window)")
-        self.assertEqual(fast.download_workers, 2)
+        self.assertEqual(balanced.download_workers, 2)
+        self.assertEqual(balanced.dask_chunk_size, "32MiB")
+        self.assertEqual(fast.download_workers, 1)
+        self.assertEqual(fast.dask_chunk_size, "32MiB")
         self.assertEqual(timelapse.mode, "Timelapse")
+        self.assertEqual(timelapse.download_workers, 1)
         self.assertEqual(timelapse.dask_num_workers, 1)
+        self.assertEqual(timelapse.dask_chunk_size, "16MiB")
         self.assertEqual(timelapse.resampler, "native")
+        self.assertEqual(balanced.map_view, "flat")
+        self.assertEqual(fast.map_view, "flat")
+        self.assertEqual(timelapse.map_view, "flat")
+        self.assertEqual(balanced.flat_min_lat, -45.0)
+        self.assertEqual(timelapse.flat_resolution_deg, 0.1)
 
     def test_gui_settings_round_trip_ignores_unknown_fields(self):
         config = h.default_config()
@@ -1177,6 +1819,47 @@ class ProcessorTests(unittest.TestCase):
         self.assertIn("B03", h.native_area_compatibility_error(band_areas, b13_target))
         self.assertIsNone(h.native_area_compatibility_error(band_areas, b03_target))
 
+    def test_native_common_area_locks_full_disk_from_reference_band_not_compatibility_extents(self):
+        projection = {"proj": "geos", "lon_0": 140.7, "h": 35785863, "a": 6378137, "b": 6356752.3}
+        b01 = AreaDefinition(
+            "b01",
+            "b01",
+            "b01",
+            projection,
+            11000,
+            11000,
+            (-5500000.035542117, -5500000.035542117, 5500000.035542117, 5500000.035542117),
+        )
+        b03 = AreaDefinition(
+            "b03",
+            "b03",
+            "b03",
+            projection,
+            22000,
+            22000,
+            (-5499999.968358421, -5499999.968358421, 5499999.968358421, 5499999.968358421),
+        )
+        b13 = AreaDefinition(
+            "b13",
+            "b13",
+            "b13",
+            projection,
+            5500,
+            5500,
+            (-5499999.901174725, -5499999.901174725, 5499999.901174725, 5499999.901174725),
+        )
+        compatibility_areas = {"frame:B01": b01, "frame:B02": b01, "frame:B03": b03, "frame:B04": b01, "frame:B13": b13}
+
+        target = h.native_compatible_common_area(
+            [b03],
+            500,
+            source_pixel_size_m=500,
+            compatibility_areas=compatibility_areas,
+        )
+
+        self.assertEqual((target.width, target.height), (22000, 22000))
+        self.assertIsNone(h.native_area_compatibility_error(compatibility_areas, target))
+
     def test_native_common_area_refines_r301_target_for_visible_band_compatibility(self):
         projection = {"proj": "geos", "lon_0": 140.7, "h": 35785863, "a": 6378137, "b": 6356752.31414}
         frame_extents = [
@@ -1254,7 +1937,7 @@ class ProcessorTests(unittest.TestCase):
             "b13",
             "b13",
             projection,
-            500,
+            499,
             500,
             (-350000.0, 3080000.0, 650000.0, 4080000.0),
         )
@@ -1312,7 +1995,12 @@ class ProcessorTests(unittest.TestCase):
 
     def test_save_retries_without_failed_overlay(self):
         scene = mock.Mock()
-        scene.save_dataset.side_effect = [ModuleNotFoundError("No module named 'pycoast'"), None]
+        def save_dataset(_dataset_name, **kwargs):
+            if "overlay" in kwargs:
+                raise ModuleNotFoundError("No module named 'pycoast'")
+            h.Path(kwargs["filename"]).write_bytes(b"saved")
+
+        scene.save_dataset.side_effect = save_dataset
         output = h.Path("out.png")
 
         result = h.save_dataset_with_optional_overlay(
@@ -1332,7 +2020,12 @@ class ProcessorTests(unittest.TestCase):
 
     def test_png_empty_image_retries_as_geotiff(self):
         scene = mock.Mock()
-        scene.save_dataset.side_effect = [ValueError("cannot write empty image"), None]
+        def save_dataset(_dataset_name, **kwargs):
+            if kwargs["writer"] == "simple_image":
+                raise ValueError("cannot write empty image")
+            h.Path(kwargs["filename"]).write_bytes(b"saved")
+
+        scene.save_dataset.side_effect = save_dataset
 
         result = h.save_dataset_with_optional_overlay(
             scene,
@@ -1348,6 +2041,273 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(scene.save_dataset.call_args_list[1].kwargs["writer"], "geotiff")
         self.assertTrue(scene.save_dataset.call_args_list[1].kwargs["filename"].endswith(".tif"))
         self.assertEqual(result, h.Path("out.tif"))
+
+    def test_rgb_geotiff_validation_rejects_constant_near_black(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "black.tif"
+            area = AreaDefinition(
+                "test",
+                "test",
+                "latlon",
+                {"proj": "longlat", "datum": "WGS84"},
+                4,
+                4,
+                (100.0, -10.0, 104.0, -6.0),
+            )
+            data = xr.DataArray(
+                da.ones((3, 4, 4), chunks=(1, 2, 2)),
+                dims=("bands", "y", "x"),
+                coords={"bands": ["R", "G", "B"]},
+                attrs={"area": area, "mode": "RGB"},
+            ).astype(h.np.uint8)
+
+            h.write_rgb_geotiff_low_ram(data, path, area)
+            degenerate, reason = h.rgb_geotiff_is_degenerate(path)
+
+        self.assertTrue(degenerate)
+        self.assertIn("near black", reason)
+
+    def test_rgb_geotiff_validation_accepts_visible_data(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "visible.tif"
+            area = AreaDefinition(
+                "test",
+                "test",
+                "latlon",
+                {"proj": "longlat", "datum": "WGS84"},
+                4,
+                4,
+                (100.0, -10.0, 104.0, -6.0),
+            )
+            base = da.from_array(
+                [
+                    [[0, 32, 64, 96], [16, 48, 80, 112], [32, 64, 96, 128], [48, 80, 112, 144]],
+                    [[20, 52, 84, 116], [36, 68, 100, 132], [52, 84, 116, 148], [68, 100, 132, 164]],
+                    [[40, 72, 104, 136], [56, 88, 120, 152], [72, 104, 136, 168], [88, 120, 152, 184]],
+                ],
+                chunks=(1, 2, 2),
+            )
+            data = xr.DataArray(
+                base,
+                dims=("bands", "y", "x"),
+                coords={"bands": ["R", "G", "B"]},
+                attrs={"area": area, "mode": "RGB"},
+            ).astype(h.np.uint8)
+
+            h.write_rgb_geotiff_low_ram(data, path, area)
+            degenerate, reason = h.rgb_geotiff_is_degenerate(path)
+
+        self.assertFalse(degenerate)
+        self.assertIn("visible", reason)
+
+    def test_direct_rgb_geotiff_writer_preserves_lazy_rgb_stats(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "b11.tif"
+            area = AreaDefinition(
+                "test",
+                "test",
+                "latlon",
+                {"proj": "longlat", "datum": "WGS84"},
+                4,
+                4,
+                (100.0, -10.0, 104.0, -6.0),
+            )
+            source = xr.DataArray(
+                da.from_array(
+                    [[190.0, 220.0, 250.0, 280.0], [200.0, 230.0, 260.0, 290.0], [210.0, 240.0, 270.0, 300.0], [215.0, 245.0, 275.0, 305.0]],
+                    chunks=(2, 2),
+                ),
+                dims=("y", "x"),
+                attrs={"area": area, "sensor": "ahi", "calibration": "brightness_temperature"},
+            )
+            rgb = h.single_band_to_rgb(source, "B11", "custom_b11_rgb")
+
+            h.write_rgb_geotiff_low_ram(rgb, path, area)
+            degenerate, _reason = h.rgb_geotiff_is_degenerate(path)
+
+        self.assertFalse(degenerate)
+
+    def test_direct_rgb_png_writer_writes_lazy_rgb_without_satpy(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "rgb.png"
+            rgb = xr.DataArray(
+                da.from_array(
+                    [
+                        [[0, 64], [128, 255]],
+                        [[10, 74], [138, 245]],
+                        [[20, 84], [148, 235]],
+                    ],
+                    chunks=(1, 2, 2),
+                ),
+                dims=("bands", "y", "x"),
+                coords={"bands": ["R", "G", "B"]},
+            ).astype(h.np.uint8)
+
+            h.write_rgb_png_low_ram(rgb, path)
+
+            from PIL import Image
+
+            with Image.open(path) as image:
+                self.assertEqual(image.mode, "RGB")
+                self.assertEqual(image.size, (2, 2))
+                self.assertEqual(image.getpixel((1, 0)), (64, 74, 84))
+
+    @mock.patch("himawari_lowram_processor.direct_overlay_writer")
+    def test_direct_png_overlay_draws_coastlines_and_borders(self, mock_writer_class):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "rgb.png"
+            area = AreaDefinition(
+                "test",
+                "test",
+                "latlon",
+                {"proj": "longlat", "datum": "WGS84"},
+                2,
+                2,
+                (100.0, -10.0, 102.0, -8.0),
+            )
+            from PIL import Image
+
+            Image.new("RGB", (2, 2), (10, 20, 30)).save(path)
+            writer = mock.Mock()
+            mock_writer_class.return_value = writer
+
+            result = h.apply_direct_overlay_to_image_file(
+                path,
+                area,
+                {
+                    "coast_dir": str(h.Path(tmp_dir) / "overlays"),
+                    "color": (0, 255, 0),
+                    "width": 1.0,
+                    "level_coast": 1,
+                    "level_borders": 1,
+                    "resolution": "l",
+                },
+            )
+
+        self.assertEqual(result, path)
+        writer.add_coastlines.assert_called_once()
+        writer.add_borders.assert_called_once()
+
+    def test_direct_rgb_writer_rejects_non_rgb_dataarray(self):
+        source = xr.DataArray(da.ones((2, 2), chunks=(1, 1)), dims=("y", "x"))
+
+        with self.assertRaisesRegex(ValueError, "Direct RGB output requires"):
+            h.prepared_rgb_dask_array(source)
+
+    def test_direct_rgb_geotiff_rejects_area_dimension_mismatch(self):
+        area = AreaDefinition(
+            "test",
+            "test",
+            "latlon",
+            {"proj": "longlat", "datum": "WGS84"},
+            3,
+            2,
+            (100.0, -10.0, 103.0, -8.0),
+        )
+        rgb = xr.DataArray(
+            da.ones((3, 2, 2), chunks=(1, 2, 2)).astype(h.np.uint8),
+            dims=("bands", "y", "x"),
+            coords={"bands": ["R", "G", "B"]},
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with self.assertRaisesRegex(ValueError, "dimensions do not match"):
+                h.write_rgb_geotiff_low_ram(rgb, h.Path(tmp_dir) / "rgb.tif", area)
+
+    @mock.patch("himawari_lowram_processor.save_dataset_with_optional_overlay")
+    @mock.patch("himawari_lowram_processor.write_rgb_png_low_ram")
+    @mock.patch("himawari_lowram_processor.resample_scene_low_ram")
+    def test_custom_rgb_png_uses_direct_writer_not_satpy_png(self, mock_resample, mock_write_png, mock_save):
+        area = AreaDefinition(
+            "test",
+            "test",
+            "latlon",
+            {"proj": "longlat", "datum": "WGS84"},
+            2,
+            2,
+            (100.0, -10.0, 102.0, -8.0),
+        )
+        attrs = {"area": area, "sensor": "ahi"}
+        bands = {
+            band: xr.DataArray(da.ones((2, 2), chunks=(2, 2)) * 50, dims=("y", "x"), attrs=attrs)
+            for band in ("B01", "B02", "B03", "B04")
+        }
+        scene = mock.MagicMock()
+        scene.__getitem__.side_effect = lambda key: bands[key]
+        resampled = mock.MagicMock()
+        resampled.__getitem__.side_effect = lambda key: bands[key]
+        mock_resample.return_value = resampled
+        output = h.Path("out.png")
+        mock_write_png.return_value = output
+        config = h.default_config()
+        config.gpu_acceleration = False
+        config.use_night_fallback = False
+
+        result = h.save_custom_composite_output(
+            scene,
+            "True Color Reproduction Image",
+            area,
+            output,
+            config,
+            is_night=False,
+            overlay_options=None,
+        )
+
+        self.assertEqual(result, output)
+        mock_write_png.assert_called_once()
+        mock_save.assert_not_called()
+
+    @mock.patch("himawari_lowram_processor.save_dataset_with_optional_overlay")
+    @mock.patch("himawari_lowram_processor.write_rgb_png_low_ram")
+    @mock.patch("himawari_lowram_processor.build_gpu_custom_composite")
+    @mock.patch("himawari_lowram_processor.resample_scene_low_ram")
+    def test_gpu_flat_true_color_png_uses_gpu_block_and_direct_writer(
+        self,
+        mock_resample,
+        mock_build_gpu,
+        mock_write_png,
+        mock_save,
+    ):
+        area = AreaDefinition(
+            "test",
+            "test",
+            "latlon",
+            {"proj": "longlat", "datum": "WGS84"},
+            2,
+            2,
+            (100.0, -10.0, 102.0, -8.0),
+        )
+        rgb = xr.DataArray(
+            da.ones((3, 2, 2), chunks=(1, 2, 2)).astype(h.np.uint8),
+            dims=("bands", "y", "x"),
+            coords={"bands": ["R", "G", "B"]},
+            attrs={"area": area, "mode": "RGB", "name": "gpu_rgb"},
+        )
+        scene = mock.MagicMock()
+        resampled = mock.MagicMock()
+        mock_resample.return_value = resampled
+        mock_build_gpu.return_value = ("gpu_rgb", rgb)
+        output = h.Path("out.png")
+        mock_write_png.return_value = output
+        config = h.default_config()
+        config.map_view = "flat"
+        config.gpu_acceleration = True
+        config.use_night_fallback = False
+
+        result = h.save_custom_composite_output(
+            scene,
+            "True Color Reproduction Image",
+            area,
+            output,
+            config,
+            is_night=False,
+            overlay_options=None,
+        )
+
+        self.assertEqual(result, output)
+        mock_build_gpu.assert_called_once_with(resampled, "True Color Reproduction Image", config)
+        mock_write_png.assert_called_once_with(rgb, output)
+        mock_save.assert_not_called()
 
     def test_require_module_reports_missing_dependency(self):
         with self.assertRaises(RuntimeError):
@@ -1370,7 +2330,7 @@ class ProcessorTests(unittest.TestCase):
         start = h.datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
         area = mock.Mock(width=22000, height=22000)
 
-        with self.assertRaisesRegex(RuntimeError, "Timelapse frames would be too large"):
+        with self.assertRaisesRegex(RuntimeError, "Timelapse frame target"):
             h.validate_runtime_dependencies(config, info, start, area)
 
     def test_pyspectral_quality_handling(self):
@@ -1434,7 +2394,7 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(datasets, ["true_color_reproduction", "B03", "B13"])
 
     @mock.patch("himawari_lowram_processor.cleanup_paths")
-    @mock.patch("himawari_lowram_processor.save_dataset_with_optional_overlay")
+    @mock.patch("himawari_lowram_processor.write_rgb_png_low_ram")
     @mock.patch("himawari_lowram_processor.resample_scene_low_ram")
     @mock.patch("himawari_lowram_processor.download_segments")
     @mock.patch("himawari_lowram_processor.Scene")
@@ -1480,9 +2440,58 @@ class ProcessorTests(unittest.TestCase):
 
         self.assertEqual(result, h.Path("out.png"))
         mock_save.assert_called_once()
-        self.assertEqual(mock_save.call_args.args[1], h.CUSTOM_DATASET_NAMES["True Color Reproduction Image"])
-        self.assertFalse(mock_save.call_args.kwargs["enhance"])
         self.assertTrue(any("custom low-RAM fallback" in message for message, _current, _total in events))
+
+    @mock.patch("himawari_lowram_processor.cleanup_paths")
+    @mock.patch("himawari_lowram_processor.native_area_compatibility_error")
+    @mock.patch("himawari_lowram_processor.write_rgb_png_low_ram")
+    @mock.patch("himawari_lowram_processor.resample_scene_low_ram")
+    @mock.patch("himawari_lowram_processor.download_segments")
+    @mock.patch("himawari_lowram_processor.Scene")
+    def test_flat_map_custom_fallback_skips_native_compatibility_check(
+        self,
+        mock_scene_class,
+        mock_download,
+        mock_resample,
+        mock_save,
+        mock_native_compatibility,
+        _mock_cleanup,
+    ):
+        original_scene = mock.Mock()
+        original_scene.load.side_effect = KeyError(
+            "\"No dataset matching 'DataQuery(name='true_color_reproduction')' found\""
+        )
+        attrs = {"area": h.flat_map_area(h.default_config()), "sensor": "ahi"}
+        bands = {
+            band: xr.DataArray(da.ones((4, 4), chunks=(2, 2)) * 50, dims=("y", "x"), attrs=attrs)
+            for band in ("B01", "B02", "B03", "B04")
+        }
+        fallback_scene = mock.MagicMock()
+        fallback_scene.__getitem__.side_effect = lambda key: bands[key]
+        fallback_scene.__setitem__.return_value = None
+        fallback_scene.load.return_value = None
+        mock_scene_class.side_effect = [original_scene, fallback_scene]
+        mock_resample.return_value = fallback_scene
+        mock_save.return_value = h.Path("out.png")
+        mock_download.return_value = [h.Path(f"segment-{idx}.dat") for idx in range(40)]
+        config = h.default_config()
+        config.map_view = "flat"
+        config.composite_choice = "True Color Reproduction Image"
+        config.use_night_fallback = False
+        info = h.parse_url(h.USER_URL)
+        dt = h.datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
+        master_area = h.flat_map_area(config)
+
+        result = h.process_frame(dt, info, master_area, 0, 1, config=config)
+
+        self.assertEqual(result, h.Path("out.png"))
+        mock_native_compatibility.assert_not_called()
+        mock_resample.assert_called_once_with(
+            fallback_scene,
+            master_area,
+            config,
+            datasets=h.required_bands("True Color Reproduction Image", False, config.night_fallback_mode),
+        )
 
     @mock.patch("himawari_lowram_processor.cleanup_paths")
     @mock.patch("himawari_lowram_processor.save_custom_satpy_missing_dataset_fallback")
@@ -1747,6 +2756,16 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(data, b"onetwo")
         self.assertTrue(decompressor.eof)
 
+    def test_streaming_bz2_writes_concatenated_streams_without_buffering(self):
+        decompressor = bz2.BZ2Decompressor()
+        payload = bz2.compress(b"one") + bz2.compress(b"two")
+        output = io.BytesIO()
+
+        decompressor = h.write_decompressed_bz2_chunk(decompressor, payload, output)
+
+        self.assertEqual(output.getvalue(), b"onetwo")
+        self.assertTrue(decompressor.eof)
+
     def test_download_segments_honors_canceled_event(self):
         cancel_event = threading.Event()
         cancel_event.set()
@@ -1808,12 +2827,31 @@ class ProcessorTests(unittest.TestCase):
             run_id = h.stable_run_id(config, info, steps)
             manifest = h.build_timelapse_manifest(run_id, config, info, steps, frame_dir)
             frame_path = frame_dir / "frame_0000.png"
-            frame_path.parent.mkdir(parents=True)
-            frame_path.write_text("done")
+            write_test_png(frame_path)
             h.update_manifest_frame(manifest, 0, frame_path, "complete")
 
             self.assertEqual(h.resume_frame_path(manifest, 0), frame_path)
             self.assertIsNone(h.resume_frame_path(manifest, 1))
+
+    def test_resume_frame_path_rejects_corrupt_nonempty_png(self):
+        manifest = {"frames": [{"index": 0, "path": ""}]}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            frame_path = h.Path(tmp_dir) / "frame_0000.png"
+            frame_path.write_bytes(b"not a png")
+            manifest["frames"][0]["path"] = str(frame_path)
+
+            self.assertIsNone(h.resume_frame_path(manifest, 0))
+
+    def test_stable_run_id_changes_for_flat_map_settings(self):
+        config = h.default_config()
+        config.mode = "Timelapse"
+        info = h.parse_url(config.user_url)
+        steps = [h.datetime(2024, 7, 25, 4, 0)]
+        first = h.stable_run_id(config, info, steps)
+        config.map_view = "flat"
+        second = h.stable_run_id(config, info, steps)
+
+        self.assertNotEqual(first, second)
 
     def test_load_or_create_timelapse_manifest_reuses_existing(self):
         config = h.default_config()
@@ -1834,11 +2872,9 @@ class ProcessorTests(unittest.TestCase):
 
     @mock.patch("himawari_lowram_processor.cleanup_paths")
     def test_assemble_timelapse_deletes_frame_paths_when_configured(self, mock_cleanup):
-        writer = mock.Mock()
-        writer.__enter__ = mock.Mock(return_value=writer)
-        writer.__exit__ = mock.Mock(return_value=None)
+        writer, get_writer = fake_imageio_writer_creating_file()
         fake_imageio = mock.Mock()
-        fake_imageio.get_writer.return_value = writer
+        fake_imageio.get_writer.side_effect = get_writer
         fake_imageio.imread.side_effect = ["frame-a", "frame-b"]
         config = h.default_config()
         config.mode = "Timelapse"
@@ -1858,11 +2894,9 @@ class ProcessorTests(unittest.TestCase):
 
     @mock.patch("himawari_lowram_processor.cleanup_paths")
     def test_assemble_timelapse_keeps_frame_paths_when_configured(self, mock_cleanup):
-        writer = mock.Mock()
-        writer.__enter__ = mock.Mock(return_value=writer)
-        writer.__exit__ = mock.Mock(return_value=None)
+        writer, get_writer = fake_imageio_writer_creating_file()
         fake_imageio = mock.Mock()
-        fake_imageio.get_writer.return_value = writer
+        fake_imageio.get_writer.side_effect = get_writer
         fake_imageio.imread.return_value = "frame"
         config = h.default_config()
         config.mode = "Timelapse"
@@ -1879,11 +2913,9 @@ class ProcessorTests(unittest.TestCase):
 
     @mock.patch("himawari_lowram_processor.cleanup_paths")
     def test_assemble_timelapse_falls_back_to_gif_without_ffmpeg(self, _mock_cleanup):
-        writer = mock.Mock()
-        writer.__enter__ = mock.Mock(return_value=writer)
-        writer.__exit__ = mock.Mock(return_value=None)
+        _writer, get_writer = fake_imageio_writer_creating_file()
         fake_imageio = mock.Mock()
-        fake_imageio.get_writer.return_value = writer
+        fake_imageio.get_writer.side_effect = get_writer
         fake_imageio.imread.return_value = "frame"
         config = h.default_config()
         config.mode = "Timelapse"
@@ -2017,7 +3049,7 @@ class ProcessorTests(unittest.TestCase):
 
         mock_common_area.assert_not_called()
         area = mock_validate.call_args.args[3]
-        self.assertEqual((area.height, area.width), (2400, 2400))
+        self.assertEqual((area.height, area.width), (3018, 2400))
         self.assertEqual(mock_process.call_args.args[2].area_id, "himawari_flat_map")
 
     @mock.patch("himawari_lowram_processor.process_frame")
@@ -2127,8 +3159,7 @@ class ProcessorTests(unittest.TestCase):
                 run_id = h.stable_run_id(config, info, steps)
                 frame_dir = h.timelapse_frame_dir(run_id, h.OUTPUT_DIR)
                 frame = frame_dir / "frame_0000.png"
-                frame.parent.mkdir(parents=True)
-                frame.write_text("done")
+                write_test_png(frame)
                 manifest = h.build_timelapse_manifest(run_id, config, info, steps, frame_dir)
                 h.update_manifest_frame(manifest, 0, frame, "complete")
                 h.save_timelapse_manifest(h.timelapse_manifest_path(run_id, h.OUTPUT_DIR), manifest)
@@ -2202,6 +3233,41 @@ class ProcessorTests(unittest.TestCase):
 
         self.assertIn("No processing error", app.root.clipboard)
 
+    @mock.patch("himawari_lowram_processor.messagebox.showwarning")
+    @mock.patch("himawari_lowram_processor.os.startfile")
+    def test_gui_open_missing_path_warns_and_falls_back_to_output_folder(self, mock_startfile, mock_warning):
+        app = object.__new__(h.HimawariProcessorApp)
+        app._append_log = mock.Mock()
+        original_output = h.OUTPUT_DIR
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                h.OUTPUT_DIR = h.Path(tmp_dir) / "outputs"
+                missing_output = h.Path(tmp_dir) / "deleted" / "out.png"
+
+                h.HimawariProcessorApp._open_path(app, missing_output)
+
+                mock_warning.assert_called_once()
+                mock_startfile.assert_called_once_with(str(h.OUTPUT_DIR))
+                self.assertTrue(h.OUTPUT_DIR.exists())
+                self.assertTrue(any("Requested path is unavailable" in call.args[0] for call in app._append_log.call_args_list))
+        finally:
+            h.OUTPUT_DIR = original_output
+
+    @mock.patch("himawari_lowram_processor.messagebox.showwarning")
+    @mock.patch("himawari_lowram_processor.os.startfile", side_effect=OSError("cannot open"))
+    def test_gui_open_existing_path_reports_startfile_failure(self, mock_startfile, mock_warning):
+        app = object.__new__(h.HimawariProcessorApp)
+        app._append_log = mock.Mock()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            target = h.Path(tmp_dir)
+            result = h.HimawariProcessorApp._open_existing_path(app, target, "Test folder")
+
+        self.assertFalse(result)
+        mock_startfile.assert_called_once_with(str(target))
+        mock_warning.assert_called_once()
+        self.assertTrue(any("Could not open test folder" in call.args[0] for call in app._append_log.call_args_list))
+
     def test_gui_mouse_wheel_units_supports_common_platform_events(self):
         self.assertEqual(h.HimawariProcessorApp._mouse_wheel_units(FakeEvent(delta=120)), -1)
         self.assertEqual(h.HimawariProcessorApp._mouse_wheel_units(FakeEvent(delta=-120)), 1)
@@ -2234,6 +3300,27 @@ class ProcessorTests(unittest.TestCase):
         self.assertNotIn("self.main_pane.add(notebook_pane, weight=1, minsize=", source)
         self.assertNotIn("self.main_pane.add(self.log_frame, weight=1, minsize=", source)
 
+    def test_gui_view_mode_advanced_restores_and_selects_advanced_tab(self):
+        app = object.__new__(h.HimawariProcessorApp)
+        app.advanced_tab_id = "advanced-tab"
+        app.notebook = FakeNotebook()
+        app.ui_mode_var = FakeVar("Advanced")
+
+        h.HimawariProcessorApp._refresh_ui_mode(app)
+
+        self.assertEqual(app.notebook.added, [("advanced-tab", {"text": "Advanced"})])
+        self.assertEqual(app.notebook.selected, "advanced-tab")
+
+    def test_gui_view_mode_simple_hides_advanced_tab(self):
+        app = object.__new__(h.HimawariProcessorApp)
+        app.advanced_tab_id = "advanced-tab"
+        app.notebook = FakeNotebook()
+        app.ui_mode_var = FakeVar("Simple")
+
+        h.HimawariProcessorApp._refresh_ui_mode(app)
+
+        self.assertEqual(app.notebook.hidden, ["advanced-tab"])
+
     def test_gui_running_state_disables_mutable_controls(self):
         app = object.__new__(h.HimawariProcessorApp)
         app.start_button = FakeWidget()
@@ -2248,6 +3335,9 @@ class ProcessorTests(unittest.TestCase):
         app.auto_fix_button = FakeWidget()
         app.latest_url_button = FakeWidget()
         app.scan_browser_button = FakeWidget()
+        app.local_files_button = FakeWidget()
+        app.safe_perf_button = FakeWidget()
+        app.best_perf_button = FakeWidget()
         app.overlay_check_button = FakeWidget()
         app.open_last_button = FakeWidget()
         app.copy_paths_button = FakeWidget()
@@ -2273,6 +3363,8 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(app.auto_fix_button.configured["state"], "disabled")
         self.assertEqual(app.latest_url_button.configured["state"], "disabled")
         self.assertEqual(app.scan_browser_button.configured["state"], "disabled")
+        self.assertEqual(app.safe_perf_button.configured["state"], "disabled")
+        self.assertEqual(app.best_perf_button.configured["state"], "disabled")
         self.assertEqual(app.overlay_check_button.configured["state"], "disabled")
         self.assertEqual(app.copy_error_button.configured["state"], "disabled")
         self.assertEqual(app.custom_preset_box.configured["state"], "disabled")
@@ -2285,6 +3377,8 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(app.choose_temp_button.configured["state"], "normal")
         self.assertEqual(app.latest_url_button.configured["state"], "normal")
         self.assertEqual(app.scan_browser_button.configured["state"], "normal")
+        self.assertEqual(app.safe_perf_button.configured["state"], "normal")
+        self.assertEqual(app.best_perf_button.configured["state"], "normal")
 
     def test_gui_rerun_recent_settings_loads_saved_config(self):
         app = object.__new__(h.HimawariProcessorApp)
@@ -2323,9 +3417,15 @@ class ProcessorTests(unittest.TestCase):
 
         self.assertEqual(app.root.clipboard, "out.png")
 
+    @mock.patch("himawari_lowram_processor.os.startfile")
     @mock.patch("himawari_lowram_processor.messagebox.showwarning")
     @mock.patch("himawari_lowram_processor.has_module", return_value=True)
-    def test_gui_overlay_check_creates_overlay_folder(self, _mock_has_module, mock_warning):
+    def test_gui_overlay_check_creates_overlay_folder_without_opening_it(
+        self,
+        _mock_has_module,
+        mock_warning,
+        mock_startfile,
+    ):
         app = object.__new__(h.HimawariProcessorApp)
         app._append_log = mock.Mock()
         original_project = h.PROJECT_DIR
@@ -2338,6 +3438,8 @@ class ProcessorTests(unittest.TestCase):
                 self.assertTrue((h.Path(tmp_dir) / "overlays").exists())
                 mock_warning.assert_called_once()
                 self.assertTrue(app._append_log.called)
+                self.assertTrue(any("Overlay folder:" in call.args[0] for call in app._append_log.call_args_list))
+                mock_startfile.assert_not_called()
         finally:
             h.PROJECT_DIR = original_project
 
@@ -2370,6 +3472,7 @@ class ProcessorTests(unittest.TestCase):
         app.interval_var = FakeVar(str(config.interval_minutes))
         app.fps_var = FakeVar(str(config.fps))
         app.auto_download_var = FakeVar(config.auto_download)
+        app.gpu_acceleration_var = FakeVar(config.gpu_acceleration)
         app.night_fallback_var = FakeVar(config.use_night_fallback)
         app.night_fallback_mode_var = FakeVar(config.night_fallback_mode)
         app.download_workers_var = FakeVar(str(config.download_workers))
@@ -2394,6 +3497,146 @@ class ProcessorTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "Flat map min latitude must be finite"):
             h.HimawariProcessorApp._read_config(app)
+
+    @mock.patch("himawari_lowram_processor.system_performance_profile")
+    def test_gui_applies_performance_recommendation_to_fields(self, mock_profile):
+        app = object.__new__(h.HimawariProcessorApp)
+        app.download_workers_var = FakeVar("")
+        app.dask_workers_var = FakeVar("")
+        app.chunk_var = FakeVar("")
+        app.ram_limit_var = FakeVar("")
+        app._update_setup_status = mock.Mock()
+        app._write_current_settings = mock.Mock()
+        app._append_log = mock.Mock()
+        mock_profile.return_value = h.SystemPerformanceProfile(
+            total_ram_gb=64.0,
+            available_ram_gb=32.0,
+            cpu_count=12,
+            cpu_percent=10.0,
+        )
+
+        h.HimawariProcessorApp._apply_performance_recommendation(app, "best_performance")
+
+        self.assertEqual(app.download_workers_var.get(), "4")
+        self.assertEqual(app.dask_workers_var.get(), "2")
+        self.assertEqual(app.chunk_var.get(), "128MiB")
+        self.assertEqual(app.ram_limit_var.get(), "16.0")
+        app._update_setup_status.assert_called_once()
+        app._write_current_settings.assert_called_once()
+        self.assertTrue(app._append_log.called)
+
+    @mock.patch("himawari_lowram_processor.messagebox.askyesno", return_value=False)
+    @mock.patch("himawari_lowram_processor.gpu_support_status")
+    def test_gui_gpu_toggle_reverts_when_support_missing(self, mock_status, mock_ask):
+        app = object.__new__(h.HimawariProcessorApp)
+        app.gpu_acceleration_var = FakeVar(True)
+        app._update_setup_status = mock.Mock()
+        app._write_current_settings = mock.Mock()
+        app._append_log = mock.Mock()
+        app._open_gpu_environment_fix = mock.Mock()
+        mock_status.return_value = h.GpuSupportStatus(False, "missing")
+
+        h.HimawariProcessorApp._toggle_gpu_acceleration(app)
+
+        self.assertFalse(app.gpu_acceleration_var.get())
+        app._open_gpu_environment_fix.assert_not_called()
+        mock_ask.assert_called_once()
+
+    @mock.patch("himawari_lowram_processor.gpu_support_status")
+    def test_gui_gpu_toggle_accepts_ready_support(self, mock_status):
+        app = object.__new__(h.HimawariProcessorApp)
+        app.gpu_acceleration_var = FakeVar(True)
+        app._update_setup_status = mock.Mock()
+        app._write_current_settings = mock.Mock()
+        app._append_log = mock.Mock()
+        mock_status.return_value = h.GpuSupportStatus(True, "ready", device_name="Test GPU", device_count=1)
+
+        h.HimawariProcessorApp._toggle_gpu_acceleration(app)
+
+        self.assertTrue(app.gpu_acceleration_var.get())
+        app._update_setup_status.assert_called_once()
+        app._write_current_settings.assert_called_once()
+        app._append_log.assert_called_once()
+
+    @mock.patch("himawari_lowram_processor.messagebox.showinfo")
+    @mock.patch("himawari_lowram_processor.import_local_hsd_segments")
+    def test_gui_local_import_updates_source_and_offline_mode(self, mock_import, mock_info):
+        app = object.__new__(h.HimawariProcessorApp)
+        result = h.LocalImportResult(
+            sat_id="HS_H09",
+            timestamp="20240725_0400",
+            area="FLDK",
+            total_segments=10,
+            imported_paths=(h.Path("cached.dat"),),
+            reused_paths=(),
+            bands=("B13",),
+        )
+        mock_import.return_value = result
+        app.url_var = FakeVar("")
+        app.auto_download_var = FakeVar(True)
+        app.mode_var = FakeVar("Timelapse")
+        app.status_var = FakeVar("")
+        app._update_setup_status = mock.Mock(return_value=h.SetupStatus(True, (), (), ()))
+        app._write_current_settings = mock.Mock()
+        app._append_log = mock.Mock()
+
+        h.HimawariProcessorApp._import_local_hsd_files(app, ["file.dat"])
+
+        self.assertIn("AHI-L1b-FLDK", app.url_var.get())
+        self.assertFalse(app.auto_download_var.get())
+        self.assertEqual(app.mode_var.get(), "Single Image")
+        app._update_setup_status.assert_called_once()
+        app._write_current_settings.assert_called_once()
+        mock_info.assert_called_once()
+
+    def test_gui_optional_drop_target_skips_without_tkinterdnd2(self):
+        app = object.__new__(h.HimawariProcessorApp)
+        app.pending_log_messages = []
+        app.local_drop_label = mock.Mock()
+
+        original_import = __import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "tkinterdnd2":
+                raise ImportError("missing")
+            return original_import(name, *args, **kwargs)
+
+        with mock.patch("builtins.__import__", side_effect=fake_import):
+            h.HimawariProcessorApp._setup_optional_local_drop_target(app)
+
+        app.local_drop_label.configure.assert_called_once()
+        self.assertIn("Local Files", app.local_drop_label.configure.call_args.kwargs["text"])
+
+    def test_gui_optional_drop_target_registers_when_tkinterdnd2_available(self):
+        app = object.__new__(h.HimawariProcessorApp)
+        app.local_drop_label = mock.Mock()
+        app._handle_local_file_drop = mock.Mock()
+        app._append_log = mock.Mock()
+        fake_module = mock.Mock(DND_FILES="DND_Files")
+
+        original_import = __import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "tkinterdnd2":
+                return fake_module
+            return original_import(name, *args, **kwargs)
+
+        with mock.patch("builtins.__import__", side_effect=fake_import):
+            h.HimawariProcessorApp._setup_optional_local_drop_target(app)
+
+        app.local_drop_label.drop_target_register.assert_called_once_with("DND_Files")
+        app.local_drop_label.dnd_bind.assert_called_once_with("<<Drop>>", app._handle_local_file_drop)
+
+    def test_gui_flushes_pending_log_messages_after_log_widget_exists(self):
+        app = object.__new__(h.HimawariProcessorApp)
+        app.pending_log_messages = ["queued one", "queued two"]
+        app.log_text = mock.Mock()
+
+        h.HimawariProcessorApp._flush_pending_log_messages(app)
+
+        self.assertEqual(app.pending_log_messages, [])
+        inserted = [call.args[1] for call in app.log_text.insert.call_args_list]
+        self.assertEqual(inserted, ["queued one\n", "queued two\n"])
 
 
 if __name__ == "__main__":

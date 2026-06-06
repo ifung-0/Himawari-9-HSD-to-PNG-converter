@@ -2,15 +2,24 @@
 
 This project downloads Himawari-9 AHI-L1b HSD segments from NOAA AWS S3,
 processes them with Satpy, and writes either a single PNG or a GIF/MP4
-timelapse. The pipeline is designed for a hard 10 GiB memory budget.
+timelapse. The pipeline is designed for a conservative 10 GiB memory budget,
+with defaults that favor lower peak RAM over speed.
+
+## Which Entry Point Should I Use?
+
+- `run_gui.bat` / `himawari_lowram_processor.py`: the main HSD processor.
+  Use this for normal Himawari-9 AHI HSD downloads, true color, B13 infrared,
+  flat-map output, overlays, single images, and timelapses.
+- `run_cli.bat` / `himawari_cli.py`: the terminal interface for the same HSD
+  processor. Use this for repeatable commands or scripted runs.
 
 ## Why This Version Is Low RAM
 
 - Downloads are streamed and decompressed incrementally.
 - Active downloads can be canceled from the GUI; partial `.part` files are
   cleaned up when cancellation is requested.
-- Dask chunks default to `64MiB`.
-- Download concurrency is capped to 4 workers.
+- Dask chunks default to `32MiB`; `16MiB` is available for slower, lower-RAM runs.
+- Download concurrency defaults to 2 workers and is capped to 4 workers.
 - Dask execution is capped to 1 worker by default, with a hard max of 2.
 - Custom composites use lazy `xarray`/Dask operations.
 - The old full-frame `np.array(...values)` and percentile colorization paths
@@ -21,8 +30,8 @@ timelapse. The pipeline is designed for a hard 10 GiB memory budget.
   selected product, with compatibility checks across the required bands.
 - Set `IMAGE_FORMAT = "tif"` to use Satpy/rasterio chunked GeoTIFF writing for
   very large full-disk outputs.
-- Full-disk 500 m PNG requests are automatically switched to GeoTIFF because
-  the PNG/Pillow writer has to assemble one huge image in memory.
+- Large PNG requests are automatically switched to GeoTIFF because the
+  PNG/Pillow writer has to assemble one huge image in memory.
 
 ## Usage
 
@@ -45,11 +54,29 @@ python check_environment.py --fix
 
 The checker verifies the active Python executable, installed package versions,
 Satpy's AHI reader/composite configuration, `pyspectral`, and GeoTIFF/overlay
-helpers. With `--fix`, it upgrades packages from `requirements.txt` using the
-current Python and installs the overlay data used by border lines. With
-`--auto`, it does the same repair automatically and, if the active Python is
-unsupported, tries to create/use a local `.venv` with Python 3.12 or 3.13 from
-the Windows `py` launcher.
+helpers, including the optional `tkinterdnd2` package used by local file
+drag/drop. With `--fix`, it upgrades packages from `requirements.txt` using the
+current Python, installs the overlay data used by border lines, and archives
+confirmed obsolete root-level helper programs into `cleanup_archive/`. The
+archive is reversible and ignored by git; no cleanup path deletes files. Use
+`--archive-unused` to run only that archive step, or `--no-archive-unused` with
+`--fix`/`--auto` to skip it. With `--auto`, the checker does the same repair
+automatically and, if the active Python is unsupported, tries to create/use a
+local `.venv` with Python 3.12 or 3.13 from the Windows `py` launcher.
+
+Experimental GPU acceleration is optional and NVIDIA/CUDA-only in this version.
+It uses CuPy for compatible custom composite math after Satpy has loaded and
+resampled on the CPU, then returns data to CPU chunks before saving. Speedups
+depend on the product and output size; HSD reading, Pyresample reprojection, and
+PNG/GeoTIFF writing remain CPU paths. GPU mode is intentionally limited to
+`True Color Reproduction Image` and `True Color RGB (Enhanced)` in this build;
+other products are blocked during setup/preflight so the run does not continue
+with misleading settings. Install and check GPU support separately:
+
+```powershell
+python check_environment.py --gpu --plain
+python check_environment.py --gpu-fix
+```
 
 ## First Thing To Try
 
@@ -62,7 +89,7 @@ python check_environment.py --plain
 python check_environment.py --auto
 ```
 
-Expected current version: `2026.05.26.1`. If `--version` shows an older value,
+Expected current version: `2026.06.05.1`. If `--version` shows an older value,
 the machine is not running the latest update. If `--plain` reports a different
 Python than the one used to launch the GUI, use `run_gui.bat`, `run_cli.bat`,
 or `check_environment.bat` so the same Python environment is selected.
@@ -81,7 +108,13 @@ Dask/download worker caps, output filename templates, resampling, temp folders,
 overlays, and custom preset management.
 Use `Latest FLDK` to fill the URL from the most recent NOAA AWS full-disk scan
 the app can find, or `Choose Scan` to pick a recent FLDK scan and band from a
-bounded NOAA AWS listing. Safe presets are available for a balanced true-color
+bounded NOAA AWS listing. Use `Local Files...` to import already-downloaded
+Himawari HSD `.DAT` or `.DAT.bz2` segment files for offline processing; the app
+streams compressed files into the normal temp cache, disables auto-download, and
+processes the cached scan through the same low-RAM pipeline. Drag/drop accepts
+the same files when `tkinterdnd2` is installed; otherwise the `Local Files...`
+button remains available. Safe presets are
+available for a balanced true-color
 image, a quick B13 infrared check, and a lower-RAM B13 timelapse. Custom presets
 can save and reload your current settings without changing the locked safe
 presets.
@@ -96,24 +129,39 @@ processing is blocked when border lines are enabled but those files are missing.
 The progress bar advances while segment downloads and timelapse frame assembly
 run, the phase/status strip summarizes the current stage, and the live log panel
 shows memory checkpoints and processing details.
+In Advanced > Performance, `Safe Mode` and `Best Performance` inspect current
+CPU/RAM headroom and update worker, chunk-size, and RAM-limit settings without
+starting a run.
 Night fallback now defaults to `hybrid` for true-color products: the sunlit side
 stays true color while the dark side is filled with B13 infrared grayscale, with
 a soft transition near the terminator. Choose `whole_frame_ir` if you prefer the
 older behavior of switching the entire frame to infrared when a scene is dark.
 Advanced users can enable `flat` map view to reproject the output to a bounded
-lat/lon map. The default flat extent is lat `-60..60`, lon `80E..200E`, at
-`0.05` degrees; native disk output remains the low-RAM default.
+Web Mercator map, the same projection style used by Google Maps and OpenStreetMap,
+while keeping the satellite image as the output. The default flat extent is lat
+`-60..60`, lon `80E..200E`, at approximately `0.05` degrees per pixel at the
+equator; this creates a default target around `2400x3018` pixels because Web
+Mercator stretches latitude. Flat mode does not add Google labels, roads, map
+tiles, or basemap imagery; the existing optional coast/country borders are the
+only map overlay. Native disk output remains the low-RAM default.
 Use `Stop Processing` to cancel the current run, including active segment
 downloads and pending frames. `Check Env` runs the diagnostic checker inline;
 `Quick Fix` repairs the current Python in a separate console; `Auto Fix` uses
 the stronger `.venv` repair path for wrong or unsupported Python installs.
+Advanced > Performance also has `Use GPU (Experimental)` and `GPU Fix`; the
+button installs optional packages from `requirements-gpu.txt` instead of the
+normal CPU requirements file.
 Before processing, the GUI shows a run summary with source, frames, bands, segment estimate, output
-behavior, warnings, timelapse resume details, and blocking setup errors. After
-completion, use `Open Last` and `Copy Paths`; after a failure, use `Copy Error`
-for a support report. The `Recent Runs` tab persists completed, canceled, and
-failed GUI runs, including outputs, manifest/frame locations, re-run settings,
-copy/open actions, and a safe preview for normal image outputs. Very large
-images, GeoTIFFs, MP4s, and unsupported files show metadata only.
+behavior, warnings, timelapse resume details, and blocking setup errors. The
+same setup/preflight checks now catch unwritable output/temp folders, missing
+offline cache segments, unsupported GPU/product combinations, broken border
+overlay setup, invalid flat-map bounds, and unsafe output sizes before expensive
+downloads or Satpy processing start. After completion, use `Open Last` and
+`Copy Paths`; after a failure, use `Copy Error` for a support report. The
+`Recent Runs` tab persists completed, canceled, and failed GUI runs, including
+outputs, manifest/frame locations, re-run settings, copy/open actions, and a
+safe preview for normal image outputs. Very large images, GeoTIFFs, MP4s, and
+unsupported files show metadata only.
 
 Launch the terminal interface:
 
@@ -131,7 +179,12 @@ flags for repeatable commands:
 python himawari_cli.py --run --composite "B13 (Infrared Window)" --mode "Single Image"
 python himawari_cli.py --run --composite "True Color Reproduction Image" --night-fallback-mode hybrid
 python himawari_cli.py --run --map-view flat --flat-min-lat -60 --flat-max-lat 60 --flat-min-lon 80 --flat-max-lon 200 --flat-resolution-deg 0.05
+python himawari_cli.py --run --gpu-acceleration yes --composite "True Color Reproduction Image"
 ```
+
+If you enable GPU acceleration from the CLI, choose one of the two supported
+true-color products. For B13, B11/SO2, and other single-band or specialty RGB
+products, leave `--gpu-acceleration no` so the normal CPU low-RAM path is used.
 
 Windows helper launchers prefer `.venv\Scripts\python.exe` when it exists,
 then `py -3.13`, `py -3.12`, and finally `python`.
@@ -143,10 +196,10 @@ python himawari_cli.py --version
 python check_environment.py --plain
 ```
 
-Current fixed build: `2026.05.26.1`. Processing logs should include:
+Current fixed build: `2026.06.05.1`. Processing logs should include:
 
 ```text
-App version: 2026.05.26.1
+App version: 2026.06.05.1
 ```
 
 For official-looking true color and true color reproduction, keep the
@@ -217,7 +270,7 @@ by the checker when installing or launching the app.
 Symptom: a friend says the fix is installed, but logs do not show:
 
 ```text
-App version: 2026.05.26.1
+App version: 2026.06.05.1
 ```
 
 Likely cause: their folder is still on an old commit, or they downloaded a ZIP
@@ -380,6 +433,11 @@ Quick fix if GeoTIFF output fails:
 ```powershell
 python check_environment.py --fix
 ```
+
+Custom RGB outputs, including single-band flat maps such as B11/SO2, are written
+with the app's chunked rasterio path and checked after saving. If an RGB GeoTIFF
+is constant or near-black, the run fails instead of reporting a bad file as
+saved.
 
 Use `Single Image` for full-disk 500 m true color. Use smaller Target areas or
 coarser products for PNG workflows.

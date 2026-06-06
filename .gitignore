@@ -8,6 +8,7 @@ venv/
 
 outputs/
 temp/
+cleanup_archive/
 himawari_gui_settings.json
 himawari_recent_runs.json
 himawari_custom_presets.json

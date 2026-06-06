@@ -1,4 +1,6 @@
 import unittest
+import json
+import warnings
 import zipfile
 from io import StringIO
 from pathlib import Path
@@ -64,6 +66,14 @@ class EnvironmentCheckTests(unittest.TestCase):
         self.assertIn("--upgrade", command)
         self.assertEqual(command[-2], "-r")
         self.assertEqual(command[-1], str(env.REQUIREMENTS_FILE))
+
+    def test_gpu_pip_install_command_uses_gpu_requirements(self):
+        command = env.gpu_pip_install_command(upgrade=True)
+
+        self.assertEqual(command[0], env.sys.executable)
+        self.assertIn("--upgrade", command)
+        self.assertEqual(command[-2], "-r")
+        self.assertEqual(command[-1], str(env.GPU_REQUIREMENTS_FILE))
 
     @mock.patch("check_environment.subprocess.run")
     def test_check_pip_available_reports_failure(self, mock_run):
@@ -141,6 +151,36 @@ class EnvironmentCheckTests(unittest.TestCase):
         self.assertFalse(result.critical)
         self.assertIn("module is not importable", result.detail)
 
+    @mock.patch("check_environment.importlib.util.find_spec", return_value=object())
+    @mock.patch("check_environment.package_version", return_value="1.0")
+    def test_check_package_suppresses_known_cupy_cuda_path_warning(self, _mock_version, _mock_spec):
+        package = env.PackageCheck("demo", "demo-dist", "testing")
+
+        def noisy_import(_name):
+            warnings.warn_explicit(
+                "CUDA path could not be detected. Set CUDA_PATH environment variable if CuPy fails to load.",
+                UserWarning,
+                "cupy/_environment.py",
+                284,
+                module="cupy._environment",
+            )
+            return object()
+
+        with mock.patch("check_environment.importlib.import_module", side_effect=noisy_import):
+            with warnings.catch_warnings(record=True) as captured:
+                warnings.simplefilter("always")
+                result = env.check_package(package, {})
+
+        self.assertTrue(result.ok)
+        self.assertEqual(captured, [])
+
+    def test_tkinterdnd2_is_optional_drag_drop_check(self):
+        package = next(package for package in env.PACKAGE_CHECKS if package.import_name == "tkinterdnd2")
+
+        self.assertFalse(package.critical)
+        self.assertEqual(package.distribution_name, "tkinterdnd2")
+        self.assertIn("drag/drop", package.purpose)
+
     def test_has_critical_failures_ignores_optional_warnings(self):
         results = [
             env.CheckResult("optional", False, "missing", critical=False),
@@ -155,17 +195,134 @@ class EnvironmentCheckTests(unittest.TestCase):
         results = [
             env.CheckResult("python version", True, "ok"),
             env.CheckResult("psutil", False, "missing", critical=False),
+            env.CheckResult("CuPy GPU package", False, "missing", critical=False),
+            env.CheckResult("unused root programs", False, "archive recommended", critical=False),
             env.CheckResult("satpy", False, "missing", critical=True),
             env.CheckResult("default output folder", True, "ok"),
         ]
 
         self.assertEqual(env.result_group(results[0]), "Python")
         self.assertEqual(env.result_group(results[1]), "Packages")
-        self.assertEqual(env.result_group(results[3]), "Paths")
-        self.assertEqual(env.result_counts(results), (2, 1, 1))
+        self.assertEqual(env.result_group(results[2]), "GPU")
+        self.assertEqual(env.result_group(results[3]), "Project Cleanup")
+        self.assertEqual(env.result_group(results[5]), "Paths")
+        self.assertEqual(env.result_counts(results), (2, 3, 1))
         self.assertEqual(env.status_label(results[0]), "OK")
         self.assertEqual(env.status_label(results[1]), "WARN")
-        self.assertEqual(env.status_label(results[2]), "FAIL")
+        self.assertEqual(env.status_label(results[4]), "FAIL")
+
+    @mock.patch("check_environment.importlib.util.find_spec", return_value=None)
+    def test_check_gpu_support_reports_missing_cupy_as_warning(self, _mock_spec):
+        results = env.check_gpu_support()
+
+        self.assertTrue(any(result.name == "GPU requirements file" for result in results))
+        missing = next(result for result in results if result.name == "CuPy GPU package")
+        self.assertFalse(missing.ok)
+        self.assertFalse(missing.critical)
+
+    @mock.patch("check_environment.importlib.util.find_spec", return_value=object())
+    def test_check_gpu_support_reports_kernel_test_failure(self, _mock_spec):
+        class FakeRuntime:
+            @staticmethod
+            def getDeviceCount():
+                return 1
+
+            @staticmethod
+            def getDeviceProperties(_device):
+                return {"name": b"Fake GPU"}
+
+        class FakeCuda:
+            runtime = FakeRuntime()
+            Stream = mock.Mock(null=mock.Mock(synchronize=mock.Mock()))
+
+        fake_cupy = mock.Mock(
+            __version__="13.0",
+            cuda=FakeCuda(),
+            float32=float,
+            asarray=mock.Mock(side_effect=RuntimeError("missing headers")),
+        )
+
+        with mock.patch.dict("sys.modules", {"cupy": fake_cupy}):
+            results = env.check_gpu_support()
+
+        kernel = next(result for result in results if result.name == "CUDA kernel test")
+        self.assertFalse(kernel.ok)
+        self.assertFalse(kernel.critical)
+        self.assertIn("--gpu-fix", kernel.detail)
+
+    @mock.patch("check_environment.importlib.util.find_spec", return_value=object())
+    def test_check_gpu_support_reports_kernel_test_success(self, _mock_spec):
+        class FakeArray:
+            def __init__(self, value):
+                self.value = float(value)
+
+            def __add__(self, other):
+                return FakeArray(self.value + float(other))
+
+            def astype(self, _dtype):
+                return self
+
+        class FakeRuntime:
+            @staticmethod
+            def getDeviceCount():
+                return 1
+
+            @staticmethod
+            def getDeviceProperties(_device):
+                return {"name": b"Fake GPU"}
+
+        class FakeCuda:
+            runtime = FakeRuntime()
+            Stream = mock.Mock(null=mock.Mock(synchronize=mock.Mock()))
+
+        fake_cupy = mock.Mock(
+            __version__="13.0",
+            cuda=FakeCuda(),
+            float32=float,
+            asarray=mock.Mock(return_value=FakeArray(1.0)),
+            asnumpy=mock.Mock(side_effect=lambda array: [array.value]),
+            get_default_memory_pool=mock.Mock(return_value=mock.Mock(free_all_blocks=mock.Mock())),
+        )
+
+        with mock.patch.dict("sys.modules", {"cupy": fake_cupy}):
+            results = env.check_gpu_support()
+
+        kernel = next(result for result in results if result.name == "CUDA kernel test")
+        self.assertTrue(kernel.ok)
+        self.assertIn("kernel operation succeeded", kernel.detail)
+
+    @mock.patch("check_environment.check_gpu_support", return_value=[env.CheckResult("CuPy GPU package", True, "ok", critical=False)])
+    def test_run_checks_can_include_gpu_diagnostics(self, mock_gpu):
+        with mock.patch("check_environment.check_packages", return_value=[]), \
+            mock.patch("check_environment.has_critical_failures", return_value=True):
+            results = env.run_checks(include_gpu=True)
+
+        self.assertTrue(any(result.name == "CuPy GPU package" for result in results))
+        mock_gpu.assert_called_once()
+
+    @mock.patch("check_environment.print_banner")
+    @mock.patch("check_environment.print_results")
+    @mock.patch("check_environment.print_next_steps")
+    @mock.patch("check_environment.run_gpu_fix", return_value=0)
+    @mock.patch("check_environment.run_checks")
+    def test_main_gpu_fix_runs_gpu_repair_and_rechecks(
+        self,
+        mock_run_checks,
+        mock_gpu_fix,
+        _mock_next_steps,
+        _mock_print_results,
+        _mock_banner,
+    ):
+        clean = [env.CheckResult("python version", True, "ok")]
+        mock_run_checks.return_value = clean
+
+        with mock.patch("check_environment.sys.argv", ["check_environment.py", "--gpu-fix", "--plain"]):
+            result = env.main()
+
+        self.assertEqual(result, 0)
+        mock_gpu_fix.assert_called_once()
+        self.assertEqual(mock_run_checks.call_count, 2)
+        mock_run_checks.assert_called_with(include_gpu=True)
 
     def test_print_results_groups_output(self):
         results = [
@@ -209,6 +366,15 @@ class EnvironmentCheckTests(unittest.TestCase):
         self.assertIn("GUI or CLI", output)
         self.assertIn("non-synced", output)
 
+    def test_print_next_steps_for_gpu_warning_mentions_gpu_fix(self):
+        results = [env.CheckResult("CuPy GPU package", False, "missing", critical=False)]
+
+        with mock.patch("sys.stdout", new_callable=StringIO) as stdout:
+            env.print_next_steps(results)
+
+        output = stdout.getvalue()
+        self.assertIn("--gpu-fix", output)
+
     def test_print_next_steps_for_ready_environment_mentions_launchers(self):
         results = [env.CheckResult("python version", True, "ok")]
 
@@ -219,10 +385,135 @@ class EnvironmentCheckTests(unittest.TestCase):
         self.assertIn("Environment looks ready", output)
         self.assertIn("run_gui.bat", output)
         self.assertIn("run_cli.bat", output)
+        self.assertNotIn("run_dashboard.bat", output)
 
     def test_final_status_code_fails_only_for_critical_failures(self):
         self.assertEqual(env.final_status_code([env.CheckResult("optional", False, "warn", critical=False)]), 0)
         self.assertEqual(env.final_status_code([env.CheckResult("critical", False, "fail")]), 1)
+
+    def test_cleanup_scan_detects_known_and_unknown_root_programs(self):
+        with TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            for name in env.CORE_ROOT_FILES:
+                (project_dir / name).write_text("core", encoding="utf-8")
+            (project_dir / "HW_9_to_png_tiff 2.(old version)ipynb").write_text("{}", encoding="utf-8")
+            (project_dir / "tiff_to_png_converter.py").write_text("print('old')", encoding="utf-8")
+            (project_dir / "himawari_dashboard.py").write_text("print('old')", encoding="utf-8")
+            (project_dir / "scratch_tool.py").write_text("print('extra')", encoding="utf-8")
+            (project_dir / "notes.txt").write_text("ignore", encoding="utf-8")
+
+            candidates = env.root_cleanup_candidates(project_dir)
+
+        names = {candidate.path.name for candidate in candidates}
+        self.assertIn("HW_9_to_png_tiff 2.(old version)ipynb", names)
+        self.assertIn("tiff_to_png_converter.py", names)
+        self.assertIn("himawari_dashboard.py", names)
+        self.assertIn("scratch_tool.py", names)
+        self.assertNotIn("check_environment.py", names)
+        self.assertNotIn("notes.txt", names)
+
+    def test_project_cleanup_check_reports_warning_for_candidates(self):
+        with TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            (project_dir / "run_dashboard.bat").write_text("python dashboard.py", encoding="utf-8")
+
+            result = env.check_project_cleanup(project_dir)
+
+        self.assertFalse(result.ok)
+        self.assertFalse(result.critical)
+        self.assertIn("run_dashboard.bat", result.detail)
+
+    def test_project_cleanup_check_ok_when_no_candidates(self):
+        with TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            (project_dir / "check_environment.py").write_text("core", encoding="utf-8")
+
+            result = env.check_project_cleanup(project_dir)
+
+        self.assertTrue(result.ok)
+        self.assertFalse(result.critical)
+
+    def test_runtime_json_check_accepts_valid_json_and_warns_for_broken_json(self):
+        with TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            (project_dir / "himawari_gui_settings.json").write_text('{"ok": true}', encoding="utf-8")
+            valid = env.check_runtime_json_files(project_dir)
+            (project_dir / "himawari_recent_runs.json").write_text("{broken", encoding="utf-8")
+            broken = env.check_runtime_json_files(project_dir)
+
+        self.assertTrue(valid.ok)
+        self.assertFalse(broken.ok)
+        self.assertFalse(broken.critical)
+        self.assertIn("himawari_recent_runs.json", broken.detail)
+
+    def test_archive_unused_programs_moves_candidates_and_writes_manifest(self):
+        with TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            old_file = project_dir / "tiff_to_png_converter.py"
+            old_notebook = project_dir / "HW_9_to_png_tiff 2.(old version)ipynb"
+            extra_file = project_dir / "scratch_tool.py"
+            core_file = project_dir / "himawari_lowram_processor.py"
+            old_file.write_text("old", encoding="utf-8")
+            old_notebook.write_text("{}", encoding="utf-8")
+            extra_file.write_text("extra", encoding="utf-8")
+            core_file.write_text("core", encoding="utf-8")
+
+            result = env.archive_unused_programs(project_dir, timestamp="20260102_030405")
+            archive_dir = project_dir / "cleanup_archive" / "20260102_030405"
+            manifest = json.loads((archive_dir / "manifest.json").read_text(encoding="utf-8"))
+
+            self.assertTrue(result.ok)
+            self.assertFalse(old_file.exists())
+            self.assertFalse(old_notebook.exists())
+            self.assertFalse(extra_file.exists())
+            self.assertTrue(core_file.exists())
+            self.assertTrue((archive_dir / "tiff_to_png_converter.py").exists())
+            self.assertTrue((archive_dir / "HW_9_to_png_tiff 2.(old version)ipynb").exists())
+            self.assertTrue((archive_dir / "scratch_tool.py").exists())
+            self.assertEqual(
+                {Path(item["original_path"]).name for item in manifest},
+                {
+                    "HW_9_to_png_tiff 2.(old version)ipynb",
+                    "tiff_to_png_converter.py",
+                    "scratch_tool.py",
+                },
+            )
+
+    @mock.patch("check_environment.shutil.move", side_effect=OSError("locked"))
+    def test_archive_unused_programs_reports_move_failures_without_crashing(self, _mock_move):
+        with TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            (project_dir / "tiff_to_png_converter.py").write_text("old", encoding="utf-8")
+
+            result = env.archive_unused_programs(project_dir, timestamp="20260102_030405")
+
+        self.assertFalse(result.ok)
+        self.assertFalse(result.critical)
+        self.assertIn("OSError", result.detail)
+
+    @mock.patch("check_environment.print_banner")
+    @mock.patch("check_environment.print_results")
+    @mock.patch("check_environment.print_next_steps")
+    @mock.patch("check_environment.run_checks")
+    @mock.patch("check_environment.archive_unused_programs")
+    def test_main_archive_unused_runs_cleanup_without_pip(
+        self,
+        mock_archive,
+        mock_run_checks,
+        _mock_next_steps,
+        _mock_print_results,
+        _mock_banner,
+    ):
+        clean = [env.CheckResult("python version", True, "ok")]
+        mock_run_checks.return_value = clean
+        mock_archive.return_value = env.CheckResult("archive unused programs", True, "archived", critical=False)
+
+        with mock.patch("check_environment.sys.argv", ["check_environment.py", "--archive-unused"]):
+            result = env.main()
+
+        self.assertEqual(result, 0)
+        mock_archive.assert_called_once_with(env.PROJECT_DIR)
+        self.assertEqual(mock_run_checks.call_count, 2)
 
     @mock.patch("check_environment.print_banner")
     @mock.patch("check_environment.print_results")
@@ -247,7 +538,11 @@ class EnvironmentCheckTests(unittest.TestCase):
             result = env.main()
 
         self.assertEqual(result, 0)
-        mock_run_fix.assert_called_once_with(install_overlays=True, force_overlay_data=False)
+        mock_run_fix.assert_called_once_with(
+            install_overlays=True,
+            force_overlay_data=False,
+            archive_unused=True,
+        )
         self.assertEqual(mock_run_checks.call_count, 1)
 
     @mock.patch("check_environment.print_banner")
@@ -301,7 +596,41 @@ class EnvironmentCheckTests(unittest.TestCase):
             result = env.main()
 
         self.assertEqual(result, 0)
-        mock_auto_fix.assert_called_once_with(clean, install_overlays=False, force_overlay_data=True)
+        mock_auto_fix.assert_called_once_with(
+            clean,
+            install_overlays=False,
+            force_overlay_data=True,
+            archive_unused=True,
+        )
+
+    @mock.patch("check_environment.print_banner")
+    @mock.patch("check_environment.print_results")
+    @mock.patch("check_environment.print_next_steps")
+    @mock.patch("check_environment.recheck_after_repair_fresh")
+    @mock.patch("check_environment.run_fix", return_value=0)
+    @mock.patch("check_environment.run_checks")
+    def test_main_fix_can_skip_archive_cleanup(
+        self,
+        mock_run_checks,
+        mock_run_fix,
+        mock_recheck_fresh,
+        _mock_next_steps,
+        _mock_print_results,
+        _mock_banner,
+    ):
+        clean = [env.CheckResult("python version", True, "ok")]
+        mock_run_checks.return_value = clean
+        mock_recheck_fresh.return_value = clean
+
+        with mock.patch("check_environment.sys.argv", ["check_environment.py", "--fix", "--no-archive-unused"]):
+            result = env.main()
+
+        self.assertEqual(result, 0)
+        mock_run_fix.assert_called_once_with(
+            install_overlays=True,
+            force_overlay_data=False,
+            archive_unused=False,
+        )
 
     @mock.patch("check_environment.print_banner")
     @mock.patch("check_environment.print_results")
@@ -362,48 +691,102 @@ class EnvironmentCheckTests(unittest.TestCase):
 
     @mock.patch("check_environment.subprocess.call", return_value=0)
     @mock.patch("check_environment.check_pip_available", return_value=env.CheckResult("pip repair tool", True, "pip ok"))
+    @mock.patch("check_environment.archive_unused_programs")
     @mock.patch("check_environment.install_overlay_data")
-    def test_run_fix_invokes_pip_and_installs_overlay_data(self, mock_overlay_install, _mock_pip, mock_call):
+    def test_run_fix_invokes_pip_installs_overlay_data_and_archives_cleanup(
+        self,
+        mock_overlay_install,
+        mock_archive,
+        _mock_pip,
+        mock_call,
+    ):
         mock_overlay_install.return_value = env.OverlayInstallResult(True, True, "ok")
+        mock_archive.return_value = env.CheckResult("archive unused programs", True, "archived", critical=False)
 
-        result = env.run_fix()
+        with mock.patch("sys.stdout", new_callable=StringIO):
+            result = env.run_fix()
 
         self.assertEqual(result, 0)
         mock_call.assert_called_once_with(env.pip_install_command(upgrade=True), cwd=env.PROJECT_DIR)
         mock_overlay_install.assert_called_once_with(open_folder=True, force=False)
+        mock_archive.assert_called_once_with(env.PROJECT_DIR)
 
     @mock.patch("check_environment.subprocess.call", return_value=0)
     @mock.patch("check_environment.check_pip_available", return_value=env.CheckResult("pip repair tool", True, "pip ok"))
+    @mock.patch("check_environment.archive_unused_programs")
     @mock.patch("check_environment.ensure_overlay_folder")
     @mock.patch("check_environment.install_overlay_data")
-    def test_run_fix_can_skip_overlay_data(self, mock_overlay_install, mock_overlay_folder, _mock_pip, _mock_call):
-        result = env.run_fix(install_overlays=False)
+    def test_run_fix_can_skip_overlay_data(
+        self,
+        mock_overlay_install,
+        mock_overlay_folder,
+        mock_archive,
+        _mock_pip,
+        _mock_call,
+    ):
+        mock_archive.return_value = env.CheckResult("archive unused programs", True, "archived", critical=False)
+
+        with mock.patch("sys.stdout", new_callable=StringIO):
+            result = env.run_fix(install_overlays=False)
 
         self.assertEqual(result, 0)
         mock_overlay_install.assert_not_called()
         mock_overlay_folder.assert_called_once_with(open_folder=True)
+        mock_archive.assert_called_once_with(env.PROJECT_DIR)
 
     @mock.patch("check_environment.subprocess.call", return_value=0)
     @mock.patch("check_environment.check_pip_available", return_value=env.CheckResult("pip repair tool", True, "pip ok"))
+    @mock.patch("check_environment.archive_unused_programs")
     @mock.patch("check_environment.install_overlay_data")
-    def test_run_fix_returns_failure_when_overlay_install_fails(self, mock_overlay_install, _mock_pip, _mock_call):
+    def test_run_fix_returns_failure_when_overlay_install_fails(
+        self,
+        mock_overlay_install,
+        mock_archive,
+        _mock_pip,
+        _mock_call,
+    ):
         mock_overlay_install.return_value = env.OverlayInstallResult(False, False, "download failed")
 
         result = env.run_fix()
 
         self.assertEqual(result, 1)
         mock_overlay_install.assert_called_once_with(open_folder=True, force=False)
+        mock_archive.assert_not_called()
 
     @mock.patch("check_environment.subprocess.call", return_value=0)
     @mock.patch("check_environment.check_pip_available", return_value=env.CheckResult("pip repair tool", True, "pip ok"))
+    @mock.patch("check_environment.archive_unused_programs")
     @mock.patch("check_environment.install_overlay_data")
-    def test_run_fix_can_force_overlay_data_install(self, mock_overlay_install, _mock_pip, _mock_call):
+    def test_run_fix_can_force_overlay_data_install(self, mock_overlay_install, mock_archive, _mock_pip, _mock_call):
         mock_overlay_install.return_value = env.OverlayInstallResult(True, True, "ok")
+        mock_archive.return_value = env.CheckResult("archive unused programs", True, "archived", critical=False)
 
-        result = env.run_fix(force_overlay_data=True)
+        with mock.patch("sys.stdout", new_callable=StringIO):
+            result = env.run_fix(force_overlay_data=True)
 
         self.assertEqual(result, 0)
         mock_overlay_install.assert_called_once_with(open_folder=True, force=True)
+        mock_archive.assert_called_once_with(env.PROJECT_DIR)
+
+    @mock.patch("check_environment.subprocess.call", return_value=0)
+    @mock.patch("check_environment.check_pip_available", return_value=env.CheckResult("pip repair tool", True, "pip ok"))
+    @mock.patch("check_environment.archive_unused_programs")
+    @mock.patch("check_environment.install_overlay_data")
+    def test_run_fix_can_skip_archive_cleanup(self, mock_overlay_install, mock_archive, _mock_pip, _mock_call):
+        mock_overlay_install.return_value = env.OverlayInstallResult(True, True, "ok")
+
+        result = env.run_fix(archive_unused=False)
+
+        self.assertEqual(result, 0)
+        mock_archive.assert_not_called()
+
+    @mock.patch("check_environment.subprocess.call", return_value=0)
+    @mock.patch("check_environment.check_pip_available", return_value=env.CheckResult("pip repair tool", True, "pip ok"))
+    def test_run_gpu_fix_invokes_gpu_requirements(self, _mock_pip, mock_call):
+        result = env.run_gpu_fix()
+
+        self.assertEqual(result, 0)
+        mock_call.assert_called_once_with(env.gpu_pip_install_command(upgrade=True), cwd=env.PROJECT_DIR)
 
     @mock.patch("check_environment.subprocess.call")
     @mock.patch("check_environment.check_pip_available", return_value=env.CheckResult("pip repair tool", False, "missing pip"))
@@ -434,6 +817,7 @@ class EnvironmentCheckTests(unittest.TestCase):
             python_path,
             install_overlays=True,
             force_overlay_data=False,
+            archive_unused=True,
         )
         mock_check_repaired.assert_called_once_with(python_path)
 
@@ -463,6 +847,7 @@ class EnvironmentCheckTests(unittest.TestCase):
             created_path,
             install_overlays=True,
             force_overlay_data=False,
+            archive_unused=True,
         )
         mock_check_repaired.assert_called_once_with(created_path)
 
@@ -750,15 +1135,14 @@ class EnvironmentCheckTests(unittest.TestCase):
         self.assertTrue(result.installed)
         self.assertFalse(result.missing_paths)
 
-    @mock.patch("check_environment.os.startfile", create=True)
-    def test_ensure_overlay_folder_creates_folder_and_can_open_on_windows(self, mock_startfile):
+    @mock.patch("check_environment.open_path_in_file_manager")
+    def test_ensure_overlay_folder_creates_folder_and_can_open_on_windows(self, mock_open_path):
         with TemporaryDirectory() as tmp_dir:
-            with mock.patch("check_environment.os.name", "nt"):
-                with mock.patch("sys.stdout", new_callable=StringIO):
-                    overlays_dir = env.ensure_overlay_folder(Path(tmp_dir), open_folder=True)
-                    self.assertTrue(overlays_dir.exists())
+            with mock.patch("sys.stdout", new_callable=StringIO):
+                overlays_dir = env.ensure_overlay_folder(Path(tmp_dir), open_folder=True)
+                self.assertTrue(overlays_dir.exists())
 
-        mock_startfile.assert_called_once_with(str(overlays_dir))
+        mock_open_path.assert_called_once_with(overlays_dir)
 
     def test_launcher_helpers_ok_when_expected_scripts_are_referenced(self):
         with TemporaryDirectory() as tmp_dir:

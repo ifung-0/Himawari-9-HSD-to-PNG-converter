@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -16,6 +17,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+import warnings
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime, timedelta
@@ -23,9 +25,25 @@ from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, ttk
 from typing import Callable, Iterable
 
+def configure_known_warning_filters() -> None:
+    warnings.filterwarnings(
+        "ignore",
+        message="CUDA path could not be detected.*",
+        category=UserWarning,
+        module=r"cupy\._environment",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="invalid value encountered in (cos|sin)",
+        category=RuntimeWarning,
+        module=r"dask\._task_spec",
+    )
+
+
+configure_known_warning_filters()
+
 if __name__ == "__main__":
     print("Loading scientific packages; first startup can take a few seconds...", flush=True)
-
 try:
     import dask
     import dask.array as da
@@ -46,7 +64,7 @@ except KeyboardInterrupt:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-APP_VERSION = "2026.05.26.1"
+APP_VERSION = "2026.06.05.1"
 APP_DISPLAY_NAME = "Himawari-9 Low-RAM Processor"
 USER_URL = "https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/2024/07/25/0400/HS_H09_20240725_0400_B01_FLDK_R10_S0110.DAT.bz2"
 MODE = "Single Image"  # "Single Image" or "Timelapse"
@@ -56,9 +74,11 @@ HOURS_BACK = 72
 INTERVAL_MINUTES = 20
 FPS = 10
 AUTO_DOWNLOAD = True
+GPU_ACCELERATION = False
 USE_NIGHT_FALLBACK = True
 NIGHT_FALLBACK_MODE = "hybrid"
-DOWNLOAD_WORKERS = 4
+DOWNLOAD_WORKERS = 2
+DOWNLOAD_STREAM_CHUNK_BYTES = 256 * 1024
 TIMELAPSE_FORMAT = "gif"  # "gif" or "mp4"
 DELETE_TIMELAPSE_FRAMES = True
 IMAGE_FORMAT = "png"  # Use "tif" for chunked GeoTIFF writes on very large outputs.
@@ -67,7 +87,8 @@ RESAMPLER = "native"  # "native" is required for full-disk low-RAM processing.
 ADD_BORDER_LINES = False
 BORDER_LINE_COLOR = "green"
 BORDER_LINE_WIDTH = 1.0
-MAX_SAFE_PNG_PIXELS = 120_000_000
+MAX_SAFE_PNG_PIXELS = 40_000_000
+MAX_SAFE_TIMELAPSE_FRAME_PIXELS = 40_000_000
 MAP_VIEW = "native"
 FLAT_MIN_LAT = -60.0
 FLAT_MAX_LAT = 60.0
@@ -75,16 +96,23 @@ FLAT_MIN_LON = 80.0
 FLAT_MAX_LON = 200.0
 FLAT_RESOLUTION_DEG = 0.05
 MAX_FLAT_MAP_PIXELS = 30_000_000
+WEB_MERCATOR_MAX_LAT = 85.05112878
+WEB_MERCATOR_PROJ4 = (
+    "+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 "
+    "+x_0=0 +y_0=0 +units=m +over +no_defs"
+)
+WEB_MERCATOR_METERS_PER_DEGREE = (2.0 * math.pi * 6378137.0) / 360.0
 
 RAM_LIMIT_GB = 10.0
-DASK_CHUNK_SIZE = "64MiB"  # Use "128MiB" only if the machine has headroom.
+DASK_CHUNK_CHOICES = ("16MiB", "32MiB", "64MiB", "128MiB")
+DASK_CHUNK_SIZE = "32MiB"  # Use larger chunks only if the machine has headroom.
 DASK_NUM_WORKERS = 1  # Keep at 1 or 2.
 NIGHT_CHECK_SAMPLE_PIXELS = 512
 NIGHT_CHECK_CENTER_FRACTION = 0.65
 NIGHT_CHECK_BRIGHT_REFLECTANCE = 2.0
 NIGHT_CHECK_BRIGHT_FRACTION = 0.03
-HYBRID_NIGHT_DARK_REFLECTANCE = 2.0
-HYBRID_NIGHT_DAY_REFLECTANCE = 8.0
+HYBRID_NIGHT_DARK_REFLECTANCE = 0.3
+HYBRID_NIGHT_DAY_REFLECTANCE = 1.5
 MAX_NATIVE_COMPATIBILITY_CROP_PIXELS = 32
 NATIVE_GRID_INDEX_TOLERANCE = 1e-7
 
@@ -111,6 +139,14 @@ OVERLAY_LEVEL = 1
 BUILT_IN_PRESETS = ("Balanced Single", "Fast IR Check", "Low-RAM Timelapse")
 ALLOWED_TEMPLATE_TOKENS = {"scan_time", "area", "product", "mode", "band", "format"}
 WINDOWS_RESERVED_FILENAME_CHARS = '<>:"/\\|?*'
+WINDOWS_RESERVED_DEVICE_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +326,61 @@ class DownloadTask:
     destination: Path
 
 
+@dataclass(frozen=True)
+class LocalSegmentInfo:
+    source_path: Path
+    sat_id: str
+    timestamp: str
+    band: str
+    area: str
+    resolution: str
+    segment: int
+    total_segments: int
+    compressed: bool
+
+
+@dataclass(frozen=True)
+class LocalImportResult:
+    sat_id: str
+    timestamp: str
+    area: str
+    total_segments: int
+    imported_paths: tuple[Path, ...]
+    reused_paths: tuple[Path, ...]
+    bands: tuple[str, ...]
+
+    @property
+    def synthetic_url(self) -> str:
+        return offline_source_url_for_import(self)
+
+
+@dataclass(frozen=True)
+class SystemPerformanceProfile:
+    total_ram_gb: float | None
+    available_ram_gb: float | None
+    cpu_count: int
+    cpu_percent: float | None
+
+
+@dataclass(frozen=True)
+class PerformanceRecommendation:
+    mode: str
+    download_workers: int
+    dask_num_workers: int
+    dask_chunk_size: str
+    ram_limit_gb: float
+    summary: str
+
+
+@dataclass(frozen=True)
+class GpuSupportStatus:
+    ok: bool
+    detail: str
+    device_name: str = ""
+    device_count: int = 0
+    package_version: str = ""
+
+
 @dataclass
 class ProcessorConfig:
     user_url: str = USER_URL
@@ -299,6 +390,7 @@ class ProcessorConfig:
     interval_minutes: int = INTERVAL_MINUTES
     fps: int = FPS
     auto_download: bool = AUTO_DOWNLOAD
+    gpu_acceleration: bool = GPU_ACCELERATION
     use_night_fallback: bool = USE_NIGHT_FALLBACK
     night_fallback_mode: str = NIGHT_FALLBACK_MODE
     download_workers: int = DOWNLOAD_WORKERS
@@ -482,6 +574,7 @@ def configure_logging() -> None:
 
 def configure_dask(config: ProcessorConfig | None = None) -> None:
     config = config or default_config()
+    validate_dask_chunk_size(config.dask_chunk_size)
     workers = clamp_dask_workers(config.dask_num_workers)
     dask.config.set(
         {
@@ -501,6 +594,382 @@ def clamp_download_workers(value: int) -> int:
 
 def clamp_dask_workers(value: int) -> int:
     return max(1, min(int(value), 2))
+
+
+def validate_dask_chunk_size(value: str) -> None:
+    if value not in DASK_CHUNK_CHOICES:
+        choices = ", ".join(DASK_CHUNK_CHOICES)
+        raise ValueError(f"Dask chunk size must be one of: {choices}.")
+
+
+def system_performance_profile() -> SystemPerformanceProfile:
+    cpu_count = os.cpu_count() or 1
+    total_ram_gb: float | None = None
+    available_ram_gb: float | None = None
+    cpu_percent: float | None = None
+    try:
+        import psutil
+
+        memory = psutil.virtual_memory()
+        total_ram_gb = memory.total / (1024**3)
+        available_ram_gb = memory.available / (1024**3)
+        cpu_percent = float(psutil.cpu_percent(interval=0.1))
+    except Exception:
+        pass
+    return SystemPerformanceProfile(
+        total_ram_gb=total_ram_gb,
+        available_ram_gb=available_ram_gb,
+        cpu_count=cpu_count,
+        cpu_percent=cpu_percent,
+    )
+
+
+def recommend_performance_settings(
+    profile: SystemPerformanceProfile,
+    mode: str,
+) -> PerformanceRecommendation:
+    normalized = mode.strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized not in {"safe", "best_performance"}:
+        raise ValueError('Performance mode must be "safe" or "best_performance".')
+
+    available = profile.available_ram_gb if profile.available_ram_gb is not None else 4.0
+    total = profile.total_ram_gb if profile.total_ram_gb is not None else max(available, 4.0)
+    cpu_count = max(1, int(profile.cpu_count or 1))
+    cpu_busy = profile.cpu_percent is not None and profile.cpu_percent >= 75.0
+
+    if normalized == "safe":
+        download_workers = 1 if cpu_busy or available < 8 else 2
+        dask_workers = 1
+        chunk_size = "16MiB" if available < 8 else "32MiB"
+        ram_limit = max(2.0, min(8.0, available * 0.55, total * 0.5))
+        label = "Safe Mode"
+    else:
+        download_workers = 4 if cpu_count >= 8 and available >= 12 and not cpu_busy else 2
+        dask_workers = 2 if cpu_count >= 6 and available >= 12 and not cpu_busy else 1
+        if available >= 24 and cpu_count >= 8 and not cpu_busy:
+            chunk_size = "128MiB"
+        elif available >= 12:
+            chunk_size = "64MiB"
+        else:
+            chunk_size = "32MiB"
+        ram_limit = max(4.0, min(16.0, available * 0.7, total * 0.65))
+        label = "Best Performance"
+
+    summary = (
+        f"{label}: CPU cores {cpu_count}, "
+        f"available RAM {available:.1f} GiB"
+        + (f", CPU load {profile.cpu_percent:.0f}%" if profile.cpu_percent is not None else "")
+    )
+    return PerformanceRecommendation(
+        mode=normalized,
+        download_workers=clamp_download_workers(download_workers),
+        dask_num_workers=clamp_dask_workers(dask_workers),
+        dask_chunk_size=chunk_size,
+        ram_limit_gb=round(ram_limit, 1),
+        summary=summary,
+    )
+
+
+def gpu_support_status() -> GpuSupportStatus:
+    if importlib.util.find_spec("cupy") is None:
+        return GpuSupportStatus(
+            False,
+            "CuPy is not installed. Run GPU Fix to install optional NVIDIA/CUDA GPU support.",
+        )
+    try:
+        import cupy as cp  # type: ignore
+    except Exception as exc:
+        return GpuSupportStatus(False, f"CuPy import failed: {exc.__class__.__name__}: {exc}")
+
+    version = str(getattr(cp, "__version__", "unknown"))
+    try:
+        device_count = int(cp.cuda.runtime.getDeviceCount())
+    except Exception as exc:
+        return GpuSupportStatus(False, f"CUDA device check failed: {exc.__class__.__name__}: {exc}", package_version=version)
+    if device_count <= 0:
+        return GpuSupportStatus(False, "CuPy is installed, but no CUDA GPU device was found.", package_version=version)
+
+    device_name = ""
+    try:
+        raw_name = cp.cuda.runtime.getDeviceProperties(0).get("name", b"")
+        device_name = raw_name.decode("utf-8", errors="replace") if isinstance(raw_name, bytes) else str(raw_name)
+        test = cp.asarray([1], dtype=cp.float32)
+        test = (test + cp.float32(1.0)).astype(cp.float32)
+        cp.cuda.Stream.null.synchronize()
+        if float(cp.asnumpy(test)[0]) != 2.0:
+            raise RuntimeError("unexpected CUDA test result")
+        del test
+        cp.get_default_memory_pool().free_all_blocks()
+    except Exception as exc:
+        return GpuSupportStatus(
+            False,
+            (
+                f"CUDA kernel test failed: {exc.__class__.__name__}: {exc}. "
+                "Run GPU Fix to install CuPy with CUDA toolkit headers."
+            ),
+            device_name=device_name,
+            device_count=device_count,
+            package_version=version,
+        )
+    return GpuSupportStatus(
+        True,
+        f"CuPy {version} ready on {device_name or 'CUDA device 0'} ({device_count} device(s)).",
+        device_name=device_name,
+        device_count=device_count,
+        package_version=version,
+    )
+
+
+def require_gpu_ready() -> GpuSupportStatus:
+    status = gpu_support_status()
+    if not status.ok:
+        raise RuntimeError("GPU acceleration is enabled, but GPU support is not ready. " + status.detail)
+    return status
+
+
+def dask_array_to_gpu_chunks(array: da.Array) -> da.Array:
+    import cupy as cp  # type: ignore
+
+    return array.map_blocks(cp.asarray, dtype=array.dtype)
+
+
+def dask_array_to_cpu_chunks(array: da.Array) -> da.Array:
+    def to_cpu(block):
+        if not is_cupy_array_like(block):
+            return block
+        import cupy as cp  # type: ignore
+
+        return cp.asnumpy(block)
+
+    return array.map_blocks(to_cpu, dtype=array.dtype)
+
+
+def is_cupy_array_like(value: object) -> bool:
+    return value.__class__.__module__.split(".", 1)[0] == "cupy"
+
+
+def dataarray_to_gpu_chunks(data: xr.DataArray) -> xr.DataArray:
+    if not isinstance(data.data, da.Array):
+        return data
+    return data.copy(deep=False, data=dask_array_to_gpu_chunks(data.data))
+
+
+def dataarray_to_cpu_chunks(data: xr.DataArray) -> xr.DataArray:
+    if not isinstance(data.data, da.Array):
+        return data
+    return data.copy(deep=False, data=dask_array_to_cpu_chunks(data.data))
+
+
+def scene_missing_bands(scene: Scene, bands: Iterable[str]) -> tuple[str, ...]:
+    missing: list[str] = []
+    for band in bands:
+        try:
+            scene[band]
+        except KeyError:
+            missing.append(band)
+    return tuple(missing)
+
+
+def maybe_gpu_scene_for_custom_composite(scene: Scene, bands: Iterable[str], config: ProcessorConfig) -> Scene:
+    if not config.gpu_acceleration:
+        return scene
+    require_gpu_ready()
+    for band in bands:
+        scene[band] = dataarray_to_gpu_chunks(scene[band])
+    return scene
+
+
+def maybe_cpu_scene_after_gpu(scene: Scene, dataset_names: Iterable[str], config: ProcessorConfig) -> Scene:
+    if not config.gpu_acceleration:
+        return scene
+    for name in dataset_names:
+        try:
+            scene[name] = dataarray_to_cpu_chunks(scene[name])
+        except KeyError:
+            continue
+    return scene
+
+
+def maybe_cpu_dataset_after_gpu(dataset: xr.DataArray, config: ProcessorConfig) -> xr.DataArray:
+    if not config.gpu_acceleration:
+        return dataset
+    return dataarray_to_cpu_chunks(dataset)
+
+
+def gpu_scale_reflectance_block(cp, data, max_value: float = 100.0, gamma: float = 1.0):
+    scaled = cp.clip(cp.nan_to_num(data, nan=0.0), 0.0, max_value) / cp.float32(max_value)
+    if gamma != 1.0:
+        scaled = scaled ** cp.float32(1.0 / gamma)
+    return cp.clip(scaled, 0.0, 1.0)
+
+
+def gpu_scale_ir_temperature_block(cp, data, warm_k: float = 300.0, cold_k: float = 190.0, gamma: float = 1.0):
+    filled = cp.nan_to_num(data, nan=warm_k)
+    scaled = (cp.float32(warm_k) - filled) / cp.float32(warm_k - cold_k)
+    scaled = cp.clip(scaled, 0.0, 1.0)
+    if gamma != 1.0:
+        scaled = scaled ** cp.float32(1.0 / gamma)
+    return cp.clip(scaled, 0.0, 1.0)
+
+
+def gpu_black_point_block(cp, data, black: float):
+    return cp.clip((data - cp.float32(black)) / cp.float32(1.0 - black), 0.0, 1.0)
+
+
+def gpu_contrast_block(cp, data, contrast: float, midpoint: float):
+    return cp.clip((data - cp.float32(midpoint)) * cp.float32(contrast) + cp.float32(midpoint), 0.0, 1.0)
+
+
+def gpu_saturation_block(cp, red, green, blue, saturation: float):
+    luma = red * cp.float32(0.2126) + green * cp.float32(0.7152) + blue * cp.float32(0.0722)
+    saturation = cp.float32(saturation)
+    return (
+        cp.clip(luma + (red - luma) * saturation, 0.0, 1.0),
+        cp.clip(luma + (green - luma) * saturation, 0.0, 1.0),
+        cp.clip(luma + (blue - luma) * saturation, 0.0, 1.0),
+    )
+
+
+def gpu_true_color_reproduction_block(
+    b01,
+    b02,
+    b03,
+    b04,
+    b13=None,
+    use_hybrid: bool = False,
+) -> np.ndarray:
+    import cupy as cp  # type: ignore
+
+    input_shapes = {tuple(np.shape(block)) for block in (b01, b02, b03, b04)}
+    if len(input_shapes) != 1:
+        raise ValueError(f"GPU true color block received mismatched visible band shapes: {sorted(input_shapes)}")
+    if use_hybrid and b13 is not None and tuple(np.shape(b13)) != tuple(np.shape(b03)):
+        raise ValueError(
+            "GPU hybrid true color block received a B13 chunk that does not match the visible band chunk shape."
+        )
+
+    b01_gpu = cp.asarray(b01, dtype=cp.float32)
+    b02_gpu = cp.asarray(b02, dtype=cp.float32)
+    b03_gpu = cp.asarray(b03, dtype=cp.float32)
+    b04_gpu = cp.asarray(b04, dtype=cp.float32)
+
+    red = gpu_black_point_block(cp, gpu_scale_reflectance_block(cp, b03_gpu, max_value=100.0, gamma=1.12), 0.012)
+    green = cp.clip(
+        gpu_black_point_block(cp, gpu_scale_reflectance_block(cp, b02_gpu, max_value=100.0, gamma=1.08), 0.010)
+        * cp.float32(0.56)
+        + red * cp.float32(0.32)
+        + gpu_black_point_block(cp, gpu_scale_reflectance_block(cp, b04_gpu, max_value=100.0, gamma=1.05), 0.008)
+        * cp.float32(0.12),
+        0.0,
+        1.0,
+    )
+    blue = gpu_black_point_block(cp, gpu_scale_reflectance_block(cp, b01_gpu, max_value=100.0, gamma=1.12), 0.004)
+    red = gpu_contrast_block(cp, cp.clip(red * cp.float32(1.12) + cp.float32(0.018), 0.0, 1.0), 1.22, 0.40)
+    green = gpu_contrast_block(cp, cp.clip(green * cp.float32(1.08) + cp.float32(0.010), 0.0, 1.0), 1.18, 0.40)
+    blue = gpu_contrast_block(cp, cp.clip(blue * cp.float32(0.98) + cp.float32(0.006), 0.0, 1.0), 1.12, 0.38)
+    red, green, blue = gpu_saturation_block(cp, red, green, blue, 1.32)
+    rgb = cp.stack([red, green, blue], axis=0)
+
+    if use_hybrid:
+        if b13 is None:
+            raise ValueError("GPU hybrid custom composite requires B13.")
+        b13_gpu = cp.asarray(b13, dtype=cp.float32)
+        weight = cp.clip(
+            (cp.float32(HYBRID_NIGHT_DAY_REFLECTANCE) - cp.nan_to_num(b03_gpu, nan=0.0))
+            / cp.float32(HYBRID_NIGHT_DAY_REFLECTANCE - HYBRID_NIGHT_DARK_REFLECTANCE),
+            0.0,
+            1.0,
+        )
+        night = gpu_scale_ir_temperature_block(cp, b13_gpu, warm_k=305.0, cold_k=190.0, gamma=1.15)
+        night_rgb = cp.stack(
+            [
+                night,
+                cp.clip(night * cp.float32(0.95) + cp.float32(0.03), 0.0, 1.0),
+                cp.clip(night * cp.float32(0.85) + cp.float32(0.06), 0.0, 1.0),
+            ],
+            axis=0,
+        )
+        rgb = rgb * (cp.float32(1.0) - weight[None, :, :]) + night_rgb * weight[None, :, :]
+
+    out = cp.rint(cp.clip(rgb, 0.0, 1.0) * cp.float32(255.0)).astype(cp.uint8)
+    result = cp.asnumpy(out)
+    cp.get_default_memory_pool().free_all_blocks()
+    return result
+
+
+def can_build_gpu_custom_composite(composite_choice: str) -> bool:
+    return composite_choice in {"True Color RGB (Enhanced)", "True Color Reproduction Image"}
+
+
+def build_gpu_custom_composite(scene: Scene, composite_choice: str, config: ProcessorConfig) -> tuple[str, xr.DataArray]:
+    if not can_build_gpu_custom_composite(composite_choice):
+        raise KeyError(f"GPU custom composite is not implemented for {composite_choice}.")
+    require_gpu_ready()
+    use_hybrid = config.use_night_fallback and uses_hybrid_night_fallback(
+        composite_choice,
+        config.night_fallback_mode,
+    )
+    bands = ["B01", "B02", "B03", "B04"] + (["B13"] if use_hybrid else [])
+    missing = scene_missing_bands(scene, bands)
+    if missing:
+        raise RuntimeError(
+            "GPU custom composite is missing required resampled band(s): "
+            + ", ".join(missing)
+            + ". Disable GPU acceleration and retry, or choose a product whose required bands are available."
+        )
+    reference = scene["B03"]
+    y_dim, x_dim = reference.dims[-2], reference.dims[-1]
+    expected_shape = (int(reference.sizes[y_dim]), int(reference.sizes[x_dim]))
+    arrays = []
+    for band in bands:
+        source = scene[band]
+        if len(source.dims) < 2:
+            raise RuntimeError(f"GPU custom composite band {band} is not two-dimensional after resampling.")
+        band_shape = (int(source.sizes[source.dims[-2]]), int(source.sizes[source.dims[-1]]))
+        if band_shape != expected_shape:
+            raise RuntimeError(
+                f"GPU custom composite band {band} has shape {band_shape}, expected {expected_shape}. "
+                "This usually means the source bands did not resample to the same target grid."
+            )
+        arrays.append(source.data if isinstance(source.data, da.Array) else da.from_array(source.data, chunks=source.shape))
+    chunks = ((3,), arrays[0].chunks[0], arrays[0].chunks[1])
+    try:
+        rgb_data = da.map_blocks(
+            gpu_true_color_reproduction_block,
+            *arrays,
+            dtype=np.uint8,
+            chunks=chunks,
+            new_axis=[0],
+            use_hybrid=use_hybrid,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "GPU custom composite graph setup failed. Disable GPU acceleration and retry this run. "
+            f"{exc.__class__.__name__}: {exc}"
+        ) from exc
+    name = hybrid_dataset_name(composite_choice) if use_hybrid else CUSTOM_DATASET_NAMES[composite_choice]
+    attrs = scene["B03"].attrs.copy()
+    attrs.update(
+        {
+            "name": name,
+            "standard_name": name,
+            "mode": "RGB",
+            "sensor": "ahi",
+        }
+    )
+    if use_hybrid:
+        attrs["night_fallback_mode"] = "hybrid"
+    attrs["_FillValue"] = np.uint8(0)
+    attrs.pop("calibration", None)
+    attrs.pop("wavelength", None)
+    attrs.pop("units", None)
+    dataset = xr.DataArray(
+        rgb_data,
+        dims=("bands", y_dim, x_dim),
+        coords={"bands": ["R", "G", "B"]},
+        attrs=attrs,
+    )
+    return name, dataset
 
 
 def memory_gb() -> float | None:
@@ -743,6 +1212,197 @@ def segment_filename(info: UrlInfo, dt: datetime, band: str, segment: int) -> st
     )
 
 
+def local_segment_destination(info: LocalSegmentInfo, temp_dir: Path) -> Path:
+    frame_dir = temp_dir / info.timestamp
+    filename = (
+        f"{info.sat_id}_{info.timestamp}_{info.band}_{info.area}_"
+        f"{info.resolution}_S{info.segment:02d}{info.total_segments:02d}.DAT"
+    )
+    return frame_dir / filename
+
+
+def parse_local_hsd_segment(path: str | Path) -> LocalSegmentInfo:
+    source_path = Path(path).expanduser()
+    name = source_path.name
+    match = re.fullmatch(
+        r"(HS_H0[89])_(\d{8}_\d{4})_(B\d{2})_([A-Z0-9]+)_(R\d{2})_S(\d{2})(\d{2})\.DAT(?:\.bz2)?",
+        name,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        raise ValueError(
+            "Local HSD file name must look like "
+            "HS_H09_YYYYMMDD_HHMM_B13_FLDK_R20_S0110.DAT or .DAT.bz2."
+        )
+    sat_id, timestamp, band, area, resolution, segment, total_segments = match.groups()
+    band = band.upper()
+    resolution = resolution.upper()
+    expected_resolution = BAND_RESOLUTION.get(band)
+    if expected_resolution is None:
+        raise ValueError(f"Unsupported local HSD band: {band}")
+    if resolution != expected_resolution:
+        raise ValueError(f"{band} files must use {expected_resolution}; got {resolution}.")
+    try:
+        datetime.strptime(timestamp, "%Y%m%d_%H%M")
+    except ValueError as exc:
+        raise ValueError(f"Invalid local HSD timestamp in {name}: {timestamp}") from exc
+    segment_number = int(segment)
+    segment_total = int(total_segments)
+    if segment_number < 1 or segment_total < 1 or segment_number > segment_total:
+        raise ValueError(f"Invalid segment number in {name}: S{segment}{total_segments}")
+    return LocalSegmentInfo(
+        source_path=source_path,
+        sat_id=sat_id.upper(),
+        timestamp=timestamp,
+        band=band,
+        area=area.upper(),
+        resolution=resolution,
+        segment=segment_number,
+        total_segments=segment_total,
+        compressed=name.lower().endswith(".dat.bz2"),
+    )
+
+
+def sorted_local_segments(paths: Iterable[str | Path]) -> list[LocalSegmentInfo]:
+    infos = [parse_local_hsd_segment(path) for path in paths]
+    if not infos:
+        raise ValueError("Choose at least one local Himawari .DAT or .DAT.bz2 file.")
+
+    first = infos[0]
+    scan_key = (first.sat_id, first.timestamp, first.area, first.total_segments)
+    seen: dict[tuple[str, int], LocalSegmentInfo] = {}
+    for info in infos:
+        current_key = (info.sat_id, info.timestamp, info.area, info.total_segments)
+        if current_key != scan_key:
+            raise ValueError(
+                "Local import supports one scan at a time. "
+                f"Expected {first.sat_id} {first.timestamp} {first.area} Sxx{first.total_segments:02d}; "
+                f"got {info.sat_id} {info.timestamp} {info.area} Sxx{info.total_segments:02d}."
+            )
+        duplicate_key = (info.band, info.segment)
+        if duplicate_key in seen:
+            raise ValueError(
+                f"Duplicate local segment for {info.band} S{info.segment:02d}/{info.total_segments:02d}: "
+                f"{seen[duplicate_key].source_path.name} and {info.source_path.name}"
+            )
+        seen[duplicate_key] = info
+    return sorted(infos, key=lambda item: (item.band, item.segment, item.source_path.name.lower()))
+
+
+def copy_local_dat_file(info: LocalSegmentInfo, destination: Path) -> bool:
+    if destination.exists() and destination.stat().st_size > 0:
+        return False
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = destination.with_suffix(destination.suffix + ".part")
+    try:
+        remove_partial_download(tmp_path)
+        shutil.copyfile(info.source_path, tmp_path)
+        tmp_path.replace(destination)
+        return True
+    except Exception:
+        remove_partial_download(tmp_path)
+        raise
+
+
+def decompress_local_bz2_file(
+    info: LocalSegmentInfo,
+    destination: Path,
+    cancel_event: threading.Event | None = None,
+) -> bool:
+    if destination.exists() and destination.stat().st_size > 0:
+        return False
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = destination.with_suffix(destination.suffix + ".part")
+    try:
+        remove_partial_download(tmp_path)
+        decompressor = bz2.BZ2Decompressor()
+        with info.source_path.open("rb") as in_file, tmp_path.open("wb") as out_file:
+            while True:
+                check_cancel(cancel_event)
+                chunk = in_file.read(DOWNLOAD_STREAM_CHUNK_BYTES)
+                if not chunk:
+                    break
+                decompressor = write_decompressed_bz2_chunk(decompressor, chunk, out_file)
+            if not decompressor.eof:
+                raise EOFError("Compressed local file ended before bz2 EOF marker.")
+        tmp_path.replace(destination)
+        return True
+    except ProcessingCancelled:
+        remove_partial_download(tmp_path)
+        raise
+    except Exception:
+        remove_partial_download(tmp_path)
+        raise
+
+
+def import_local_hsd_segments(
+    paths: Iterable[str | Path],
+    temp_dir: Path,
+    progress: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
+) -> LocalImportResult:
+    infos = sorted_local_segments(paths)
+    invalid_sources: list[Path] = []
+    for info in infos:
+        try:
+            if not info.source_path.is_file() or info.source_path.stat().st_size <= 0:
+                invalid_sources.append(info.source_path)
+        except OSError:
+            invalid_sources.append(info.source_path)
+    if invalid_sources:
+        shown = ", ".join(str(path) for path in invalid_sources[:5])
+        if len(invalid_sources) > 5:
+            shown += f", ... plus {len(invalid_sources) - 5} more"
+        raise FileNotFoundError(f"Local HSD import file(s) not found, empty, or not readable: {shown}")
+    total = len(infos)
+    imported_paths: list[Path] = []
+    reused_paths: list[Path] = []
+    for idx, info in enumerate(infos, start=1):
+        check_cancel(cancel_event)
+        destination = local_segment_destination(info, temp_dir)
+        emit_progress(progress, f"Importing {info.band} S{info.segment:02d}/{info.total_segments:02d}", idx - 1, total)
+        if info.compressed:
+            imported = decompress_local_bz2_file(info, destination, cancel_event=cancel_event)
+        else:
+            imported = copy_local_dat_file(info, destination)
+        if imported:
+            imported_paths.append(destination)
+        else:
+            reused_paths.append(destination)
+        emit_progress(progress, f"Imported {idx}/{total} local file(s)", idx, total)
+
+    bands = tuple(sorted({info.band for info in infos}))
+    first = infos[0]
+    return LocalImportResult(
+        sat_id=first.sat_id,
+        timestamp=first.timestamp,
+        area=first.area,
+        total_segments=first.total_segments,
+        imported_paths=tuple(imported_paths),
+        reused_paths=tuple(reused_paths),
+        bands=bands,
+    )
+
+
+def ahi_l1b_folder_for_area(area: str) -> str:
+    normalized = area.upper()
+    if normalized == "FLDK":
+        return "FLDK"
+    if normalized == "JAPAN":
+        return "Japan"
+    return "Target"
+
+
+def offline_source_url_for_import(result: LocalImportResult) -> str:
+    timestamp = datetime.strptime(result.timestamp, "%Y%m%d_%H%M")
+    band = result.bands[0] if result.bands else "B01"
+    filename = (
+        f"{result.sat_id}_{result.timestamp}_{band}_{result.area}_"
+        f"{BAND_RESOLUTION[band]}_S01{result.total_segments:02d}.DAT.bz2"
+    )
+    return f"{NOAA_HIMAWARI9_BUCKET}/AHI-L1b-{ahi_l1b_folder_for_area(result.area)}/{timestamp_path(timestamp)}{filename}"
+
+
 def make_download_tasks(info: UrlInfo, dt: datetime, bands: Iterable[str], temp_dir: Path) -> list[DownloadTask]:
     tasks = []
     d_path = timestamp_path(dt)
@@ -825,6 +1485,25 @@ def decompress_bz2_chunk(
     return decompressor, bytes(output)
 
 
+def write_decompressed_bz2_chunk(
+    decompressor: bz2.BZ2Decompressor,
+    chunk: bytes,
+    out_file,
+) -> bz2.BZ2Decompressor:
+    data = chunk
+    while data:
+        try:
+            output = decompressor.decompress(data)
+            if output:
+                out_file.write(output)
+            data = decompressor.unused_data
+            if data:
+                decompressor = bz2.BZ2Decompressor()
+        except EOFError:
+            decompressor = bz2.BZ2Decompressor()
+    return decompressor
+
+
 def download_task_label(task: DownloadTask) -> str:
     match = re.search(r"_(B\d{2})_[A-Z0-9]+_R\d{2}_S(\d{2})(\d{2})\.DAT$", task.destination.name)
     if match:
@@ -891,13 +1570,11 @@ def stream_download_and_extract(
                 return None
             decompressor = bz2.BZ2Decompressor()
             with tmp_path.open("wb") as out_file:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                for chunk in response.iter_content(chunk_size=DOWNLOAD_STREAM_CHUNK_BYTES):
                     check_cancel(cancel_event)
                     if not chunk:
                         continue
-                    decompressor, data = decompress_bz2_chunk(decompressor, chunk)
-                    if data:
-                        out_file.write(data)
+                    decompressor = write_decompressed_bz2_chunk(decompressor, chunk, out_file)
                 if not decompressor.eof:
                     raise EOFError("Compressed stream ended before bz2 EOF marker.")
         tmp_path.replace(task.destination)
@@ -922,7 +1599,7 @@ def download_segments(
     total = len(tasks)
     completed = 0
     if not auto_download:
-        existing = [task.destination for task in tasks if task.destination.exists()]
+        existing = [task.destination for task in tasks if task.destination.exists() and task.destination.stat().st_size > 0]
         emit_progress(progress, f"Found {len(existing)}/{total} existing files", len(existing), total)
         return existing
 
@@ -966,6 +1643,30 @@ def download_segments(
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
     return results
+
+
+def missing_cached_segments(
+    config: ProcessorConfig,
+    info: UrlInfo,
+    steps: list[datetime],
+    bands: Iterable[str],
+    temp_dir: Path,
+) -> list[Path]:
+    missing: list[Path] = []
+    for dt in steps:
+        for task in make_download_tasks(info, dt, bands, temp_dir):
+            if not task.destination.exists() or task.destination.stat().st_size <= 0:
+                missing.append(task.destination)
+    return missing
+
+
+def offline_cache_summary(missing: list[Path], total_expected: int) -> str:
+    if not missing:
+        return f"Offline cache: ready ({total_expected} required segment file(s) found)"
+    shown = ", ".join(path.name for path in missing[:5])
+    if len(missing) > 5:
+        shown += f", ... plus {len(missing) - 5} more"
+    return f"Offline cache is missing {len(missing)}/{total_expected} required segment file(s): {shown}"
 
 
 def required_bands(
@@ -1396,19 +2097,19 @@ def create_true_color_reproduction_fallback(
     name: str | None = None,
     standard_name: str = "custom_true_color_reproduction_rgb",
 ) -> xr.DataArray:
-    red = apply_black_point(scale_reflectance(b03, max_value=100.0, gamma=1.22), black=0.018)
+    red = apply_black_point(scale_reflectance(b03, max_value=100.0, gamma=1.12), black=0.012)
     green = xr_clip(
-        apply_black_point(scale_reflectance(b02, max_value=100.0, gamma=1.15), black=0.015) * 0.56
+        apply_black_point(scale_reflectance(b02, max_value=100.0, gamma=1.08), black=0.010) * 0.56
         + red * 0.32
-        + apply_black_point(scale_reflectance(b04, max_value=100.0, gamma=1.1), black=0.012) * 0.12,
+        + apply_black_point(scale_reflectance(b04, max_value=100.0, gamma=1.05), black=0.008) * 0.12,
         0.0,
         1.0,
     )
-    blue = apply_black_point(scale_reflectance(b01, max_value=100.0, gamma=1.18), black=0.008)
-    red = apply_contrast(xr_clip(red * 1.05 + 0.01, 0.0, 1.0), contrast=1.12, midpoint=0.42)
-    green = apply_contrast(xr_clip(green * 1.03 + 0.004, 0.0, 1.0), contrast=1.10, midpoint=0.42)
-    blue = apply_contrast(xr_clip(blue * 0.94, 0.0, 1.0), contrast=1.08, midpoint=0.40)
-    red, green, blue = apply_saturation(red, green, blue, saturation=1.18)
+    blue = apply_black_point(scale_reflectance(b01, max_value=100.0, gamma=1.12), black=0.004)
+    red = apply_contrast(xr_clip(red * 1.12 + 0.018, 0.0, 1.0), contrast=1.22, midpoint=0.40)
+    green = apply_contrast(xr_clip(green * 1.08 + 0.010, 0.0, 1.0), contrast=1.18, midpoint=0.40)
+    blue = apply_contrast(xr_clip(blue * 0.98 + 0.006, 0.0, 1.0), contrast=1.12, midpoint=0.38)
+    red, green, blue = apply_saturation(red, green, blue, saturation=1.32)
     return rgb_dataarray(
         red,
         green,
@@ -1491,6 +2192,14 @@ def safe_filename_component(value: object) -> str:
     return text or "output"
 
 
+def validate_windows_filename_stem(stem: str, label: str = "Output filename") -> None:
+    if not stem.strip(" ."):
+        raise ValueError(f"{label} must not be empty.")
+    normalized = stem.rstrip(" .").upper()
+    if normalized in WINDOWS_RESERVED_DEVICE_NAMES:
+        raise ValueError(f"{label} must not use a Windows reserved device name: {stem}")
+
+
 def first_required_band(composite_choice: str, use_night_fallback: bool = True) -> str:
     bands = required_bands(composite_choice, use_night_fallback=use_night_fallback)
     return bands[0] if bands else "B00"
@@ -1524,8 +2233,8 @@ def validate_output_template(template: str) -> None:
         raise ValueError(f"Output filename template is invalid: {exc}") from exc
     if any(char in rendered for char in WINDOWS_RESERVED_FILENAME_CHARS):
         raise ValueError("Output filename template renders reserved filename characters.")
-    if not safe_filename_component(rendered):
-        raise ValueError("Output filename template renders an empty filename.")
+    rendered_stem = safe_filename_component(rendered)
+    validate_windows_filename_stem(rendered_stem, "Output filename template")
     if len(rendered) > 180:
         raise ValueError("Output filename template is too long.")
 
@@ -1549,6 +2258,7 @@ def output_stem_from_template(
     }
     rendered = config.output_template.format(**values)
     stem = safe_filename_component(rendered)
+    validate_windows_filename_stem(stem)
     if len(stem) > 180:
         raise ValueError("Output filename template renders a name that is too long.")
     return stem
@@ -1610,6 +2320,28 @@ def finite_float(value: object, label: str) -> float:
     return numeric
 
 
+def positive_finite_float(value: object, label: str) -> float:
+    numeric = finite_float(value, label)
+    if numeric <= 0:
+        raise ValueError(f"{label} must be positive.")
+    return numeric
+
+
+def positive_integer(value: object, label: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be positive.")
+    if isinstance(value, int):
+        numeric = value
+    else:
+        text = str(value).strip()
+        if not re.fullmatch(r"[+-]?\d+", text):
+            raise ValueError(f"{label} must be positive.")
+        numeric = int(text)
+    if numeric <= 0:
+        raise ValueError(f"{label} must be positive.")
+    return numeric
+
+
 def flat_map_shape(
     min_lat: float,
     max_lat: float,
@@ -1617,16 +2349,31 @@ def flat_map_shape(
     max_lon: float,
     resolution_deg: float,
 ) -> tuple[int, int]:
+    resolution_deg = finite_float(resolution_deg, "Flat map resolution")
+    if resolution_deg <= 0:
+        raise ValueError("Flat map resolution must be positive.")
+    left, bottom, right, top = web_mercator_extent(min_lat, max_lat, min_lon, max_lon)
+    resolution_m = flat_map_resolution_meters(resolution_deg)
+    width = int(round((right - left) / resolution_m))
+    height = int(round((top - bottom) / resolution_m))
+    return height, width
+
+
+def flat_map_resolution_meters(resolution_deg: float) -> float:
+    return finite_float(resolution_deg, "Flat map resolution") * WEB_MERCATOR_METERS_PER_DEGREE
+
+
+def web_mercator_extent(min_lat: float, max_lat: float, min_lon: float, max_lon: float) -> tuple[float, float, float, float]:
     min_lat = finite_float(min_lat, "Flat map min latitude")
     max_lat = finite_float(max_lat, "Flat map max latitude")
     min_lon = finite_float(min_lon, "Flat map min longitude")
     max_lon = finite_float(max_lon, "Flat map max longitude")
-    resolution_deg = finite_float(resolution_deg, "Flat map resolution")
-    if resolution_deg <= 0:
-        raise ValueError("Flat map resolution must be positive.")
-    width = int(round((max_lon - min_lon) / resolution_deg))
-    height = int(round((max_lat - min_lat) / resolution_deg))
-    return height, width
+    from pyproj import Transformer
+
+    transformer = Transformer.from_crs("EPSG:4326", WEB_MERCATOR_PROJ4, always_xy=True)
+    left, bottom = transformer.transform(min_lon, min_lat)
+    right, top = transformer.transform(max_lon, max_lat)
+    return float(left), float(bottom), float(right), float(top)
 
 
 def checked_flat_map_parameters(config: ProcessorConfig) -> tuple[float, float, float, float, float, int, int]:
@@ -1641,8 +2388,11 @@ def checked_flat_map_parameters(config: ProcessorConfig) -> tuple[float, float, 
         raise ValueError("Flat map min latitude must be less than max latitude.")
     if min_lon >= max_lon:
         raise ValueError("Flat map min longitude must be less than max longitude.")
-    if not (-90.0 <= min_lat <= 90.0 and -90.0 <= max_lat <= 90.0):
-        raise ValueError("Flat map latitude bounds must be between -90 and 90.")
+    if not (-WEB_MERCATOR_MAX_LAT <= min_lat <= WEB_MERCATOR_MAX_LAT and -WEB_MERCATOR_MAX_LAT <= max_lat <= WEB_MERCATOR_MAX_LAT):
+        raise ValueError(
+            "Flat map latitude bounds must be between "
+            f"-{WEB_MERCATOR_MAX_LAT:g} and {WEB_MERCATOR_MAX_LAT:g} for Web Mercator."
+        )
     if not (-360.0 <= min_lon <= 360.0 and -360.0 <= max_lon <= 360.0):
         raise ValueError("Flat map longitude bounds must be between -360 and 360.")
     height, width = flat_map_shape(min_lat, max_lat, min_lon, max_lon, resolution_deg)
@@ -1666,14 +2416,15 @@ def validate_flat_map_settings(config: ProcessorConfig) -> None:
 
 def flat_map_area(config: ProcessorConfig) -> AreaDefinition:
     min_lat, max_lat, min_lon, max_lon, _resolution_deg, height, width = checked_flat_map_parameters(config)
+    extent = web_mercator_extent(min_lat, max_lat, min_lon, max_lon)
     return AreaDefinition(
         "himawari_flat_map",
-        "Himawari Flat Equirectangular Map",
-        "latlon",
-        {"proj": "longlat", "datum": "WGS84", "no_defs": None},
+        "Himawari Web Mercator Flat Map",
+        "webmerc",
+        WEB_MERCATOR_PROJ4,
         width,
         height,
-        (min_lon, min_lat, max_lon, max_lat),
+        extent,
     )
 
 
@@ -1688,6 +2439,19 @@ def enforce_safe_output_format(path: Path, area: AreaDefinition, config: Process
         )
         return safe_path
     return path
+
+
+def validate_timelapse_frame_size(area: AreaDefinition, config: ProcessorConfig) -> None:
+    if config.mode != "Timelapse":
+        return
+    pixel_count = int(area.width) * int(area.height)
+    if pixel_count > MAX_SAFE_TIMELAPSE_FRAME_PIXELS:
+        raise RuntimeError(
+            f"Timelapse frame target would be {area.width:,}x{area.height:,} pixels "
+            f"({pixel_count:,} pixels). GIF/MP4 assembly has to read each frame into memory. "
+            "Use Single Image, a smaller Himawari target area, or coarser flat-map settings "
+            f"under {MAX_SAFE_TIMELAPSE_FRAME_PIXELS:,} pixels."
+        )
 
 
 def output_behavior_for_config(config: ProcessorConfig, info: UrlInfo, start: datetime) -> str:
@@ -1817,6 +2581,38 @@ def require_module(module_name: str, purpose: str) -> None:
         )
 
 
+def ensure_directory_writable(path: Path, label: str) -> None:
+    try:
+        if path.exists() and not path.is_dir():
+            raise RuntimeError(f"{label} folder path exists but is not a folder: {path}")
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / f".himawari_write_test_{os.getpid()}.tmp"
+        with open(probe, "wb") as handle:
+            handle.write(b"ok")
+        probe.unlink(missing_ok=True)
+    except Exception as exc:
+        raise RuntimeError(f"{label} folder is not writable: {path} ({exc.__class__.__name__}: {exc})") from exc
+
+
+def setup_directory_writability(path: Path, label: str) -> tuple[str | None, str | None]:
+    try:
+        if path.exists():
+            ensure_directory_writable(path, label)
+            return f"{label} folder: writable ({path})", None
+        parent = path.parent
+        while not parent.exists() and parent != parent.parent:
+            parent = parent.parent
+        if not parent.exists() or not parent.is_dir():
+            return None, f"{label} folder parent does not exist and cannot be checked: {path}"
+        probe = parent / f".himawari_write_test_{os.getpid()}.tmp"
+        with open(probe, "wb") as handle:
+            handle.write(b"ok")
+        probe.unlink(missing_ok=True)
+        return f"{label} folder: parent writable; folder will be created when processing starts ({path})", None
+    except Exception as exc:
+        return None, f"{label} folder is not writable: {path} ({exc.__class__.__name__}: {exc})"
+
+
 NAMED_COLORS = {
     "black": (0, 0, 0),
     "white": (255, 255, 255),
@@ -1861,6 +2657,68 @@ def build_overlay_options(config: ProcessorConfig) -> dict | None:
     }
 
 
+def direct_overlay_writer(coast_dir: str):
+    from pycoast import ContourWriterAGG
+
+    return ContourWriterAGG(coast_dir)
+
+
+def apply_direct_overlay_to_image_file(output_path: Path, area: AreaDefinition, overlay: dict | None) -> Path:
+    if overlay is None:
+        return output_path
+    if output_path.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
+        LOG.warning(
+            "Border overlay is not applied to direct %s output because preserving georeferencing is prioritized.",
+            output_path.suffix or "image",
+        )
+        return output_path
+    try:
+        from PIL import Image
+
+        writer = direct_overlay_writer(str(overlay["coast_dir"]))
+        tmp_path = temporary_output_path(output_path)
+        try:
+            tmp_path.unlink(missing_ok=True)
+            with Image.open(output_path) as image:
+                original_mode = image.mode
+                working = image.convert("RGBA")
+                color = tuple(overlay["color"])
+                width = float(overlay["width"])
+                resolution = str(overlay["resolution"])
+                writer.add_coastlines(
+                    working,
+                    area,
+                    resolution=resolution,
+                    level=int(overlay["level_coast"]),
+                    outline=color,
+                    width=width,
+                )
+                writer.add_borders(
+                    working,
+                    area,
+                    resolution=resolution,
+                    level=int(overlay["level_borders"]),
+                    outline=color,
+                    width=width,
+                )
+                if original_mode != "RGBA":
+                    working = working.convert(original_mode)
+                working.save(tmp_path)
+            tmp_path.replace(output_path)
+        except Exception:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
+    except Exception as exc:
+        LOG.warning(
+            "Border overlay failed for direct RGB output (%s). Saving image without border lines.",
+            exc,
+        )
+    return output_path
+
+
 def cleanup_paths(paths: Iterable[Path]) -> None:
     for path in paths:
         try:
@@ -1877,15 +2735,39 @@ def cleanup_partial_downloads(frame_dir: Path) -> None:
         cleanup_paths(list(frame_dir.glob("*.part")))
 
 
+def temporary_output_path(output_path: Path) -> Path:
+    suffix = output_path.suffix or ".tmp"
+    return output_path.with_name(f".{output_path.stem}.{os.getpid()}.{threading.get_ident()}.part{suffix}")
+
+
 def stable_run_id(config: ProcessorConfig, info: UrlInfo, steps: list[datetime]) -> str:
     payload = {
         "schema": TIMELAPSE_MANIFEST_SCHEMA_VERSION,
+        "app_version": APP_VERSION,
         "url": config.user_url,
         "mode": config.mode,
         "composite": config.composite_choice,
         "image_format": config.image_format,
         "timelapse_format": config.timelapse_format,
         "night_fallback": config.use_night_fallback,
+        "night_fallback_mode": config.night_fallback_mode,
+        "quality_fallback": config.allow_quality_fallback,
+        "map_view": normalized_map_view(config.map_view),
+        "flat_map": {
+            "min_lat": config.flat_min_lat,
+            "max_lat": config.flat_max_lat,
+            "min_lon": config.flat_min_lon,
+            "max_lon": config.flat_max_lon,
+            "resolution_deg": config.flat_resolution_deg,
+        },
+        "resampler": config.resampler,
+        "border_lines": {
+            "enabled": config.add_border_lines,
+            "color": config.border_line_color,
+            "width": config.border_line_width,
+        },
+        "gpu_acceleration": config.gpu_acceleration,
+        "max_safe_png_pixels": config.max_safe_png_pixels,
         "area": info.area,
         "timestamp": info.timestamp,
         "steps": [dt.strftime("%Y%m%d_%H%M") for dt in steps],
@@ -1917,14 +2799,24 @@ def frame_manifest_records(steps: list[datetime], frame_dir: Path, image_format:
 
 def load_json_file(path: Path) -> dict | None:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+    return data if isinstance(data, dict) else None
 
 
 def write_json_file(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp_path.replace(path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
 
 
 def build_timelapse_manifest(
@@ -1958,7 +2850,9 @@ def save_timelapse_manifest(path: Path, manifest: dict) -> None:
 
 def manifest_frames(manifest: dict) -> list[dict[str, object]]:
     frames = manifest.get("frames", [])
-    return frames if isinstance(frames, list) else []
+    if not isinstance(frames, list):
+        return []
+    return [frame for frame in frames if isinstance(frame, dict)]
 
 
 def frame_output_from_manifest(manifest: dict, frame_idx: int) -> Path | None:
@@ -1979,9 +2873,36 @@ def update_manifest_frame(manifest: dict, frame_idx: int, path: Path | None, sta
 
 def resume_frame_path(manifest: dict, frame_idx: int) -> Path | None:
     path = frame_output_from_manifest(manifest, frame_idx)
-    if path and path.exists() and path.stat().st_size > 0:
+    if path and valid_resume_frame(path):
         return path
     return None
+
+
+def valid_resume_frame(path: Path) -> bool:
+    try:
+        if not path.exists() or path.stat().st_size <= 0:
+            return False
+    except OSError:
+        return False
+    suffix = path.suffix.lower()
+    if suffix in {".png", ".jpg", ".jpeg", ".gif"}:
+        try:
+            from PIL import Image
+
+            with Image.open(path) as image:
+                image.verify()
+            return True
+        except Exception:
+            return False
+    if suffix in {".tif", ".tiff"}:
+        try:
+            import rasterio
+
+            with rasterio.open(path) as src:
+                return bool(src.width > 0 and src.height > 0 and src.count > 0)
+        except Exception:
+            return False
+    return True
 
 
 def load_or_create_timelapse_manifest(
@@ -2278,7 +3199,7 @@ def refine_native_compatible_target_area(
     error = native_area_compatibility_error(compatibility_areas, target_area)
     raise RuntimeError(
         "Selected frames cannot be aligned to a native low-RAM target area across all required bands. "
-        "Try a shorter timelapse range, use Single Image, or choose a coarser product such as B13. "
+        "Try flat map output, a shorter timelapse range, or a coarser product such as B13. "
         f"Last compatibility check: {error}"
     )
 
@@ -2299,8 +3220,10 @@ def native_compatible_common_area(
         )
 
     template_area = area_list[0]
-    all_areas = list(compatibility_areas.values()) if compatibility_areas else area_list
-    common, source_shape = find_native_common_area(area_list, intersect_extents(all_areas), source_pixel_size_m)
+    # Lock the target to the reference band/timelapse frames first. Other
+    # required bands validate the result below, but their tiny floating-point
+    # extent differences must not shrink full-disk targets to 21999x21999.
+    common, source_shape = find_native_common_area(area_list, intersect_extents(area_list), source_pixel_size_m)
     source_height, source_width = source_shape
     if source_height <= 0 or source_width <= 0:
         raise RuntimeError("No common geographic area across selected frames.")
@@ -2495,6 +3418,193 @@ def missing_pyspectral_message(composite_name: str) -> str:
     )
 
 
+def is_rgb_dataarray(dataset: xr.DataArray) -> bool:
+    return (
+        len(dataset.dims) == 3
+        and dataset.dims[0] == "bands"
+        and int(dataset.sizes.get("bands", 0)) == 3
+    )
+
+
+def validate_rgb_dataset_for_direct_output(dataset: xr.DataArray, area: AreaDefinition | None = None) -> None:
+    if not is_rgb_dataarray(dataset):
+        raise ValueError("Direct RGB output requires a DataArray with dimensions ('bands', y, x) and exactly 3 bands.")
+    y_dim, x_dim = dataset.dims[-2], dataset.dims[-1]
+    height = int(dataset.sizes.get(y_dim, 0))
+    width = int(dataset.sizes.get(x_dim, 0))
+    if width <= 0 or height <= 0:
+        raise ValueError("Direct RGB output requires non-empty image dimensions.")
+    if area is not None and (int(area.width) != width or int(area.height) != height):
+        raise ValueError(
+            "Direct RGB output dimensions do not match the target map area: "
+            f"dataset {width}x{height} px, area {int(area.width)}x{int(area.height)} px."
+        )
+    if dataset.dtype.kind in {"O", "S", "U", "V"}:
+        raise ValueError(f"Direct RGB output requires numeric data, got dtype {dataset.dtype}.")
+    if isinstance(dataset.data, da.Array) and len(dataset.data.chunks) != 3:
+        raise ValueError("Direct RGB output requires a 3-dimensional Dask array.")
+
+
+def area_transform(area: AreaDefinition):
+    from rasterio.transform import from_bounds
+
+    left, bottom, right, top = area.area_extent
+    return from_bounds(left, bottom, right, top, int(area.width), int(area.height))
+
+
+def write_rgb_geotiff_low_ram(dataset: xr.DataArray, output_path: Path, area: AreaDefinition) -> Path:
+    require_module("rasterio", "direct RGB GeoTIFF output")
+    import rasterio
+
+    validate_rgb_dataset_for_direct_output(dataset, area)
+    data = prepared_rgb_dask_array(dataset)
+    dask_data = data.data
+    delayed_blocks = dask_data.to_delayed().flatten()
+    band_chunks, y_chunks, x_chunks = dask_data.chunks
+    crs = area.crs
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    profile = {
+        "driver": "GTiff",
+        "width": int(area.width),
+        "height": int(area.height),
+        "count": 3,
+        "dtype": "uint8",
+        "crs": crs,
+        "transform": area_transform(area),
+        "nodata": 0,
+        "tiled": True,
+        "compress": "deflate",
+        "photometric": "RGB",
+    }
+    tmp_path = temporary_output_path(output_path)
+    try:
+        tmp_path.unlink(missing_ok=True)
+        with rasterio.open(tmp_path, "w", **profile) as dst:
+            index = 0
+            for band_index, band_height in enumerate(band_chunks):
+                for y_offset, y_size in chunk_offsets(y_chunks):
+                    for x_offset, x_size in chunk_offsets(x_chunks):
+                        block = delayed_blocks[index].compute()
+                        index += 1
+                        if is_cupy_array_like(block):
+                            import cupy as cp  # type: ignore
+
+                            block = cp.asnumpy(block)
+                        if band_height != 1:
+                            raise ValueError("RGB GeoTIFF writer expects one band per block.")
+                        dst.write(
+                            block[0],
+                            int(band_index) + 1,
+                            window=rasterio.windows.Window(x_offset, y_offset, x_size, y_size),
+                        )
+            dst.colorinterp = (
+                rasterio.enums.ColorInterp.red,
+                rasterio.enums.ColorInterp.green,
+                rasterio.enums.ColorInterp.blue,
+            )
+        tmp_path.replace(output_path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+    return output_path
+
+
+def prepared_rgb_dask_array(dataset: xr.DataArray) -> xr.DataArray:
+    validate_rgb_dataset_for_direct_output(dataset)
+    data = dataset.astype(np.uint8)
+    if not isinstance(data.data, da.Array):
+        data = data.chunk({"bands": 1, data.dims[-2]: data.sizes[data.dims[-2]], data.dims[-1]: data.sizes[data.dims[-1]]})
+    dask_data = data.data
+    if len(dask_data.chunks[0]) != 3 or any(chunk != 1 for chunk in dask_data.chunks[0]):
+        dask_data = dask_data.rechunk((1, dask_data.chunks[1], dask_data.chunks[2]))
+        data = data.copy(deep=False, data=dask_data)
+    return data
+
+
+def write_rgb_png_low_ram(dataset: xr.DataArray, output_path: Path) -> Path:
+    from PIL import Image
+
+    validate_rgb_dataset_for_direct_output(dataset)
+    data = prepared_rgb_dask_array(dataset)
+    dask_data = data.data
+    band_chunks, y_chunks, x_chunks = dask_data.chunks
+    if len(y_chunks) > 1 or len(x_chunks) > 1:
+        dask_data = dask_data.rechunk((1, data.sizes[data.dims[-2]], data.sizes[data.dims[-1]]))
+    delayed_blocks = dask_data.to_delayed().flatten()
+    rgb_planes: list[np.ndarray] = []
+    for index, band_height in enumerate(dask_data.chunks[0]):
+        block = delayed_blocks[index].compute()
+        if is_cupy_array_like(block):
+            import cupy as cp  # type: ignore
+
+            block = cp.asnumpy(block)
+        if band_height != 1:
+            raise ValueError("RGB PNG writer expects one band per block.")
+        rgb_planes.append(np.asarray(block[0], dtype=np.uint8))
+    if len(rgb_planes) != 3:
+        raise ValueError("RGB PNG writer expected exactly three bands.")
+    rgb = np.stack(rgb_planes, axis=-1)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = temporary_output_path(output_path)
+    try:
+        tmp_path.unlink(missing_ok=True)
+        Image.fromarray(rgb, mode="RGB").save(tmp_path)
+        tmp_path.replace(output_path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+    return output_path
+
+
+def chunk_offsets(chunks: tuple[int, ...]) -> Iterable[tuple[int, int]]:
+    offset = 0
+    for size in chunks:
+        yield offset, int(size)
+        offset += int(size)
+
+
+def rgb_geotiff_is_degenerate(path: Path, max_mean: float = 2.0) -> tuple[bool, str]:
+    require_module("rasterio", "GeoTIFF output validation")
+    import rasterio
+
+    if not path.exists():
+        return True, "file does not exist"
+    if path.suffix.lower() not in {".tif", ".tiff"}:
+        return False, "not a GeoTIFF"
+    try:
+        with rasterio.open(path) as src:
+            if src.count < 3:
+                return False, "not an RGB GeoTIFF"
+            sample_height = min(int(src.height), 256)
+            sample_width = min(int(src.width), 256)
+            sample = src.read(
+                indexes=(1, 2, 3),
+                out_shape=(3, sample_height, sample_width),
+                masked=True,
+            )
+    except Exception as exc:
+        return True, f"could not validate GeoTIFF: {exc}"
+    band_values = []
+    for index in range(3):
+        values = sample[index].compressed() if hasattr(sample[index], "compressed") else np.asarray(sample[index]).ravel()
+        if values.size == 0:
+            return True, "RGB bands contain only nodata values"
+        band_values.append(values)
+    ranges = [float(values.max()) - float(values.min()) for values in band_values]
+    means = [float(values.mean()) for values in band_values]
+    if all(value <= 0.0 for value in ranges) and max(means) <= max_mean:
+        return True, "RGB bands are constant and near black"
+    if all(float(values.max()) <= max_mean for values in band_values):
+        return True, "RGB bands contain only near-black values"
+    return False, "RGB GeoTIFF has visible data"
+
+
 def save_dataset_with_optional_overlay(
     scene: Scene,
     dataset_name: str,
@@ -2504,17 +3614,34 @@ def save_dataset_with_optional_overlay(
     overlay: dict | None,
     fill_value: int | float | None = None,
 ) -> Path:
-    save_kwargs = {
-        "filename": str(output_path),
-        "writer": writer,
-        "enhance": enhance,
-    }
-    if fill_value is not None:
-        save_kwargs["fill_value"] = fill_value
+    def save_once(target_path: Path, target_writer: str, target_overlay: dict | None = None) -> Path:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = temporary_output_path(target_path)
+        save_kwargs = {
+            "filename": str(tmp_path),
+            "writer": target_writer,
+            "enhance": enhance,
+        }
+        if fill_value is not None:
+            save_kwargs["fill_value"] = fill_value
+        try:
+            tmp_path.unlink(missing_ok=True)
+            if target_overlay is None:
+                scene.save_dataset(dataset_name, **save_kwargs)
+            else:
+                scene.save_dataset(dataset_name, overlay=target_overlay, **save_kwargs)
+            tmp_path.replace(target_path)
+            return target_path
+        except Exception:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
+
     if overlay is not None:
         try:
-            scene.save_dataset(dataset_name, overlay=overlay, **save_kwargs)
-            return output_path
+            return save_once(output_path, writer, overlay)
         except Exception as exc:
             LOG.warning(
                 "Border overlay failed (%s). Saving image without border lines. "
@@ -2522,7 +3649,7 @@ def save_dataset_with_optional_overlay(
                 exc,
             )
     try:
-        scene.save_dataset(dataset_name, **save_kwargs)
+        return save_once(output_path, writer)
     except ValueError as exc:
         if output_path.suffix.lower() == ".png" and "empty image" in str(exc).lower():
             fallback_path = output_path.with_suffix(".tif")
@@ -2531,12 +3658,8 @@ def save_dataset_with_optional_overlay(
                 exc,
                 fallback_path.name,
             )
-            save_kwargs["filename"] = str(fallback_path)
-            save_kwargs["writer"] = "geotiff"
-            scene.save_dataset(dataset_name, **save_kwargs)
-            return fallback_path
+            return save_once(fallback_path, "geotiff")
         raise
-    return output_path
 
 
 def save_satpy_dataset_output(
@@ -2594,37 +3717,67 @@ def save_custom_composite_output(
     load_bands(scene, custom_bands)
     log_memory("after load", config)
     check_cancel(cancel_event)
-    band_areas = {band: scene[band].attrs["area"] for band in custom_bands}
-    compatibility_error = native_area_compatibility_error(band_areas, master_area)
-    if compatibility_error:
-        if is_night:
-            emit_progress(
-                progress,
-                f"Skipping night fallback frame; {active} is not native-compatible with the locked target area",
-                None,
-                None,
-            )
-        else:
-            emit_progress(progress, f"Skipping frame; {active} is not native-compatible with target area", None, None)
-        raise RuntimeError(compatibility_error)
+    if not is_flat_map(config):
+        band_areas = {band: scene[band].attrs["area"] for band in custom_bands}
+        compatibility_error = native_area_compatibility_error(band_areas, master_area)
+        if compatibility_error:
+            if is_night:
+                emit_progress(
+                    progress,
+                    f"Skipping night fallback frame; {active} is not native-compatible with the locked target area",
+                    None,
+                    None,
+                )
+            else:
+                emit_progress(progress, f"Skipping frame; {active} is not native-compatible with target area", None, None)
+            raise RuntimeError(compatibility_error)
     emit_progress(progress, "Resampling", None, None)
     resampled = resample_scene_low_ram(scene, master_area, config, datasets=custom_bands)
     log_memory("after resample", config)
     check_cancel(cancel_event)
     emit_progress(progress, f"Building {active}", None, None)
-    dataset_name, dataset = build_custom_composite(resampled, active, is_night, config)
+    if config.gpu_acceleration and can_build_gpu_custom_composite(active):
+        emit_progress(progress, "GPU acceleration enabled for custom composite math", None, None)
+        LOG.info("GPU custom composite will return CPU chunks for saving.")
+        try:
+            dataset_name, dataset = build_gpu_custom_composite(resampled, active, config)
+        except Exception as exc:
+            raise RuntimeError(
+                "GPU custom composite failed. Disable GPU acceleration and retry this run. "
+                f"{exc.__class__.__name__}: {exc}"
+            ) from exc
+    else:
+        dataset_name, dataset = build_custom_composite(resampled, active, is_night, config)
+        dataset = maybe_cpu_dataset_after_gpu(dataset, config)
     resampled[dataset_name] = dataset
     check_cancel(cancel_event)
     emit_progress(progress, f"Saving {output_path.name}", None, None)
-    output_path = save_dataset_with_optional_overlay(
-        resampled,
-        dataset_name,
-        output_path,
-        writer_for_output(output_path),
-        enhance=False,
-        fill_value=0,
-        overlay=overlay_options,
-    )
+    if writer_for_output(output_path) == "geotiff" and is_rgb_dataarray(dataset):
+        output_path = write_rgb_geotiff_low_ram(dataset, output_path, master_area)
+        degenerate, reason = rgb_geotiff_is_degenerate(output_path)
+        if degenerate:
+            raise RuntimeError(f"GeoTIFF output is invalid after direct RGB write: {reason}.")
+    elif output_path.suffix.lower() == ".png" and is_rgb_dataarray(dataset):
+        output_path = write_rgb_png_low_ram(dataset, output_path)
+        output_path = apply_direct_overlay_to_image_file(output_path, master_area, overlay_options)
+    else:
+        output_path = save_dataset_with_optional_overlay(
+            resampled,
+            dataset_name,
+            output_path,
+            writer_for_output(output_path),
+            enhance=False,
+            fill_value=0,
+            overlay=overlay_options,
+        )
+        if writer_for_output(output_path) == "geotiff" and is_rgb_dataarray(dataset):
+            degenerate, reason = rgb_geotiff_is_degenerate(output_path)
+            if degenerate:
+                LOG.warning("GeoTIFF output looked invalid (%s). Retrying with direct RGB writer.", reason)
+                output_path = write_rgb_geotiff_low_ram(dataset, output_path, master_area)
+                degenerate, retry_reason = rgb_geotiff_is_degenerate(output_path)
+                if degenerate:
+                    raise RuntimeError(f"GeoTIFF output is invalid after retry: {retry_reason}.")
     log_memory("after save", config)
     return output_path
 
@@ -2905,22 +4058,33 @@ def assemble_timelapse(
 
     start = datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
     output = OUTPUT_DIR / f"{output_stem_from_template(config, info, start, fmt)}.{fmt}"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    tmp_output = temporary_output_path(output)
     LOG.info("Assembling %s from %s frame(s)", output.name, len(paths))
     emit_progress(progress, f"Assembling {output.name}", 0, len(paths))
     log_memory("timelapse start", config)
 
-    if fmt == "mp4":
-        with imageio.get_writer(output, fps=config.fps, codec="libx264", quality=8) as writer:
-            for idx, path in enumerate(paths, start=1):
-                check_cancel(cancel_event)
-                writer.append_data(imageio.imread(path))
-                emit_progress(progress, f"Added frame {idx}/{len(paths)}", idx, len(paths))
-    else:
-        with imageio.get_writer(output, mode="I", duration=int(1000 / config.fps), loop=0) as writer:
-            for idx, path in enumerate(paths, start=1):
-                check_cancel(cancel_event)
-                writer.append_data(imageio.imread(path))
-                emit_progress(progress, f"Added frame {idx}/{len(paths)}", idx, len(paths))
+    try:
+        tmp_output.unlink(missing_ok=True)
+        if fmt == "mp4":
+            with imageio.get_writer(tmp_output, fps=config.fps, codec="libx264", quality=8) as writer:
+                for idx, path in enumerate(paths, start=1):
+                    check_cancel(cancel_event)
+                    writer.append_data(imageio.imread(path))
+                    emit_progress(progress, f"Added frame {idx}/{len(paths)}", idx, len(paths))
+        else:
+            with imageio.get_writer(tmp_output, mode="I", duration=int(1000 / config.fps), loop=0) as writer:
+                for idx, path in enumerate(paths, start=1):
+                    check_cancel(cancel_event)
+                    writer.append_data(imageio.imread(path))
+                    emit_progress(progress, f"Added frame {idx}/{len(paths)}", idx, len(paths))
+        tmp_output.replace(output)
+    except Exception:
+        try:
+            tmp_output.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
 
     log_memory("timelapse saved", config)
     if config.delete_timelapse_frames:
@@ -2930,7 +4094,7 @@ def assemble_timelapse(
 
 def validate_configuration(config: ProcessorConfig | None = None) -> None:
     config = config or default_config()
-    if not config.user_url.strip():
+    if config.user_url is None or not str(config.user_url).strip():
         raise ValueError("Himawari URL is required.")
     if config.mode not in {"Single Image", "Timelapse"}:
         raise ValueError('MODE must be "Single Image" or "Timelapse".')
@@ -2941,34 +4105,37 @@ def validate_configuration(config: ProcessorConfig | None = None) -> None:
         raise ValueError("BAND_RESOLUTION must define B01 through B16 in order.")
     if BAND_NAMES != tuple(BAND_PIXEL_SIZE_M):
         raise ValueError("BAND_PIXEL_SIZE_M must define B01 through B16 in order.")
-    if config.interval_minutes <= 0:
-        raise ValueError("INTERVAL_MINUTES must be positive.")
-    if config.hours_back <= 0:
-        raise ValueError("HOURS_BACK must be positive.")
-    if config.fps <= 0:
-        raise ValueError("FPS must be positive.")
-    if config.download_workers <= 0:
-        raise ValueError("Download workers must be positive.")
-    if config.dask_num_workers <= 0:
-        raise ValueError("Dask workers must be positive.")
-    if config.ram_limit_gb <= 0:
-        raise ValueError("RAM limit must be positive.")
+    positive_integer(config.interval_minutes, "INTERVAL_MINUTES")
+    positive_integer(config.hours_back, "HOURS_BACK")
+    positive_integer(config.fps, "FPS")
+    positive_integer(config.download_workers, "Download workers")
+    positive_integer(config.dask_num_workers, "Dask workers")
+    positive_finite_float(config.ram_limit_gb, "RAM limit")
+    positive_integer(config.max_safe_png_pixels, "Max safe PNG pixels")
+    validate_dask_chunk_size(config.dask_chunk_size)
     if config.download_workers > 4:
         LOG.warning("DOWNLOAD_WORKERS=%s requested; capped to 4.", config.download_workers)
-    if config.image_format.lower() not in {"png", "tif", "tiff", "geotiff"}:
+    image_format = str(config.image_format).lower()
+    if image_format not in {"png", "tif", "tiff", "geotiff"}:
         raise ValueError('IMAGE_FORMAT must be "png" or "tif".')
     validate_output_template(config.output_template)
-    if config.timelapse_format.lower() not in {"gif", "mp4"}:
+    if str(config.timelapse_format).lower() not in {"gif", "mp4"}:
         raise ValueError('TIMELAPSE_FORMAT must be "gif" or "mp4".')
-    if config.resampler.lower() not in {"native", "nearest"}:
+    if str(config.resampler).lower() not in {"native", "nearest"}:
         raise ValueError('RESAMPLER must be "native" or "nearest" for low-RAM processing.')
     if normalized_night_fallback_mode(config.night_fallback_mode) not in {"hybrid", "whole_frame_ir"}:
         raise ValueError('Night fallback mode must be "hybrid" or "whole_frame_ir".')
     validate_flat_map_settings(config)
+    if config.gpu_acceleration:
+        if not can_build_gpu_custom_composite(config.composite_choice):
+            raise ValueError(
+                "GPU acceleration is currently limited to True Color Reproduction Image and True Color RGB (Enhanced). "
+                "Disable GPU acceleration or choose one of those products."
+            )
+        require_gpu_ready()
     if config.add_border_lines:
         parse_rgb_color(config.border_line_color)
-        if config.border_line_width <= 0:
-            raise ValueError("Border line width must be positive.")
+        positive_finite_float(config.border_line_width, "Border line width")
         validate_overlay_ready_for_run(config)
 
 
@@ -2976,8 +4143,7 @@ def validate_overlay_ready_for_run(config: ProcessorConfig, project_dir: Path = 
     if not config.add_border_lines:
         return
     parse_rgb_color(config.border_line_color)
-    if config.border_line_width <= 0:
-        raise ValueError("Border line width must be positive.")
+    positive_finite_float(config.border_line_width, "Border line width")
     status = overlay_status(project_dir)
     if status.ok:
         return
@@ -2994,6 +4160,9 @@ def validate_overlay_ready_for_run(config: ProcessorConfig, project_dir: Path = 
 
 def validate_runtime_dependencies(config: ProcessorConfig, info: UrlInfo, start: datetime, area: AreaDefinition) -> None:
     validate_overlay_ready_for_run(config)
+    ensure_directory_writable(OUTPUT_DIR, "Output")
+    ensure_directory_writable(TEMP_DIR, "Temp/cache")
+    validate_timelapse_frame_size(area, config)
     preview_name = output_filename(
         info,
         start,
@@ -3011,6 +4180,11 @@ def validate_runtime_dependencies(config: ProcessorConfig, info: UrlInfo, start:
         )
     if writer_for_output(safe_name) == "geotiff":
         require_module("rasterio", "GeoTIFF output")
+    if config.gpu_acceleration and config.composite_choice not in {"True Color RGB (Enhanced)", "True Color Reproduction Image"}:
+        raise RuntimeError(
+            "GPU acceleration is currently limited to True Color Reproduction Image and True Color RGB (Enhanced). "
+            "Disable GPU acceleration or choose one of those products."
+        )
 
 
 def build_run_summary(config: ProcessorConfig) -> RunSummary:
@@ -3029,7 +4203,9 @@ def build_run_summary(config: ProcessorConfig) -> RunSummary:
     if config.use_night_fallback and uses_hybrid_night_fallback(config.composite_choice, config.night_fallback_mode):
         warnings.append("Hybrid night fallback fills the dark side with B13 infrared while keeping sunlit true color.")
     if is_flat_map(config):
-        warnings.append("Flat map output uses nearest-neighbor reprojection and a bounded regional extent.")
+        warnings.append("Web Mercator flat map output uses nearest-neighbor reprojection and a bounded regional extent.")
+    if config.gpu_acceleration:
+        warnings.append("GPU acceleration is experimental and only applies to compatible custom composite math.")
     if config.download_workers > 4:
         warnings.append("Download workers will be capped to 4.")
     if config.dask_num_workers > 2:
@@ -3063,6 +4239,26 @@ def preflight_run(config: ProcessorConfig, output_dir: Path = OUTPUT_DIR, temp_d
         if error not in errors:
             errors.append(error)
 
+    if not config.auto_download:
+        try:
+            info = parse_url(config.user_url)
+            start = datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
+            steps = frame_datetimes(start, config.mode, config.hours_back, config.interval_minutes)
+            bands = required_bands(
+                config.composite_choice,
+                use_night_fallback=config.use_night_fallback,
+                night_fallback_mode=config.night_fallback_mode,
+            )
+            total_expected = len(steps) * len(bands) * info.total_segments
+            missing = missing_cached_segments(config, info, steps, bands, temp_dir)
+            if missing:
+                error = offline_cache_summary(missing, total_expected)
+                if error not in errors:
+                    errors.append(error)
+        except Exception as exc:
+            if str(exc) not in errors:
+                errors.append(str(exc))
+
     if config.add_border_lines:
         status = overlay_status(PROJECT_DIR)
         if not status.ok:
@@ -3092,12 +4288,11 @@ def preset_config(name: str, base: ProcessorConfig | None = None) -> ProcessorCo
             auto_download=True,
             use_night_fallback=True,
             night_fallback_mode="hybrid",
-            download_workers=4,
+            download_workers=2,
             dask_num_workers=1,
-            dask_chunk_size="64MiB",
+            dask_chunk_size="32MiB",
             ram_limit_gb=10.0,
             resampler="native",
-            map_view="native",
             add_border_lines=False,
         )
     elif name == "Fast IR Check":
@@ -3108,12 +4303,11 @@ def preset_config(name: str, base: ProcessorConfig | None = None) -> ProcessorCo
             auto_download=True,
             use_night_fallback=False,
             night_fallback_mode="whole_frame_ir",
-            download_workers=2,
+            download_workers=1,
             dask_num_workers=1,
-            dask_chunk_size="64MiB",
+            dask_chunk_size="32MiB",
             ram_limit_gb=6.0,
             resampler="native",
-            map_view="native",
             add_border_lines=False,
         )
     elif name == "Low-RAM Timelapse":
@@ -3129,12 +4323,11 @@ def preset_config(name: str, base: ProcessorConfig | None = None) -> ProcessorCo
             auto_download=True,
             use_night_fallback=False,
             night_fallback_mode="whole_frame_ir",
-            download_workers=2,
+            download_workers=1,
             dask_num_workers=1,
-            dask_chunk_size="32MiB",
+            dask_chunk_size="16MiB",
             ram_limit_gb=8.0,
             resampler="native",
-            map_view="native",
             add_border_lines=False,
         )
     else:
@@ -3592,7 +4785,7 @@ def run(
         min_lat, max_lat, min_lon, max_lon, resolution_deg, _height, _width = checked_flat_map_parameters(config)
         master_area = flat_map_area(config)
         LOG.info(
-            "Flat map area locked: %sx%s px, lat %.3f..%.3f lon %.3f..%.3f at %.4g deg",
+            "Web Mercator flat map area locked: %sx%s px, lat %.3f..%.3f lon %.3f..%.3f at %.4g deg/pixel at equator",
             master_area.width,
             master_area.height,
             min_lat,
@@ -3743,33 +4936,41 @@ def migrate_default_cloud_sync_path(path: Path, project_child_name: str, local_d
 
 def setup_configuration_errors(config: ProcessorConfig) -> list[str]:
     errors: list[str] = []
-    if not config.user_url.strip():
+    if config.user_url is None or not str(config.user_url).strip():
         errors.append("Himawari URL is required.")
     if config.mode not in {"Single Image", "Timelapse"}:
         errors.append('Mode must be "Single Image" or "Timelapse".')
     if config.composite_choice not in COMPOSITE_BANDS:
         errors.append(f"Unsupported product: {config.composite_choice}")
-    if config.interval_minutes <= 0:
-        errors.append("Interval minutes must be positive.")
-    if config.hours_back <= 0:
-        errors.append("Hours back must be positive.")
-    if config.fps <= 0:
-        errors.append("FPS must be positive.")
-    if config.download_workers <= 0:
-        errors.append("Download workers must be positive.")
-    if config.dask_num_workers <= 0:
-        errors.append("Dask workers must be positive.")
-    if config.ram_limit_gb <= 0:
-        errors.append("RAM limit must be positive.")
-    if config.image_format.lower() not in {"png", "tif", "tiff", "geotiff"}:
+    for field_value, label in (
+        (config.interval_minutes, "Interval minutes"),
+        (config.hours_back, "Hours back"),
+        (config.fps, "FPS"),
+        (config.download_workers, "Download workers"),
+        (config.dask_num_workers, "Dask workers"),
+        (config.max_safe_png_pixels, "Max safe PNG pixels"),
+    ):
+        try:
+            positive_integer(field_value, label)
+        except ValueError as exc:
+            errors.append(str(exc))
+    try:
+        positive_finite_float(config.ram_limit_gb, "RAM limit")
+    except ValueError as exc:
+        errors.append(str(exc))
+    try:
+        validate_dask_chunk_size(config.dask_chunk_size)
+    except ValueError as exc:
+        errors.append(str(exc))
+    if str(config.image_format).lower() not in {"png", "tif", "tiff", "geotiff"}:
         errors.append('Image format must be "png" or "tif".')
     try:
         validate_output_template(config.output_template)
     except ValueError as exc:
         errors.append(str(exc))
-    if config.timelapse_format.lower() not in {"gif", "mp4"}:
+    if str(config.timelapse_format).lower() not in {"gif", "mp4"}:
         errors.append('Timelapse format must be "gif" or "mp4".')
-    if config.resampler.lower() not in {"native", "nearest"}:
+    if str(config.resampler).lower() not in {"native", "nearest"}:
         errors.append('Resampler must be "native" or "nearest".')
     if normalized_night_fallback_mode(config.night_fallback_mode) not in {"hybrid", "whole_frame_ir"}:
         errors.append('Night fallback mode must be "hybrid" or "whole_frame_ir".')
@@ -3782,8 +4983,19 @@ def setup_configuration_errors(config: ProcessorConfig) -> list[str]:
             parse_rgb_color(config.border_line_color)
         except ValueError as exc:
             errors.append(str(exc))
-        if config.border_line_width <= 0:
-            errors.append("Border line width must be positive.")
+        try:
+            positive_finite_float(config.border_line_width, "Border line width")
+        except ValueError as exc:
+            errors.append(str(exc))
+    if config.gpu_acceleration:
+        status = gpu_support_status()
+        if not status.ok:
+            errors.append("GPU acceleration is enabled, but GPU support is not ready. " + status.detail)
+        if config.composite_choice in COMPOSITE_BANDS and not can_build_gpu_custom_composite(config.composite_choice):
+            errors.append(
+                "GPU acceleration is currently limited to True Color Reproduction Image and True Color RGB (Enhanced). "
+                "Disable GPU acceleration or choose one of those products."
+            )
     return errors
 
 
@@ -3797,10 +5009,11 @@ def build_setup_status(
     errors = setup_configuration_errors(config)
     info: UrlInfo | None = None
     start: datetime | None = None
+    user_url_text = "" if config.user_url is None else str(config.user_url).strip()
 
-    if config.user_url.strip():
+    if user_url_text:
         try:
-            info = parse_url(config.user_url)
+            info = parse_url(user_url_text)
             start = datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
             details.append(f"Source: {info.area} {info.timestamp}, {info.total_segments} segments per band")
         except Exception as exc:
@@ -3819,7 +5032,16 @@ def build_setup_status(
                 frames = len(frame_datetimes(start, config.mode, config.hours_back, config.interval_minutes))
                 total_segments = frames * len(bands) * info.total_segments
                 frame_word = "frame" if frames == 1 else "frames"
-                details.append(f"Download estimate: {total_segments} segment file(s) across {frames} {frame_word}")
+                if config.auto_download:
+                    details.append(f"Download estimate: {total_segments} segment file(s) across {frames} {frame_word}")
+                else:
+                    steps = frame_datetimes(start, config.mode, config.hours_back, config.interval_minutes)
+                    missing = missing_cached_segments(config, info, steps, bands, temp_dir)
+                    summary = offline_cache_summary(missing, total_segments)
+                    if missing:
+                        errors.append(summary)
+                    else:
+                        details.append(summary)
             except Exception as exc:
                 errors.append(str(exc))
             if (
@@ -3837,6 +5059,14 @@ def build_setup_status(
                     "Full-disk 500 m PNG jobs may auto-switch to GeoTIFF for low-RAM writing."
                 )
 
+    if config.gpu_acceleration:
+        status = gpu_support_status()
+        if status.ok:
+            details.append(f"GPU acceleration: experimental custom-composite math on {status.device_name or 'CUDA GPU'}")
+            warnings.append("GPU mode keeps Satpy reading, reprojection, and image writing on the CPU path.")
+    else:
+        details.append("GPU acceleration: off")
+
     if config.add_border_lines:
         status = overlay_status(PROJECT_DIR)
         if not status.ok:
@@ -3850,14 +5080,18 @@ def build_setup_status(
         try:
             min_lat, max_lat, min_lon, max_lon, _resolution_deg, height, width = checked_flat_map_parameters(config)
             details.append(
-                "Map view: flat map "
+                "Map view: Web Mercator flat map "
                 f"{min_lat:g}..{max_lat:g} lat, "
                 f"{min_lon:g}..{max_lon:g} lon, "
                 f"{width}x{height} px"
             )
             warnings.append(
-                "Flat map output uses nearest-neighbor reprojection and may be slower than native disk output."
+                "Web Mercator flat map output uses nearest-neighbor reprojection and may be slower than native disk output."
             )
+            try:
+                validate_timelapse_frame_size(flat_map_area(config), config)
+            except RuntimeError as exc:
+                errors.append(str(exc))
         except ValueError as exc:
             if str(exc) not in errors:
                 errors.append(str(exc))
@@ -3872,6 +5106,12 @@ def build_setup_status(
             "Cloud-sync path detected; large output/temp writes are safer in local folders. "
             + "; ".join(cloud_matches)
         )
+    for label, path in (("Output", output_dir), ("Temp/cache", temp_dir)):
+        detail, error = setup_directory_writability(path, label)
+        if detail:
+            details.append(detail)
+        if error:
+            errors.append(error)
 
     return SetupStatus(
         ok=not errors,
@@ -3929,6 +5169,7 @@ class HimawariProcessorApp:
         self.flat_resolution_var = tk.StringVar(value=str(initial_config.flat_resolution_deg))
         self.timelapse_format_var = tk.StringVar(value=initial_config.timelapse_format)
         self.auto_download_var = tk.BooleanVar(value=initial_config.auto_download)
+        self.gpu_acceleration_var = tk.BooleanVar(value=initial_config.gpu_acceleration)
         self.night_fallback_var = tk.BooleanVar(value=initial_config.use_night_fallback)
         self.delete_frames_var = tk.BooleanVar(value=initial_config.delete_timelapse_frames)
         self.quality_fallback_var = tk.BooleanVar(value=initial_config.allow_quality_fallback)
@@ -3943,6 +5184,7 @@ class HimawariProcessorApp:
         self.selected_recent_run_id = ""
         self.output_dir_var = tk.StringVar(value=str(OUTPUT_DIR))
         self.temp_dir_var = tk.StringVar(value=str(TEMP_DIR))
+        self.pending_log_messages: list[str] = []
 
         self._build_ui()
         self._install_log_handler()
@@ -4086,6 +5328,15 @@ class HimawariProcessorApp:
         self.latest_url_button.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(2, 0))
         self.scan_browser_button = ttk.Button(source_frame, text="Choose Scan", command=self._open_scan_browser)
         self.scan_browser_button.grid(row=1, column=2, sticky="ew", padx=(8, 0), pady=(2, 0))
+        self.local_files_button = ttk.Button(source_frame, text="Local Files...", command=self._choose_local_hsd_files)
+        self.local_files_button.grid(row=1, column=3, sticky="ew", padx=(8, 0), pady=(2, 0))
+        self.local_drop_label = ttk.Label(
+            source_frame,
+            text="Local offline import: choose or drop .DAT / .DAT.bz2 segment files.",
+            style="Status.TLabel",
+        )
+        self.local_drop_label.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._setup_optional_local_drop_target()
 
         product_frame = ttk.LabelFrame(settings, text="Product", style="Section.TLabelframe")
         product_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(0, 10))
@@ -4261,13 +5512,38 @@ class HimawariProcessorApp:
         ttk.Combobox(
             performance_frame,
             textvariable=self.chunk_var,
-            values=("32MiB", "64MiB", "128MiB"),
+            values=DASK_CHUNK_CHOICES,
             state="readonly",
         ).grid(row=3, column=0, sticky="ew", padx=(0, 8), pady=(2, 0))
         ttk.Label(performance_frame, text="RAM Limit GiB").grid(row=2, column=1, sticky="w")
         ttk.Spinbox(performance_frame, from_=1, to=64, increment=0.5, textvariable=self.ram_limit_var, width=8).grid(
             row=3, column=1, sticky="ew", pady=(2, 0)
         )
+        self.safe_perf_button = ttk.Button(
+            performance_frame,
+            text="Safe Mode",
+            command=lambda: self._apply_performance_recommendation("safe"),
+        )
+        self.safe_perf_button.grid(row=4, column=0, sticky="ew", padx=(0, 8), pady=(10, 0))
+        self.best_perf_button = ttk.Button(
+            performance_frame,
+            text="Best Performance",
+            command=lambda: self._apply_performance_recommendation("best_performance"),
+        )
+        self.best_perf_button.grid(row=4, column=1, sticky="ew", pady=(10, 0))
+        self.gpu_check = ttk.Checkbutton(
+            performance_frame,
+            text="Use GPU (Experimental)",
+            variable=self.gpu_acceleration_var,
+            command=self._toggle_gpu_acceleration,
+        )
+        self.gpu_check.grid(row=5, column=0, sticky="w", pady=(10, 0))
+        self.gpu_fix_button = ttk.Button(
+            performance_frame,
+            text="GPU Fix",
+            command=self._open_gpu_environment_fix,
+        )
+        self.gpu_fix_button.grid(row=5, column=1, sticky="ew", pady=(10, 0))
 
         paths_frame = ttk.LabelFrame(advanced, text="Paths and Resampling", style="Section.TLabelframe")
         paths_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=(0, 10))
@@ -4392,6 +5668,7 @@ class HimawariProcessorApp:
         scroll = ttk.Scrollbar(self.log_frame, orient="vertical", command=self.log_text.yview)
         scroll.grid(row=1, column=3, sticky="ns")
         self.log_text.configure(yscrollcommand=scroll.set)
+        self._flush_pending_log_messages()
 
         buttons = ttk.Frame(self.root, padding=(16, 0, 16, 16))
         buttons.grid(row=2, column=0, sticky="ew")
@@ -4667,12 +5944,80 @@ class HimawariProcessorApp:
     def _refresh_ui_mode(self) -> None:
         if not hasattr(self, "advanced_tab_id"):
             return
-        tabs = set(self.notebook.tabs())
         if self.ui_mode_var.get() == "Simple":
-            if self.advanced_tab_id in tabs:
-                self.notebook.hide(self.advanced_tab_id)
-        elif self.advanced_tab_id not in tabs:
+            self.notebook.hide(self.advanced_tab_id)
+        else:
             self.notebook.add(self.advanced_tab_id, text="Advanced")
+            self.notebook.select(self.advanced_tab_id)
+
+    def _setup_optional_local_drop_target(self) -> None:
+        try:
+            import tkinterdnd2  # type: ignore
+        except Exception:
+            self.local_drop_label.configure(text="Use Local Files... to import .DAT / .DAT.bz2 segment files.")
+            return
+        if not hasattr(self.local_drop_label, "drop_target_register"):
+            self.local_drop_label.configure(text="Use Local Files... to import .DAT / .DAT.bz2 segment files.")
+            return
+        try:
+            self.local_drop_label.drop_target_register(tkinterdnd2.DND_FILES)
+            self.local_drop_label.dnd_bind("<<Drop>>", self._handle_local_file_drop)
+            self.local_drop_label.configure(text="Drop .DAT / .DAT.bz2 segment files here, or use Local Files...")
+            self._append_log("Local drag/drop import is available.")
+        except Exception as exc:
+            self._append_log(f"Local file picker ready. Drag/drop setup failed: {exc}")
+
+    def _split_drop_paths(self, raw_data: str) -> list[str]:
+        try:
+            parsed = self.root.tk.splitlist(raw_data)
+        except Exception:
+            parsed = raw_data.split()
+        return [str(path) for path in parsed if str(path).strip()]
+
+    def _handle_local_file_drop(self, event: tk.Event) -> str:
+        paths = self._split_drop_paths(str(getattr(event, "data", "")))
+        self._import_local_hsd_files(paths)
+        return "break"
+
+    def _choose_local_hsd_files(self) -> None:
+        if self.is_running:
+            return
+        selected = filedialog.askopenfilenames(
+            title="Choose local Himawari HSD segment files",
+            filetypes=(
+                ("Himawari HSD segments", "*.DAT *.DAT.bz2 *.dat *.dat.bz2"),
+                ("All files", "*.*"),
+            ),
+        )
+        self._import_local_hsd_files(selected)
+
+    def _import_local_hsd_files(self, paths: Iterable[str | Path]) -> None:
+        selected = [Path(path) for path in paths if str(path).strip()]
+        if not selected:
+            return
+        try:
+            result = import_local_hsd_segments(selected, TEMP_DIR)
+        except Exception as exc:
+            self.status_var.set("Local import failed")
+            self._append_log(f"Local file import failed: {exc}")
+            messagebox.showerror("Local import failed", str(exc))
+            return
+        self.url_var.set(result.synthetic_url)
+        self.auto_download_var.set(False)
+        self.mode_var.set("Single Image")
+        self.status_var.set("Local files imported")
+        setup_status = self._update_setup_status()
+        self._write_current_settings()
+        imported_count = len(result.imported_paths)
+        reused_count = len(result.reused_paths)
+        message = (
+            f"Imported local scan {result.area} {result.timestamp}: "
+            f"{imported_count} new, {reused_count} reused, bands {', '.join(result.bands)}."
+        )
+        self._append_log(message)
+        if not setup_status.ok:
+            message += "\n\n" + setup_status.display_text()
+        messagebox.showinfo("Local files imported", message)
 
     def _open_scan_browser(self) -> None:
         if self.is_running:
@@ -4749,6 +6094,7 @@ class HimawariProcessorApp:
             self.flat_resolution_var,
             self.timelapse_format_var,
             self.auto_download_var,
+            self.gpu_acceleration_var,
             self.night_fallback_var,
             self.delete_frames_var,
             self.quality_fallback_var,
@@ -4809,6 +6155,7 @@ class HimawariProcessorApp:
         self.flat_resolution_var.set(str(config.flat_resolution_deg))
         self.timelapse_format_var.set(config.timelapse_format)
         self.auto_download_var.set(config.auto_download)
+        self.gpu_acceleration_var.set(config.gpu_acceleration)
         self.night_fallback_var.set(config.use_night_fallback)
         self.delete_frames_var.set(config.delete_timelapse_frames)
         self.quality_fallback_var.set(config.allow_quality_fallback)
@@ -4827,6 +6174,46 @@ class HimawariProcessorApp:
         self._set_config_vars(config)
         self._write_current_settings()
         self._append_log(f"Applied preset: {name}")
+
+    def _apply_performance_recommendation(self, mode: str) -> None:
+        try:
+            recommendation = recommend_performance_settings(system_performance_profile(), mode)
+        except Exception as exc:
+            messagebox.showerror("Performance optimizer failed", str(exc))
+            return
+        self.download_workers_var.set(str(recommendation.download_workers))
+        self.dask_workers_var.set(str(recommendation.dask_num_workers))
+        self.chunk_var.set(recommendation.dask_chunk_size)
+        self.ram_limit_var.set(str(recommendation.ram_limit_gb))
+        self._update_setup_status()
+        self._write_current_settings()
+        self._append_log(
+            f"{recommendation.summary}; "
+            f"download workers={recommendation.download_workers}, "
+            f"Dask workers={recommendation.dask_num_workers}, "
+            f"chunk={recommendation.dask_chunk_size}, "
+            f"RAM limit={recommendation.ram_limit_gb:g} GiB"
+        )
+
+    def _toggle_gpu_acceleration(self) -> None:
+        if self.gpu_acceleration_var.get():
+            status = gpu_support_status()
+            if not status.ok:
+                self.gpu_acceleration_var.set(False)
+                self._update_setup_status()
+                self._write_current_settings()
+                self._append_log("GPU acceleration unavailable: " + status.detail)
+                if messagebox.askyesno(
+                    "GPU support is not ready",
+                    status.detail + "\n\nRun GPU Fix to install optional CuPy support?",
+                ):
+                    self._open_gpu_environment_fix()
+                return
+            self._append_log("GPU acceleration enabled: " + status.detail)
+        else:
+            self._append_log("GPU acceleration disabled; CPU processing path selected.")
+        self._update_setup_status()
+        self._write_current_settings()
 
     def _refresh_mode_state(self) -> None:
         is_timelapse = self.mode_var.get() == "Timelapse"
@@ -4848,6 +6235,11 @@ class HimawariProcessorApp:
             getattr(self, "auto_fix_button", None),
             getattr(self, "latest_url_button", None),
             getattr(self, "scan_browser_button", None),
+            getattr(self, "local_files_button", None),
+            getattr(self, "safe_perf_button", None),
+            getattr(self, "best_perf_button", None),
+            getattr(self, "gpu_check", None),
+            getattr(self, "gpu_fix_button", None),
             getattr(self, "overlay_check_button", None),
             getattr(self, "open_last_button", None),
             getattr(self, "copy_paths_button", None),
@@ -4880,24 +6272,41 @@ class HimawariProcessorApp:
 
     def _open_output_folder(self) -> None:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        if os.name == "nt":
-            os.startfile(str(OUTPUT_DIR))
-        else:
-            messagebox.showinfo("Output folder", str(OUTPUT_DIR))
+        self._open_existing_path(OUTPUT_DIR, "Output folder")
 
     def _open_temp_folder(self) -> None:
         TEMP_DIR.mkdir(parents=True, exist_ok=True)
-        if os.name == "nt":
-            os.startfile(str(TEMP_DIR))
-        else:
-            messagebox.showinfo("Temp folder", str(TEMP_DIR))
+        self._open_existing_path(TEMP_DIR, "Temp folder")
+
+    def _open_existing_path(self, path: Path, label: str = "Path") -> bool:
+        if not path.exists():
+            messagebox.showwarning(label, f"Location is not available:\n{path}")
+            self._append_log(f"Could not open {label.lower()}; path does not exist: {path}")
+            return False
+        try:
+            if os.name == "nt":
+                os.startfile(str(path))
+            else:
+                messagebox.showinfo(label, str(path))
+            return True
+        except Exception as exc:
+            messagebox.showwarning(label, f"Could not open location:\n{path}\n\n{exc}")
+            self._append_log(f"Could not open {label.lower()}: {exc}")
+            return False
 
     def _open_path(self, path: Path) -> None:
         target = path.parent if path.is_file() else path
-        if os.name == "nt":
-            os.startfile(str(target))
-        else:
-            messagebox.showinfo("Path", str(target))
+        if target.exists():
+            self._open_existing_path(target, "Path")
+            return
+        fallback = OUTPUT_DIR
+        fallback.mkdir(parents=True, exist_ok=True)
+        self._append_log(f"Requested path is unavailable: {target}. Opening output folder instead.")
+        messagebox.showwarning(
+            "Path unavailable",
+            f"Location is not available:\n{target}\n\nOpening output folder instead.",
+        )
+        self._open_existing_path(fallback, "Output folder")
 
     def _open_last_output(self) -> None:
         if not self.last_outputs:
@@ -4965,16 +6374,15 @@ class HimawariProcessorApp:
     def _open_environment_auto_fix(self) -> None:
         self._open_environment_command(["--auto"], "Environment auto fix")
 
+    def _open_gpu_environment_fix(self) -> None:
+        self._open_environment_command(["--gpu-fix"], "GPU environment fix")
+
     def _check_overlays(self) -> None:
         overlays_dir = PROJECT_DIR / "overlays"
         overlays_dir.mkdir(parents=True, exist_ok=True)
         status = overlay_status(PROJECT_DIR)
         self._append_log(status.display_text())
-        try:
-            if os.name == "nt":
-                os.startfile(str(overlays_dir))
-        except Exception as exc:
-            self._append_log(f"Could not open overlay folder: {exc}")
+        self._append_log(f"Overlay folder: {overlays_dir}")
         if status.ok:
             messagebox.showinfo("Overlay setup", status.display_text())
         else:
@@ -5016,6 +6424,7 @@ class HimawariProcessorApp:
             interval_minutes=int(self.interval_var.get()),
             fps=int(self.fps_var.get()),
             auto_download=self.auto_download_var.get(),
+            gpu_acceleration=self.gpu_acceleration_var.get(),
             use_night_fallback=self.night_fallback_var.get(),
             night_fallback_mode=self.night_fallback_mode_var.get(),
             download_workers=int(self.download_workers_var.get()),
@@ -5210,7 +6619,18 @@ class HimawariProcessorApp:
 
         self.root.after(100, self._poll_messages)
 
+    def _flush_pending_log_messages(self) -> None:
+        pending = list(getattr(self, "pending_log_messages", ()))
+        self.pending_log_messages = []
+        for message in pending:
+            self._append_log(message)
+
     def _append_log(self, message: str) -> None:
+        if not hasattr(self, "log_text"):
+            if not hasattr(self, "pending_log_messages"):
+                self.pending_log_messages = []
+            self.pending_log_messages.append(message)
+            return
         self.log_text.configure(state="normal")
         self.log_text.insert("end", message + "\n")
         self.log_text.see("end")
@@ -5218,7 +6638,12 @@ class HimawariProcessorApp:
 
 
 def launch_gui() -> None:
-    root = tk.Tk()
+    try:
+        from tkinterdnd2 import TkinterDnD  # type: ignore
+
+        root = TkinterDnD.Tk()
+    except Exception:
+        root = tk.Tk()
     HimawariProcessorApp(root)
     root.mainloop()
 

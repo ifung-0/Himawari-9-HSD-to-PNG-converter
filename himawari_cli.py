@@ -71,7 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fps", type=int, default=None)
     parser.add_argument("--download-workers", type=int, default=None)
     parser.add_argument("--dask-workers", dest="dask_num_workers", type=int, default=None)
-    parser.add_argument("--chunk-size", dest="dask_chunk_size", choices=("32MiB", "64MiB", "128MiB"), default=None)
+    parser.add_argument("--chunk-size", dest="dask_chunk_size", choices=processor.DASK_CHUNK_CHOICES, default=None)
     parser.add_argument("--ram-limit-gb", type=float, default=None)
     parser.add_argument("--image-format", metavar="png|tif", default=None)
     parser.add_argument(
@@ -90,6 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--flat-resolution-deg", type=float, default=None)
 
     parser.add_argument("--auto-download", type=parse_bool, default=None)
+    parser.add_argument("--gpu-acceleration", type=parse_bool, default=None)
     parser.add_argument("--night-fallback", dest="use_night_fallback", type=parse_bool, default=None)
     parser.add_argument("--delete-frames", dest="delete_timelapse_frames", type=parse_bool, default=None)
     parser.add_argument("--quality-fallback", dest="allow_quality_fallback", type=parse_bool, default=None)
@@ -109,6 +110,9 @@ def config_from_args(args: argparse.Namespace) -> processor.ProcessorConfig:
     config = processor.ProcessorConfig(**values)
     try:
         processor.validate_configuration(config)
+        setup_errors = processor.setup_configuration_errors(config)
+        if setup_errors:
+            raise ValueError(setup_errors[0])
     except Exception as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
     return config
@@ -131,11 +135,12 @@ def print_config(config: processor.ProcessorConfig) -> None:
     if processor.is_flat_map(config):
         print(
             "Flat bounds:        "
-            f"lat {config.flat_min_lat:g}..{config.flat_max_lat:g}, "
+            f"Web Mercator, lat {config.flat_min_lat:g}..{config.flat_max_lat:g}, "
             f"lon {config.flat_min_lon:g}..{config.flat_max_lon:g}, "
-            f"{config.flat_resolution_deg:g} deg"
+            f"{config.flat_resolution_deg:g} deg/px at equator"
         )
     print(f"Auto-download:      {yes_no(config.auto_download)}")
+    print(f"GPU acceleration:   {yes_no(config.gpu_acceleration)}")
     print(f"Night fallback:     {yes_no(config.use_night_fallback)}")
     print(f"Night mode:         {config.night_fallback_mode}")
     print(f"Delete frames:      {yes_no(config.delete_timelapse_frames)}")
@@ -231,6 +236,7 @@ def edit_basic_settings(config: processor.ProcessorConfig) -> processor.Processo
         values["timelapse_format"] = prompt_choice("Timelapse format", config.timelapse_format, ("gif", "mp4"))
         values["delete_timelapse_frames"] = prompt_bool("Delete frame images after assembly", config.delete_timelapse_frames)
     values["auto_download"] = prompt_bool("Auto-download missing files", config.auto_download)
+    values["gpu_acceleration"] = prompt_bool("Use GPU acceleration (experimental)", config.gpu_acceleration)
     values["use_night_fallback"] = prompt_bool("Use night fallback for day-only products", config.use_night_fallback)
     values["night_fallback_mode"] = prompt_choice(
         "Night fallback mode",
@@ -245,7 +251,7 @@ def edit_advanced_settings(config: processor.ProcessorConfig) -> processor.Proce
     values = config.__dict__.copy()
     values["download_workers"] = prompt_int("Download workers", config.download_workers, 1, 4)
     values["dask_num_workers"] = prompt_int("Dask workers", config.dask_num_workers, 1, 2)
-    values["dask_chunk_size"] = prompt_choice("Dask chunk size", config.dask_chunk_size, ("32MiB", "64MiB", "128MiB"))
+    values["dask_chunk_size"] = prompt_choice("Dask chunk size", config.dask_chunk_size, processor.DASK_CHUNK_CHOICES)
     values["ram_limit_gb"] = prompt_float("RAM limit GiB", config.ram_limit_gb, 1.0)
     values["resampler"] = prompt_choice("Resampler", config.resampler, ("native", "nearest"))
     values["map_view"] = prompt_choice("Map view", config.map_view, ("native", "flat"))

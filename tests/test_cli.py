@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import io
-import sys
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -48,6 +47,7 @@ class TestConfigFieldNames(unittest.TestCase):
             "interval_minutes",
             "fps",
             "auto_download",
+            "gpu_acceleration",
             "use_night_fallback",
             "night_fallback_mode",
             "download_workers",
@@ -144,6 +144,7 @@ class TestBuildParser(unittest.TestCase):
             "flat_max_lon",
             "flat_resolution_deg",
             "auto_download",
+            "gpu_acceleration",
             "use_night_fallback",
             "delete_timelapse_frames",
             "allow_quality_fallback",
@@ -163,6 +164,7 @@ class TestBuildParser(unittest.TestCase):
         self.assertIsNone(args.interval_minutes)
         self.assertIsNone(args.fps)
         self.assertIsNone(args.auto_download)
+        self.assertIsNone(args.gpu_acceleration)
         self.assertIsNone(args.use_night_fallback)
         self.assertIsNone(args.night_fallback_mode)
         self.assertIsNone(args.download_workers)
@@ -191,10 +193,13 @@ class TestBuildParser(unittest.TestCase):
         self.assertTrue(args.auto_download)
         self.assertFalse(args.use_night_fallback)
 
+        args = parser.parse_args(["--gpu-acceleration", "yes"])
+        self.assertTrue(args.gpu_acceleration)
+
     def test_parser_parses_chunk_size(self):
         parser = cli.build_parser()
-        args = parser.parse_args(["--chunk-size", "64MiB"])
-        self.assertEqual(args.dask_chunk_size, "64MiB")
+        args = parser.parse_args(["--chunk-size", "16MiB"])
+        self.assertEqual(args.dask_chunk_size, "16MiB")
 
     def test_parser_rejects_invalid_chunk_size(self):
         parser = cli.build_parser()
@@ -237,15 +242,18 @@ class TestConfigFromArgs(unittest.TestCase):
         config = cli.config_from_args(namespace)
         self.assertIsInstance(config, h.ProcessorConfig)
 
-    def test_builds_config_with_custom_args(self):
+    @mock.patch("himawari_cli.processor.gpu_support_status")
+    def test_builds_config_with_custom_args(self, mock_gpu):
+        mock_gpu.return_value = h.GpuSupportStatus(True, "ready", device_name="Test GPU", device_count=1)
         namespace = cli.build_parser().parse_args([
             "--url", "http://example.com/test.dat",
             "--mode", "Timelapse",
-            "--composite", "B13 (Infrared Window)",
+            "--composite", "True Color Reproduction Image",
             "--hours-back", "6",
             "--interval-minutes", "30",
             "--fps", "10",
             "--auto-download", "yes",
+            "--gpu-acceleration", "yes",
             "--night-fallback", "no",
             "--download-workers", "2",
             "--timelapse-format", "mp4",
@@ -269,11 +277,12 @@ class TestConfigFromArgs(unittest.TestCase):
         config = cli.config_from_args(namespace)
         self.assertEqual(config.user_url, "http://example.com/test.dat")
         self.assertEqual(config.mode, "Timelapse")
-        self.assertEqual(config.composite_choice, "B13 (Infrared Window)")
+        self.assertEqual(config.composite_choice, "True Color Reproduction Image")
         self.assertEqual(config.hours_back, 6)
         self.assertEqual(config.interval_minutes, 30)
         self.assertEqual(config.fps, 10)
         self.assertTrue(config.auto_download)
+        self.assertTrue(config.gpu_acceleration)
         self.assertFalse(config.use_night_fallback)
         self.assertEqual(config.download_workers, 2)
         self.assertEqual(config.timelapse_format, "mp4")
@@ -301,6 +310,17 @@ class TestConfigFromArgs(unittest.TestCase):
         with self.assertRaises(argparse.ArgumentTypeError):
             cli.config_from_args(namespace)
 
+    @mock.patch("himawari_cli.processor.gpu_support_status")
+    def test_rejects_gpu_for_unsupported_product(self, mock_gpu):
+        mock_gpu.return_value = h.GpuSupportStatus(True, "ready", device_name="Test GPU", device_count=1)
+        namespace = cli.build_parser().parse_args([
+            "--gpu-acceleration", "yes",
+            "--composite", "B13 (Infrared Window)",
+        ])
+
+        with self.assertRaisesRegex(argparse.ArgumentTypeError, "GPU acceleration is currently limited"):
+            cli.config_from_args(namespace)
+
 
 class TestPrintConfig(unittest.TestCase):
     def test_prints_expected_lines(self):
@@ -321,6 +341,7 @@ class TestPrintConfig(unittest.TestCase):
         self.assertIn("Resampler:", output)
         self.assertIn("Map view:", output)
         self.assertIn("Auto-download:", output)
+        self.assertIn("GPU acceleration:", output)
         self.assertIn("Night fallback:", output)
         self.assertIn("Night mode:", output)
         self.assertIn("Delete frames:", output)
@@ -477,7 +498,7 @@ class TestEditBasicSettings(unittest.TestCase):
         "png",
         "hybrid",
     ])
-    @mock.patch("himawari_cli.prompt_bool", side_effect=[True, True, True, True])
+    @mock.patch("himawari_cli.prompt_bool", side_effect=[True, True, True, True, True])
     def test_edits_basic_settings_single_image(self, mock_bool, mock_choice, mock_text):
         config = h.default_config()
         result = cli.edit_basic_settings(config)
@@ -495,7 +516,7 @@ class TestEditBasicSettings(unittest.TestCase):
         "hybrid",
     ])
     @mock.patch("himawari_cli.prompt_int", side_effect=[12, 30, 15])
-    @mock.patch("himawari_cli.prompt_bool", side_effect=[True, True, True, True])
+    @mock.patch("himawari_cli.prompt_bool", side_effect=[True, True, True, True, True])
     def test_edits_basic_settings_timelapse(self, mock_bool, mock_int, mock_choice, mock_text):
         config = h.default_config()
         result = cli.edit_basic_settings(config)

@@ -4,19 +4,25 @@ import argparse
 import importlib
 import importlib.metadata as metadata
 import importlib.util
+import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import urllib.error
 import urllib.request
+import warnings
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
 REQUIREMENTS_FILE = PROJECT_DIR / "requirements.txt"
+GPU_REQUIREMENTS_FILE = PROJECT_DIR / "requirements-gpu.txt"
 VENV_DIR = PROJECT_DIR / ".venv"
 LOCAL_APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
 APP_DATA_DIR = LOCAL_APP_DATA_DIR / "Himawari9LowRamProcessor"
@@ -39,7 +45,7 @@ TRUE_COLOR = "true_color"
 TRUE_COLOR_UI = "True Color RGB (Enhanced)"
 TRUE_COLOR_REPRODUCTION = "true_color_reproduction"
 TRUE_COLOR_REPRODUCTION_UI = "True Color Reproduction Image"
-GROUP_ORDER = ("Python", "Packages", "Satpy", "Project", "Overlays", "Paths")
+GROUP_ORDER = ("Python", "Packages", "GPU", "Satpy", "Project", "Project Cleanup", "Overlays", "Paths")
 SATPY_CONFIG_ENV_VARS = ("SATPY_CONFIG_PATH", "PPP_CONFIG_DIR")
 CLOUD_SYNC_PREFIXES = ("onedrive", "dropbox", "google drive", "icloud")
 CLOUD_SYNC_EXACT = ("box",)
@@ -47,6 +53,49 @@ LAUNCHER_HELPERS = {
     "run_gui.bat": "himawari_lowram_processor.py",
     "run_cli.bat": "himawari_cli.py",
     "check_environment.bat": "check_environment.py",
+}
+RUNTIME_JSON_FILES = (
+    "himawari_gui_settings.json",
+    "himawari_recent_runs.json",
+    "himawari_custom_presets.json",
+)
+CORE_ROOT_FILES = {
+    ".gitignore",
+    "check_environment.bat",
+    "check_environment.py",
+    "himawari_cli.py",
+    "himawari_lowram_processor.py",
+    "install_requirements.py",
+    "LICENSE",
+    "README.md",
+    "requirements-gpu.txt",
+    "requirements.txt",
+    "run_cli.bat",
+    "run_gui.bat",
+    *RUNTIME_JSON_FILES,
+}
+ROOT_CLEANUP_EXTENSIONS = {".py", ".bat", ".ipynb"}
+KNOWN_UNUSED_ROOT_FILES = {
+    "HW_9_to_png_tiff 2.(old version)ipynb": "old notebook replaced by the low-RAM processor",
+    "tiff_to_png_converter.py": "standalone TIFF converter is not part of the supported app workflow",
+    "himawari_dashboard.py": "removed dashboard entrypoint is out of scope for the HSD processor",
+    "himawari_l2_analytics.py": "removed L2 analytics entrypoint is out of scope for the HSD processor",
+    "run_dashboard.bat": "removed dashboard launcher is out of scope for the HSD processor",
+}
+PROTECTED_ROOT_DIRS = {
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".cache",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "cleanup_archive",
+    "outputs",
+    "overlays",
+    "temp",
+    "tests",
 }
 
 
@@ -75,11 +124,18 @@ class OverlayInstallResult:
     missing_paths: tuple[Path, ...] = ()
 
 
+@dataclass(frozen=True)
+class CleanupCandidate:
+    path: Path
+    reason: str
+
+
 PACKAGE_CHECKS = (
     PackageCheck("satpy", "satpy", "Satpy scene processing"),
     PackageCheck("dask", "dask", "lazy array processing"),
     PackageCheck("xarray", "xarray", "lazy labelled arrays"),
     PackageCheck("pyresample", "pyresample", "native/geographic resampling"),
+    PackageCheck("pyproj", "pyproj", "Web Mercator flat-map projection"),
     PackageCheck("requests", "requests", "NOAA AWS downloads"),
     PackageCheck("imageio", "imageio", "GIF/MP4 assembly"),
     PackageCheck("PIL", "pillow", "PNG image writing"),
@@ -91,6 +147,7 @@ PACKAGE_CHECKS = (
     PackageCheck("pycoast", "pycoast", "coastline and border overlays", critical=False),
     PackageCheck("aggdraw", "aggdraw", "pycoast overlay drawing", critical=False),
     PackageCheck("imageio_ffmpeg", "imageio-ffmpeg", "MP4 timelapse writing", critical=False),
+    PackageCheck("tkinterdnd2", "tkinterdnd2", "local file drag/drop import", critical=False),
 )
 
 def version_tuple(version: str) -> tuple[int, ...]:
@@ -122,10 +179,27 @@ def module_import_result(import_name: str) -> tuple[bool, str]:
         return False, f"module probe failed: {exc.__class__.__name__}: {exc}"
 
     try:
-        importlib.import_module(import_name)
+        with suppressed_known_environment_warnings():
+            importlib.import_module(import_name)
     except Exception as exc:
         return False, f"import failed: {exc.__class__.__name__}: {exc}"
     return True, "importable"
+
+
+@contextmanager
+def suppressed_known_environment_warnings():
+    with warnings.catch_warnings():
+        configure_known_warning_filters()
+        yield
+
+
+def configure_known_warning_filters() -> None:
+    warnings.filterwarnings(
+        "ignore",
+        message="CUDA path could not be detected.*",
+        category=UserWarning,
+        module=r"cupy\._environment",
+    )
 
 
 def module_available(import_name: str) -> bool:
@@ -210,6 +284,14 @@ def satpy_config_environment_detail() -> str:
 def pip_install_command(upgrade: bool = True, python_executable: str | Path | None = None) -> list[str]:
     python_executable = str(python_executable or sys.executable)
     command = [python_executable, "-m", "pip", "install", "-r", str(REQUIREMENTS_FILE)]
+    if upgrade:
+        command.insert(4, "--upgrade")
+    return command
+
+
+def gpu_pip_install_command(upgrade: bool = True, python_executable: str | Path | None = None) -> list[str]:
+    python_executable = str(python_executable or sys.executable)
+    command = [python_executable, "-m", "pip", "install", "-r", str(GPU_REQUIREMENTS_FILE)]
     if upgrade:
         command.insert(4, "--upgrade")
     return command
@@ -313,6 +395,65 @@ def check_package(package: PackageCheck, minimums: dict[str, str]) -> CheckResul
 def check_packages() -> list[CheckResult]:
     minimums = minimum_versions_from_requirements()
     return [check_package(package, minimums) for package in PACKAGE_CHECKS]
+
+
+def check_gpu_support() -> list[CheckResult]:
+    results = [
+        CheckResult("GPU requirements file", GPU_REQUIREMENTS_FILE.exists(), str(GPU_REQUIREMENTS_FILE), critical=False)
+    ]
+    if importlib.util.find_spec("cupy") is None:
+        results.append(
+            CheckResult(
+                "CuPy GPU package",
+                False,
+                "CuPy is not installed; run --gpu-fix to install optional NVIDIA/CUDA GPU support",
+                critical=False,
+            )
+        )
+        return results
+    try:
+        import cupy as cp  # type: ignore
+    except Exception as exc:
+        results.append(CheckResult("CuPy GPU package", False, f"import failed: {exc}", critical=False))
+        return results
+
+    version = str(getattr(cp, "__version__", "unknown"))
+    results.append(CheckResult("CuPy GPU package", True, f"CuPy {version} importable", critical=False))
+    try:
+        device_count = int(cp.cuda.runtime.getDeviceCount())
+    except Exception as exc:
+        results.append(CheckResult("CUDA GPU device", False, f"device check failed: {exc}", critical=False))
+        return results
+    if device_count <= 0:
+        results.append(CheckResult("CUDA GPU device", False, "no CUDA device found", critical=False))
+        return results
+    try:
+        props = cp.cuda.runtime.getDeviceProperties(0)
+        raw_name = props.get("name", b"")
+        device_name = raw_name.decode("utf-8", errors="replace") if isinstance(raw_name, bytes) else str(raw_name)
+    except Exception:
+        device_name = "CUDA device 0"
+    results.append(CheckResult("CUDA GPU device", True, f"{device_name} ({device_count} device(s))", critical=False))
+    try:
+        test = cp.asarray([1], dtype=cp.float32)
+        test = (test + cp.float32(1.0)).astype(cp.float32)
+        cp.cuda.Stream.null.synchronize()
+        if float(cp.asnumpy(test)[0]) != 2.0:
+            raise RuntimeError("unexpected CUDA test result")
+        del test
+        cp.get_default_memory_pool().free_all_blocks()
+    except Exception as exc:
+        results.append(
+            CheckResult(
+                "CUDA kernel test",
+                False,
+                f"kernel test failed: {exc}; run --gpu-fix to install CuPy with CUDA toolkit headers",
+                critical=False,
+            )
+        )
+    else:
+        results.append(CheckResult("CUDA kernel test", True, "small CuPy kernel operation succeeded", critical=False))
+    return results
 
 
 def overlay_data_required_paths(project_dir: Path = PROJECT_DIR) -> tuple[Path, ...]:
@@ -444,21 +585,23 @@ def ensure_overlay_folder(project_dir: Path = PROJECT_DIR, open_folder: bool = F
     for path in (*overlay_data_required_paths(project_dir), *missing_overlay_sidecar_paths(project_dir)):
         print(f"  {path}")
     print("Quick Fix can download and install the needed low-resolution shapefiles automatically.")
-    if open_folder and os.name == "nt":
-        try:
-            os.startfile(str(overlays_dir))
-        except OSError as exc:
-            print(f"Could not open overlay folder: {exc}", file=sys.stderr)
+    if open_folder:
+        open_path_in_file_manager(overlays_dir)
     return overlays_dir
+
+
+def open_path_in_file_manager(path: Path) -> None:
+    if os.name != "nt":
+        return
+    try:
+        os.startfile(str(path))
+    except OSError as exc:
+        print(f"Could not open overlay folder: {exc}", file=sys.stderr)
 
 
 def open_overlay_folder(project_dir: Path = PROJECT_DIR) -> None:
     overlays_dir = project_dir / "overlays"
-    if os.name == "nt":
-        try:
-            os.startfile(str(overlays_dir))
-        except OSError as exc:
-            print(f"Could not open overlay folder: {exc}", file=sys.stderr)
+    open_path_in_file_manager(overlays_dir)
 
 
 def download_file(urls: tuple[str, ...], destination: Path, timeout: int = 60) -> tuple[bool, str]:
@@ -784,6 +927,155 @@ def check_cloud_sync_locations(paths: list[Path] | None = None) -> CheckResult:
     )
 
 
+def root_cleanup_candidates(project_dir: Path = PROJECT_DIR) -> list[CleanupCandidate]:
+    if not project_dir.exists():
+        return []
+
+    candidates: list[CleanupCandidate] = []
+    for path in sorted(project_dir.iterdir(), key=lambda item: item.name.lower()):
+        name = path.name
+        if path.is_dir() or name in CORE_ROOT_FILES:
+            continue
+        reason = KNOWN_UNUSED_ROOT_FILES.get(name)
+        if reason is not None:
+            candidates.append(CleanupCandidate(path, reason))
+            continue
+        if path.suffix.lower() not in ROOT_CLEANUP_EXTENSIONS:
+            continue
+        if reason is None:
+            reason = "extra root-level program file is not part of the supported app entrypoints"
+        candidates.append(CleanupCandidate(path, reason))
+    return candidates
+
+
+def check_project_cleanup(project_dir: Path = PROJECT_DIR) -> CheckResult:
+    candidates = root_cleanup_candidates(project_dir)
+    if not candidates:
+        return CheckResult(
+            "unused root programs",
+            True,
+            "no obsolete or extra root-level program files found",
+            critical=False,
+        )
+    details = "; ".join(f"{candidate.path.name} ({candidate.reason})" for candidate in candidates)
+    return CheckResult(
+        "unused root programs",
+        False,
+        "archive recommended for: " + details,
+        critical=False,
+    )
+
+
+def runtime_json_paths(project_dir: Path = PROJECT_DIR) -> tuple[Path, ...]:
+    return tuple(project_dir / name for name in RUNTIME_JSON_FILES)
+
+
+def check_runtime_json_files(project_dir: Path = PROJECT_DIR) -> CheckResult:
+    invalid = []
+    present = 0
+    for path in runtime_json_paths(project_dir):
+        if not path.exists():
+            continue
+        present += 1
+        try:
+            json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            invalid.append(f"{path.name}: {exc.__class__.__name__}: {exc}")
+
+    if invalid:
+        return CheckResult("runtime settings JSON", False, "; ".join(invalid), critical=False)
+    if present:
+        return CheckResult(
+            "runtime settings JSON",
+            True,
+            f"{present} local settings/history file(s) parse as JSON",
+            critical=False,
+        )
+    return CheckResult("runtime settings JSON", True, "no local settings/history JSON files found", critical=False)
+
+
+def cleanup_archive_dir(project_dir: Path = PROJECT_DIR, timestamp: str | None = None) -> Path:
+    timestamp = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+    return project_dir / "cleanup_archive" / timestamp
+
+
+def safe_relative_to_project(path: Path, project_dir: Path) -> Path:
+    return path.resolve().relative_to(project_dir.resolve())
+
+
+def protected_cleanup_candidate(path: Path, project_dir: Path = PROJECT_DIR) -> bool:
+    try:
+        relative = safe_relative_to_project(path, project_dir)
+    except ValueError:
+        return True
+    if len(relative.parts) != 1:
+        return True
+    name = relative.parts[0]
+    if name in CORE_ROOT_FILES or name in PROTECTED_ROOT_DIRS:
+        return True
+    if name in KNOWN_UNUSED_ROOT_FILES:
+        return False
+    return path.suffix.lower() not in ROOT_CLEANUP_EXTENSIONS
+
+
+def archive_unused_programs(project_dir: Path = PROJECT_DIR, timestamp: str | None = None) -> CheckResult:
+    candidates = root_cleanup_candidates(project_dir)
+    if not candidates:
+        return CheckResult("archive unused programs", True, "no cleanup candidates to archive", critical=False)
+
+    archive_dir = cleanup_archive_dir(project_dir, timestamp)
+    manifest: list[dict[str, object]] = []
+    failures = []
+    moved = 0
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    for candidate in candidates:
+        source = candidate.path
+        if protected_cleanup_candidate(source, project_dir):
+            failures.append(f"{source.name}: protected path was skipped")
+            continue
+        if not source.exists():
+            failures.append(f"{source.name}: file disappeared before archiving")
+            continue
+        destination = archive_dir / source.name
+        try:
+            stat = source.stat()
+            shutil.move(str(source), str(destination))
+        except Exception as exc:
+            failures.append(f"{source.name}: {exc.__class__.__name__}: {exc}")
+            continue
+        moved += 1
+        manifest.append(
+            {
+                "original_path": str(source),
+                "archived_path": str(destination),
+                "size": stat.st_size,
+                "modified_time": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+                "reason": candidate.reason,
+            }
+        )
+
+    if manifest:
+        (archive_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    if failures:
+        return CheckResult(
+            "archive unused programs",
+            False,
+            f"archived {moved} file(s) to {archive_dir}; issues: " + "; ".join(failures),
+            critical=False,
+        )
+    return CheckResult(
+        "archive unused programs",
+        True,
+        f"archived {moved} file(s) to {archive_dir}",
+        critical=False,
+    )
+
+
 def check_satpy_version() -> CheckResult:
     version = package_version("satpy")
     if version is None:
@@ -995,7 +1287,7 @@ def check_app_version() -> CheckResult:
     return CheckResult("app version", False, "APP_VERSION is missing")
 
 
-def run_checks() -> list[CheckResult]:
+def run_checks(include_gpu: bool = False) -> list[CheckResult]:
     python_ok = supported_python_version()
     results = [
         CheckResult("python executable", True, sys.executable, critical=False),
@@ -1041,6 +1333,10 @@ def run_checks() -> list[CheckResult]:
         results.append(check_project_true_color_fallback_runtime())
     results.append(check_overlay_data())
     results.append(check_pycoast_overlay_runtime())
+    if include_gpu:
+        results.extend(check_gpu_support())
+    results.append(check_project_cleanup())
+    results.append(check_runtime_json_files())
     results.append(check_launcher_helpers())
     results.extend(check_default_path_writability())
     results.append(check_cloud_sync_locations())
@@ -1055,8 +1351,12 @@ def result_group(result: CheckResult) -> str:
     package_names = {package.import_name for package in PACKAGE_CHECKS}
     if result.name in {"python executable", "python version", "requirements file", "pip repair tool"}:
         return "Python"
+    if result.name.startswith("GPU") or result.name.startswith("CuPy") or result.name.startswith("CUDA"):
+        return "GPU"
     if result.name in package_names:
         return "Packages"
+    if result.name in {"unused root programs", "runtime settings JSON", "archive unused programs"}:
+        return "Project Cleanup"
     if result.name.startswith("satpy") or result.name.startswith("Satpy") or "AHI" in result.name:
         return "Satpy"
     if result.name in {"overlay data files", "pycoast overlay runtime"}:
@@ -1148,6 +1448,9 @@ def print_next_steps(results: list[CheckResult]) -> None:
         print("  border overlays, MP4 writing, or official Satpy true color may be limited.")
         print("  To repair optional helpers, run:")
         print("     " + command_text([sys.executable, str(Path(__file__).resolve()), "--fix"]))
+        if any(result_group(result) == "GPU" for result in results if not result.ok and not result.critical):
+            print("  To repair optional GPU acceleration support, run:")
+            print("     " + command_text([sys.executable, str(Path(__file__).resolve()), "--gpu-fix"]))
         print("  For border overlays, Quick Fix downloads the needed low-resolution GSHHS/WDBII shapefiles.")
         print("  For path warnings, choose local non-synced output/temp folders such as C:\\Himawari\\outputs.")
         print("  You can also use the custom low-RAM true color fallback from the GUI or CLI.")
@@ -1198,6 +1501,7 @@ def run_fix(
     open_overlays: bool = True,
     install_overlays: bool = True,
     force_overlay_data: bool = False,
+    archive_unused: bool = True,
 ) -> int:
     if not REQUIREMENTS_FILE.exists():
         print(f"Cannot repair: missing requirements file: {REQUIREMENTS_FILE}", file=sys.stderr)
@@ -1219,7 +1523,25 @@ def run_fix(
             return 1
     else:
         ensure_overlay_folder(open_folder=open_overlays)
+    if archive_unused:
+        cleanup_result = archive_unused_programs(PROJECT_DIR)
+        print(f"{status_label(cleanup_result)}: {cleanup_result.name}: {cleanup_result.detail}")
     return result
+
+
+def run_gpu_fix(python_executable: str | Path | None = None) -> int:
+    if not GPU_REQUIREMENTS_FILE.exists():
+        print(f"Cannot repair GPU support: missing requirements file: {GPU_REQUIREMENTS_FILE}", file=sys.stderr)
+        return 1
+    pip_result = check_pip_available(python_executable)
+    if not pip_result.ok:
+        print(f"Cannot repair GPU support: {pip_result.detail}", file=sys.stderr)
+        return 1
+    command = gpu_pip_install_command(upgrade=True, python_executable=python_executable)
+    print(f"Current Python: {sys.executable}")
+    print(f"Target Python:  {python_executable or sys.executable}")
+    print("Running:", command_text(command))
+    return subprocess.call(command, cwd=PROJECT_DIR)
 
 
 def run_environment_check_with(python_executable: str | Path) -> int:
@@ -1232,6 +1554,7 @@ def run_auto_fix(
     results: list[CheckResult],
     install_overlays: bool = True,
     force_overlay_data: bool = False,
+    archive_unused: bool = True,
 ) -> int:
     python_result = next((result for result in results if result.name == "python version"), None)
     if python_result is not None and not python_result.ok:
@@ -1245,6 +1568,7 @@ def run_auto_fix(
             python_path,
             install_overlays=install_overlays,
             force_overlay_data=force_overlay_data,
+            archive_unused=archive_unused,
         )
         if fix_code != 0:
             return fix_code
@@ -1260,6 +1584,7 @@ def run_auto_fix(
     return run_fix(
         install_overlays=install_overlays,
         force_overlay_data=force_overlay_data,
+        archive_unused=archive_unused,
     )
 
 
@@ -1286,6 +1611,16 @@ def main() -> int:
         help="Print compact one-line-per-check output.",
     )
     parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="Include optional NVIDIA/CuPy GPU acceleration diagnostics.",
+    )
+    parser.add_argument(
+        "--gpu-fix",
+        action="store_true",
+        help="Install/upgrade optional GPU packages from requirements-gpu.txt, then re-check GPU support.",
+    )
+    parser.add_argument(
         "--skip-overlay-data",
         action="store_true",
         help="Repair Python packages but do not download/install GSHHS/WDBII overlay data.",
@@ -1295,14 +1630,41 @@ def main() -> int:
         action="store_true",
         help="Re-download/reinstall GSHHS/WDBII overlay data even if required files already exist.",
     )
+    parser.add_argument(
+        "--archive-unused",
+        action="store_true",
+        help="Archive obsolete/extra root-level program files without reinstalling packages.",
+    )
+    parser.add_argument(
+        "--no-archive-unused",
+        action="store_true",
+        help="Skip cleanup archiving during --fix or --auto.",
+    )
     args = parser.parse_args()
 
+    configure_known_warning_filters()
     print_banner()
 
-    results = run_checks()
+    include_gpu = args.gpu or args.gpu_fix
+    results = run_checks(include_gpu=include_gpu)
     print_results(results, grouped=not args.plain)
 
-    if args.auto:
+    archive_unused = not args.no_archive_unused
+
+    if args.archive_unused:
+        print()
+        cleanup_result = archive_unused_programs(PROJECT_DIR)
+        print(f"{status_label(cleanup_result)}: {cleanup_result.name}: {cleanup_result.detail}")
+        results = run_checks(include_gpu=include_gpu)
+        print_results(results, grouped=not args.plain)
+    elif args.gpu_fix:
+        print()
+        fix_code = run_gpu_fix()
+        if fix_code != 0:
+            return fix_code
+        results = run_checks(include_gpu=True)
+        print_results(results, grouped=not args.plain)
+    elif args.auto:
         print()
         python_result = next((result for result in results if result.name == "python version"), None)
         current_python_supported = python_result is None or python_result.ok
@@ -1310,6 +1672,7 @@ def main() -> int:
             results,
             install_overlays=not args.skip_overlay_data,
             force_overlay_data=args.force_overlay_data,
+            archive_unused=archive_unused,
         )
         if fix_code != 0:
             return fix_code
@@ -1322,6 +1685,7 @@ def main() -> int:
         fix_code = run_fix(
             install_overlays=not args.skip_overlay_data,
             force_overlay_data=args.force_overlay_data,
+            archive_unused=archive_unused,
         )
         if fix_code != 0:
             return fix_code
