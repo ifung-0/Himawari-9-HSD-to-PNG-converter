@@ -115,6 +115,7 @@ ZOOM_EARTH_LABEL_POINTS = (
     ("INDONESIA", -2.0, 118.0, "land"),
     ("PAPUA NEW\nGUINEA", -6.0, 145.0, "land"),
     ("AUSTRALIA", -25.0, 134.0, "land"),
+    ("NEW\nZEALAND", -42.0, 172.5, "land"),
     ("INDIA", 22.0, 78.0, "land"),
     ("North Pacific\nOcean", 29.0, 173.0, "water"),
     ("Indian\nOcean", -27.0, 82.0, "water"),
@@ -3078,6 +3079,54 @@ def fill_invalid_flat_map_pixels(image, valid_mask: np.ndarray | None) -> None:
     image.paste(Image.fromarray(rgb, mode="RGB").convert(image.mode))
 
 
+def edge_connected_mask(candidate: np.ndarray) -> np.ndarray | None:
+    mask = np.asarray(candidate, dtype=bool)
+    if mask.ndim != 2 or not bool(mask.any()):
+        return None
+    seed = np.zeros(mask.shape, dtype=bool)
+    seed[0, :] = mask[0, :]
+    seed[-1, :] = mask[-1, :]
+    seed[:, 0] |= mask[:, 0]
+    seed[:, -1] |= mask[:, -1]
+    if not bool(seed.any()):
+        return None
+    try:
+        from scipy import ndimage
+
+        connected = ndimage.binary_propagation(seed, mask=mask)
+    except Exception:
+        from collections import deque
+
+        connected = np.zeros(mask.shape, dtype=bool)
+        queue: deque[tuple[int, int]] = deque()
+        for y, x in np.argwhere(seed):
+            connected[int(y), int(x)] = True
+            queue.append((int(y), int(x)))
+        height, width = mask.shape
+        while queue:
+            y, x = queue.popleft()
+            for yy, xx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= yy < height and 0 <= xx < width and mask[yy, xx] and not connected[yy, xx]:
+                    connected[yy, xx] = True
+                    queue.append((yy, xx))
+    if not bool(connected.any()):
+        return None
+    return np.asarray(connected, dtype=bool)
+
+
+def fill_flat_map_edge_artifacts(image) -> None:
+    from PIL import Image
+
+    rgb = np.asarray(image.convert("RGB")).copy()
+    luminance = 0.2126 * rgb[:, :, 0] + 0.7152 * rgb[:, :, 1] + 0.0722 * rgb[:, :, 2]
+    candidate = (luminance < 22.0) & (rgb.max(axis=2) < 55)
+    edge_mask = edge_connected_mask(candidate)
+    if edge_mask is None:
+        return
+    rgb[edge_mask] = np.asarray(FLAT_MAP_INVALID_FILL, dtype=np.uint8)
+    image.paste(Image.fromarray(rgb, mode="RGB").convert(image.mode))
+
+
 def apply_flat_map_style_to_image(
     image,
     area: AreaDefinition,
@@ -3092,6 +3141,7 @@ def apply_flat_map_style_to_image(
     if config.zoom_earth_style and true_color_product(product):
         working = apply_zoom_earth_true_color_enhancement(working)
         fill_invalid_flat_map_pixels(working, valid_mask)
+        fill_flat_map_edge_artifacts(working)
     try:
         direct_overlay_to_image(working, area, overlay_options)
     except Exception as exc:

@@ -2065,6 +2065,11 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(loaded_config.crosshair_color, h.CROSSHAIR_COLOR)
         self.assertFalse(loaded_config.zoom_earth_style)
 
+    def test_zoom_earth_labels_include_new_zealand(self):
+        labels = {label.replace("\n", " ") for label, _lat, _lon, _kind in h.ZOOM_EARTH_LABEL_POINTS}
+
+        self.assertIn("NEW ZEALAND", labels)
+
     def test_flat_map_visual_style_requires_flat_map(self):
         config = h.default_config()
         config.zoom_earth_style = True
@@ -2153,6 +2158,34 @@ class ProcessorTests(unittest.TestCase):
 
         expected = h.np.asarray([[True, False, False], [True, True, False]], dtype=bool)
         self.assertTrue(h.np.array_equal(mask, expected))
+
+    def test_flat_map_visual_overlays_fill_edge_connected_black_limb(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "limb.png"
+            pixels = h.np.zeros((20, 20, 3), dtype=h.np.uint8)
+            pixels[:, :] = (90, 105, 120)
+            pixels[:, -4:] = (0, 0, 0)
+            pixels[8:12, 8:12] = (0, 0, 0)
+            Image.fromarray(pixels, mode="RGB").save(path)
+            area = AreaDefinition("flat", "flat", "flat", h.WEB_MERCATOR_PROJ4, 20, 20, h.web_mercator_extent(-10, 10, 100, 120))
+            config = h.default_config()
+            config.map_view = "flat"
+            config.zoom_earth_style = True
+
+            h.apply_flat_map_visual_overlays(
+                path,
+                area,
+                config,
+                h.datetime(2024, 7, 25, 4, 0),
+                "True Color Reproduction Image",
+            )
+            with Image.open(path) as image:
+                styled = h.np.asarray(image.convert("RGB"))
+
+        self.assertTrue(h.np.all(styled[:, -4:, :] == h.np.asarray(h.FLAT_MAP_INVALID_FILL, dtype=h.np.uint8)))
+        self.assertFalse(h.np.all(styled[8:12, 8:12, :] == h.np.asarray(h.FLAT_MAP_INVALID_FILL, dtype=h.np.uint8)))
 
     def test_flat_map_visual_overlays_fill_invalid_pixels_with_dark_ocean(self):
         from PIL import Image
