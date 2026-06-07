@@ -89,7 +89,7 @@ python check_environment.py --plain
 python check_environment.py --auto
 ```
 
-Expected current version: `2026.06.05.1`. If `--version` shows an older value,
+Expected current version: `2026.06.06.1`. If `--version` shows an older value,
 the machine is not running the latest update. If `--plain` reports a different
 Python than the one used to launch the GUI, use `run_gui.bat`, `run_cli.bat`,
 or `check_environment.bat` so the same Python environment is selected.
@@ -119,7 +119,8 @@ image, a quick B13 infrared check, and a lower-RAM B13 timelapse. Custom presets
 can save and reload your current settings without changing the locked safe
 presets.
 It also has optional coastline/country border overlays with a user-selected
-line color. The default border color is green.
+line color. The default border color is green, while Zoom Earth-style flat maps
+use white border lines for a closer map-view look.
 Overlay rendering uses Satpy/pycoast, so install requirements first and place
 pycoast-compatible coastline/border shapefiles under the project `overlays/`
 folder if your environment does not already provide them. `Check Overlay Setup`
@@ -142,8 +143,14 @@ while keeping the satellite image as the output. The default flat extent is lat
 `-60..60`, lon `80E..200E`, at approximately `0.05` degrees per pixel at the
 equator; this creates a default target around `2400x3018` pixels because Web
 Mercator stretches latitude. Flat mode does not add Google labels, roads, map
-tiles, or basemap imagery; the existing optional coast/country borders are the
-only map overlay. Native disk output remains the low-RAM default.
+tiles, or basemap imagery. Zoom Earth-style flat maps keep the selected
+satellite product as the image, optionally add white border lines, static
+country/ocean labels, an approximate night boundary, and a center crosshair, and
+apply a bounded true-color contrast/saturation lift so true-color flat maps do
+not look washed out. Single-band products keep their normal band rendering.
+Radar, wind animation, heat spots, active fires, tropical systems, and
+temperatures are shown as unavailable because this app does not include those
+external data feeds. Native disk output remains the low-RAM default.
 Use `Stop Processing` to cancel the current run, including active segment
 downloads and pending frames. `Check Env` runs the diagnostic checker inline;
 `Quick Fix` repairs the current Python in a separate console; `Auto Fix` uses
@@ -179,6 +186,7 @@ flags for repeatable commands:
 python himawari_cli.py --run --composite "B13 (Infrared Window)" --mode "Single Image"
 python himawari_cli.py --run --composite "True Color Reproduction Image" --night-fallback-mode hybrid
 python himawari_cli.py --run --map-view flat --flat-min-lat -60 --flat-max-lat 60 --flat-min-lon 80 --flat-max-lon 200 --flat-resolution-deg 0.05
+python himawari_cli.py --run --map-view flat --zoom-earth-style yes --map-labels yes --night-boundary yes --crosshair yes
 python himawari_cli.py --run --gpu-acceleration yes --composite "True Color Reproduction Image"
 ```
 
@@ -196,10 +204,10 @@ python himawari_cli.py --version
 python check_environment.py --plain
 ```
 
-Current fixed build: `2026.06.05.1`. Processing logs should include:
+Current fixed build: `2026.06.06.1`. Processing logs should include:
 
 ```text
-App version: 2026.06.05.1
+App version: 2026.06.06.1
 ```
 
 For official-looking true color and true color reproduction, keep the
@@ -270,7 +278,7 @@ by the checker when installing or launching the app.
 Symptom: a friend says the fix is installed, but logs do not show:
 
 ```text
-App version: 2026.06.05.1
+App version: 2026.06.06.1
 ```
 
 Likely cause: their folder is still on an old commit, or they downloaded a ZIP
@@ -565,10 +573,12 @@ python check_environment.py --fix
 ```
 
 Quick Fix installs/upgrades the overlay Python packages in the current Python,
-creates the project
-`overlays/` folder if needed, downloads the official GSHHG shapefile archive,
-and extracts the low-resolution GSHHS/WDBII files the app needs. For the default
-low-resolution overlay setting, the app expects these files:
+creates the project `overlays/` folder if needed, downloads the official GSHHG
+shapefile archive from SOEST mirrors, and extracts the low-resolution GSHHS/WDBII
+files the app needs. If every mirror is unreachable, the error prints each URL
+and the required archive name, `gshhg-shp-2.3.7.zip`, so it can be downloaded
+manually and extracted under `overlays/`. For the default low-resolution overlay
+setting, the app expects these files:
 
 ```text
 overlays/GSHHS_shp/l/GSHHS_l_L1.shp

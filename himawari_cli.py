@@ -50,9 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--check-env", action="store_true", help="Run check_environment.py before any processing.")
     parser.add_argument(
         "--version",
-        action="version",
-        version=processor.app_version_label(),
-        help="Show the app version and exit.",
+        action="store_true",
+        help="Show detailed app and CLI version information, then exit.",
     )
     parser.add_argument("--output-dir", help="Folder for final outputs.")
     parser.add_argument("--temp-dir", help="Folder for downloaded DAT files and temporary frame data.")
@@ -97,7 +96,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--border-lines", dest="add_border_lines", type=parse_bool, default=None)
     parser.add_argument("--border-color", dest="border_line_color", default=None)
     parser.add_argument("--border-width", dest="border_line_width", type=float, default=None)
+    parser.add_argument("--map-labels", dest="add_map_labels", type=parse_bool, default=None)
+    parser.add_argument("--night-boundary", dest="add_night_boundary", type=parse_bool, default=None)
+    parser.add_argument("--crosshair", dest="add_crosshair", type=parse_bool, default=None)
+    parser.add_argument("--zoom-earth-style", dest="zoom_earth_style", type=parse_bool, default=None)
     return parser
+
+
+def format_version_report() -> str:
+    return "\n".join(
+        [
+            processor.APP_DISPLAY_NAME,
+            "-" * len(processor.APP_DISPLAY_NAME),
+            f"Version: {processor.APP_VERSION}",
+            "CLI:     himawari_cli.py",
+            f"Python:  {sys.executable}",
+            f"Project: {PROJECT_DIR}",
+        ]
+    )
 
 
 def config_from_args(args: argparse.Namespace) -> processor.ProcessorConfig:
@@ -147,6 +163,10 @@ def print_config(config: processor.ProcessorConfig) -> None:
     print(f"Quality fallback:   {yes_no(config.allow_quality_fallback)}")
     print(f"Border lines:       {yes_no(config.add_border_lines)}")
     print(f"Border color/width: {config.border_line_color} / {config.border_line_width}")
+    print(f"Map labels:         {yes_no(config.add_map_labels)}")
+    print(f"Night boundary:     {yes_no(config.add_night_boundary)}")
+    print(f"Crosshair:          {yes_no(config.add_crosshair)}")
+    print(f"Zoom Earth style:   {yes_no(config.zoom_earth_style)}")
     print(f"Download workers:   {config.download_workers}")
     print(f"Dask workers:       {config.dask_num_workers}")
     print(f"Dask chunk size:    {config.dask_chunk_size}")
@@ -265,6 +285,10 @@ def edit_advanced_settings(config: processor.ProcessorConfig) -> processor.Proce
     values["add_border_lines"] = prompt_bool("Draw coastline/country borders", config.add_border_lines)
     values["border_line_color"] = prompt_text("Border line color", config.border_line_color)
     values["border_line_width"] = prompt_float("Border line width", config.border_line_width, 0.25)
+    values["add_map_labels"] = prompt_bool("Flat map labels", config.add_map_labels)
+    values["add_night_boundary"] = prompt_bool("Flat map night boundary", config.add_night_boundary)
+    values["add_crosshair"] = prompt_bool("Flat map crosshair", config.add_crosshair)
+    values["zoom_earth_style"] = prompt_bool("Zoom Earth-style flat map", config.zoom_earth_style)
     output_dir = prompt_text("Output folder", str(processor.OUTPUT_DIR))
     temp_dir = prompt_text("Temp folder", str(processor.TEMP_DIR))
     set_output_dir(output_dir)
@@ -330,6 +354,11 @@ def interactive_menu(config: processor.ProcessorConfig) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.version:
+        print(format_version_report())
+        return 0
+
     set_output_dir(args.output_dir)
     set_temp_dir(args.temp_dir)
     config = config_from_args(args)

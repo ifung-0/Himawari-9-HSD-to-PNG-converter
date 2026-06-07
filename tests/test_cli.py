@@ -60,6 +60,10 @@ class TestConfigFieldNames(unittest.TestCase):
             "add_border_lines",
             "border_line_color",
             "border_line_width",
+            "add_map_labels",
+            "add_night_boundary",
+            "add_crosshair",
+            "zoom_earth_style",
             "map_view",
             "flat_min_lat",
             "flat_max_lat",
@@ -151,12 +155,17 @@ class TestBuildParser(unittest.TestCase):
             "add_border_lines",
             "border_line_color",
             "border_line_width",
+            "add_map_labels",
+            "add_night_boundary",
+            "add_crosshair",
+            "zoom_earth_style",
         }
         self.assertTrue(expected.issubset(actions))
 
     def test_parser_defaults_are_none(self):
         parser = cli.build_parser()
         args = parser.parse_args([])
+        self.assertFalse(args.version)
         self.assertIsNone(args.user_url)
         self.assertIsNone(args.mode)
         self.assertIsNone(args.composite_choice)
@@ -177,6 +186,10 @@ class TestBuildParser(unittest.TestCase):
         self.assertIsNone(args.add_border_lines)
         self.assertIsNone(args.border_line_color)
         self.assertIsNone(args.border_line_width)
+        self.assertIsNone(args.add_map_labels)
+        self.assertIsNone(args.add_night_boundary)
+        self.assertIsNone(args.add_crosshair)
+        self.assertIsNone(args.zoom_earth_style)
         self.assertIsNone(args.map_view)
         self.assertIsNone(args.flat_min_lat)
         self.assertIsNone(args.flat_max_lat)
@@ -195,6 +208,17 @@ class TestBuildParser(unittest.TestCase):
 
         args = parser.parse_args(["--gpu-acceleration", "yes"])
         self.assertTrue(args.gpu_acceleration)
+
+        args = parser.parse_args([
+            "--map-labels", "yes",
+            "--night-boundary", "yes",
+            "--crosshair", "yes",
+            "--zoom-earth-style", "yes",
+        ])
+        self.assertTrue(args.add_map_labels)
+        self.assertTrue(args.add_night_boundary)
+        self.assertTrue(args.add_crosshair)
+        self.assertTrue(args.zoom_earth_style)
 
     def test_parser_parses_chunk_size(self):
         parser = cli.build_parser()
@@ -264,6 +288,10 @@ class TestConfigFromArgs(unittest.TestCase):
             "--border-lines", "yes",
             "--border-color", "#ff0000",
             "--border-width", "2.0",
+            "--map-labels", "yes",
+            "--night-boundary", "yes",
+            "--crosshair", "yes",
+            "--zoom-earth-style", "yes",
             "--map-view", "flat",
             "--flat-min-lat", "-50.0",
             "--flat-max-lat", "50.0",
@@ -293,6 +321,10 @@ class TestConfigFromArgs(unittest.TestCase):
         self.assertTrue(config.add_border_lines)
         self.assertEqual(config.border_line_color, "#ff0000")
         self.assertEqual(config.border_line_width, 2.0)
+        self.assertTrue(config.add_map_labels)
+        self.assertTrue(config.add_night_boundary)
+        self.assertTrue(config.add_crosshair)
+        self.assertTrue(config.zoom_earth_style)
         self.assertEqual(config.map_view, "flat")
         self.assertEqual(config.flat_min_lat, -50.0)
         self.assertEqual(config.flat_max_lat, 50.0)
@@ -348,6 +380,10 @@ class TestPrintConfig(unittest.TestCase):
         self.assertIn("Quality fallback:", output)
         self.assertIn("Border lines:", output)
         self.assertIn("Border color/width:", output)
+        self.assertIn("Map labels:", output)
+        self.assertIn("Night boundary:", output)
+        self.assertIn("Crosshair:", output)
+        self.assertIn("Zoom Earth style:", output)
         self.assertIn("Download workers:", output)
         self.assertIn("Dask workers:", output)
         self.assertIn("Dask chunk size:", output)
@@ -744,9 +780,15 @@ class TestMain(unittest.TestCase):
     def test_version_flag(self, mock_run):
         captured = io.StringIO()
         with mock.patch("sys.stdout", captured):
-            with self.assertRaises(SystemExit) as cm:
-                cli.main(["--version"])
-            self.assertEqual(cm.exception.code, 0)
+            result = cli.main(["--version"])
+        self.assertEqual(result, 0)
+        output = captured.getvalue()
+        self.assertIn(h.APP_DISPLAY_NAME, output)
+        self.assertIn(f"Version: {h.APP_VERSION}", output)
+        self.assertIn("CLI:     himawari_cli.py", output)
+        self.assertIn("Python:", output)
+        self.assertIn("Project:", output)
+        mock_run.assert_not_called()
 
 
 class TestYesNo(unittest.TestCase):

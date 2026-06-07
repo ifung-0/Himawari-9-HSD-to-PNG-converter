@@ -1032,6 +1032,14 @@ class EnvironmentCheckTests(unittest.TestCase):
         self.assertIn("WDBII_shp/l/WDBII_border_l_L1.dbf", suffixes)
         self.assertIn("GSHHS_shp/l/GSHHS_l_L1.shx", suffixes)
 
+    def test_overlay_archive_urls_use_reachable_soest_mirrors_not_dead_noaa_path(self):
+        self.assertNotIn(
+            "https://www.ngdc.noaa.gov/mgg/shorelines/data/gshhs/latest/gshhg-shp-2.3.7.zip",
+            env.GSHHG_ARCHIVE_URLS,
+        )
+        self.assertIn("https://www.soest.hawaii.edu/pwessel/gshhg/gshhg-shp-2.3.7.zip", env.GSHHG_ARCHIVE_URLS)
+        self.assertIn("https://ftp.soest.hawaii.edu/gshhg/gshhg-shp-2.3.7.zip", env.GSHHG_ARCHIVE_URLS)
+
     def test_extract_overlay_archive_installs_required_files_and_sidecars(self):
         with TemporaryDirectory() as tmp_dir:
             project_dir = Path(tmp_dir) / "project"
@@ -1115,9 +1123,10 @@ class EnvironmentCheckTests(unittest.TestCase):
                     )
 
         self.assertFalse(result.ok)
-        self.assertIn("Attempted URLs", result.detail)
+        self.assertIn(env.GSHHG_SHAPEFILE_ARCHIVE, result.detail)
+        self.assertIn("Every attempted mirror failed", result.detail)
         self.assertIn("GSHHS_l_L1.shp", result.detail)
-        self.assertIn("download overlay data", stderr.getvalue())
+        self.assertIn("Could not download required overlay data archive", stderr.getvalue())
         mock_download.assert_called_once()
 
     def test_install_overlay_data_extracts_cached_archive(self):

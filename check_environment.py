@@ -32,7 +32,7 @@ OVERLAY_RESOLUTION = "l"
 OVERLAY_LEVEL = 1
 GSHHG_SHAPEFILE_ARCHIVE = "gshhg-shp-2.3.7.zip"
 GSHHG_ARCHIVE_URLS = (
-    "https://www.ngdc.noaa.gov/mgg/shorelines/data/gshhs/latest/gshhg-shp-2.3.7.zip",
+    "https://www.soest.hawaii.edu/pwessel/gshhg/gshhg-shp-2.3.7.zip",
     "https://ftp.soest.hawaii.edu/gshhg/gshhg-shp-2.3.7.zip",
     "http://www.soest.hawaii.edu/pwessel/gshhg/gshhg-shp-2.3.7.zip",
 )
@@ -701,11 +701,13 @@ def install_overlay_data(
         if not ok:
             missing = (*missing_overlay_data_paths(project_dir), *missing_overlay_sidecar_paths(project_dir))
             message = (
-                "Could not download overlay data archive. Attempted URLs: "
+                f"Could not download required overlay data archive {GSHHG_SHAPEFILE_ARCHIVE}. "
+                "Every attempted mirror failed: "
                 + "; ".join(urls)
                 + f". Destination folder: {overlays_dir}. Missing files: "
                 + "; ".join(str(path) for path in missing)
-                + ". Manual fallback: download gshhg-shp-2.3.7.zip and extract the listed GSHHS/WDBII files under overlays/."
+                + f". Manual fallback: download {GSHHG_SHAPEFILE_ARCHIVE} and extract the listed "
+                + "GSHHS/WDBII files under overlays/."
                 + f" Details: {detail}"
             )
             print(message, file=sys.stderr)

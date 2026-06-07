@@ -64,7 +64,7 @@ except KeyboardInterrupt:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-APP_VERSION = "2026.06.05.1"
+APP_VERSION = "2026.06.06.1"
 APP_DISPLAY_NAME = "Himawari-9 Low-RAM Processor"
 USER_URL = "https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/2024/07/25/0400/HS_H09_20240725_0400_B01_FLDK_R10_S0110.DAT.bz2"
 MODE = "Single Image"  # "Single Image" or "Timelapse"
@@ -87,6 +87,36 @@ RESAMPLER = "native"  # "native" is required for full-disk low-RAM processing.
 ADD_BORDER_LINES = False
 BORDER_LINE_COLOR = "green"
 BORDER_LINE_WIDTH = 1.0
+ADD_MAP_LABELS = False
+ADD_NIGHT_BOUNDARY = False
+ADD_CROSSHAIR = False
+ZOOM_EARTH_STYLE = False
+ZOOM_EARTH_BORDER_COLOR = "white"
+ZOOM_EARTH_BORDER_WIDTH = 1.25
+UNSUPPORTED_MAP_OVERLAYS = (
+    "Radar",
+    "Wind Animation",
+    "Heat Spots",
+    "Active Fires",
+    "Tropical Systems",
+    "Temperatures",
+)
+ZOOM_EARTH_LABEL_POINTS = (
+    ("RUSSIA", 61.0, 110.0, "land"),
+    ("KAZAKHSTAN", 48.0, 68.0, "land"),
+    ("MONGOLIA", 46.0, 104.0, "land"),
+    ("CHINA", 35.0, 104.0, "land"),
+    ("JAPAN", 37.5, 138.0, "land"),
+    ("SOUTH KOREA", 36.3, 128.0, "land"),
+    ("PHILIPPINES", 12.5, 122.0, "land"),
+    ("INDONESIA", -2.0, 118.0, "land"),
+    ("PAPUA NEW\nGUINEA", -6.0, 145.0, "land"),
+    ("AUSTRALIA", -25.0, 134.0, "land"),
+    ("INDIA", 22.0, 78.0, "land"),
+    ("North Pacific\nOcean", 29.0, 173.0, "water"),
+    ("Indian\nOcean", -27.0, 82.0, "water"),
+    ("Philippine Sea", 18.0, 135.0, "water"),
+)
 MAX_SAFE_PNG_PIXELS = 40_000_000
 MAX_SAFE_TIMELAPSE_FRAME_PIXELS = 40_000_000
 MAP_VIEW = "native"
@@ -403,6 +433,10 @@ class ProcessorConfig:
     add_border_lines: bool = ADD_BORDER_LINES
     border_line_color: str = BORDER_LINE_COLOR
     border_line_width: float = BORDER_LINE_WIDTH
+    add_map_labels: bool = ADD_MAP_LABELS
+    add_night_boundary: bool = ADD_NIGHT_BOUNDARY
+    add_crosshair: bool = ADD_CROSSHAIR
+    zoom_earth_style: bool = ZOOM_EARTH_STYLE
     map_view: str = MAP_VIEW
     flat_min_lat: float = FLAT_MIN_LAT
     flat_max_lat: float = FLAT_MAX_LAT
@@ -2643,14 +2677,149 @@ def parse_rgb_color(value: str) -> tuple[int, int, int]:
     raise ValueError("Border color must be a name, #RRGGBB, or R,G,B values.")
 
 
+def functional_map_overlay_enabled(config: ProcessorConfig) -> bool:
+    return bool(config.add_border_lines or config.add_map_labels or config.add_night_boundary or config.add_crosshair)
+
+
+def flat_map_visual_style_enabled(config: ProcessorConfig) -> bool:
+    return bool(config.zoom_earth_style or functional_map_overlay_enabled(config))
+
+
+def true_color_product(composite_choice: str) -> bool:
+    return composite_choice in {"True Color RGB (Enhanced)", "True Color Reproduction Image"}
+
+
+def projected_point_to_pixel(area: AreaDefinition, x: float, y: float) -> tuple[float, float] | None:
+    left, bottom, right, top = area.area_extent
+    if right == left or top == bottom:
+        return None
+    px = (float(x) - left) / (right - left) * float(area.width)
+    py = (top - float(y)) / (top - bottom) * float(area.height)
+    if px < -1 or py < -1 or px > float(area.width) + 1 or py > float(area.height) + 1:
+        return None
+    return px, py
+
+
+def lonlat_to_area_pixel(area: AreaDefinition, lon: float, lat: float) -> tuple[float, float] | None:
+    from pyproj import Transformer
+
+    transformer = Transformer.from_crs("EPSG:4326", area.crs, always_xy=True)
+    x, y = transformer.transform(float(lon), float(lat))
+    return projected_point_to_pixel(area, float(x), float(y))
+
+
+def draw_text_with_halo(draw, position: tuple[float, float], text: str, font, fill, halo=(0, 0, 0, 180)) -> None:
+    x, y = position
+    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, 1), (-1, 1), (1, -1)):
+        draw.multiline_text((x + dx, y + dy), text, font=font, fill=halo, align="center", anchor="mm", spacing=1)
+    draw.multiline_text((x, y), text, font=font, fill=fill, align="center", anchor="mm", spacing=1)
+
+
+def draw_zoom_earth_labels(image, area: AreaDefinition) -> None:
+    from PIL import ImageDraw, ImageFont
+
+    draw = ImageDraw.Draw(image, "RGBA")
+    font = ImageFont.load_default()
+    for label, lat, lon, kind in ZOOM_EARTH_LABEL_POINTS:
+        point = lonlat_to_area_pixel(area, lon, lat)
+        if point is None:
+            continue
+        fill = (235, 238, 242, 235) if kind == "land" else (205, 220, 238, 210)
+        draw_text_with_halo(draw, point, label, font, fill)
+
+
+def solar_declination_and_subsolar_lon(scan_time: datetime) -> tuple[float, float]:
+    if scan_time.tzinfo is None:
+        scan_time = scan_time.replace(tzinfo=UTC)
+    utc_time = scan_time.astimezone(UTC)
+    day = utc_time.timetuple().tm_yday
+    hour = utc_time.hour + utc_time.minute / 60.0 + utc_time.second / 3600.0
+    gamma = 2.0 * math.pi / 365.0 * (day - 1 + (hour - 12.0) / 24.0)
+    declination = (
+        0.006918
+        - 0.399912 * math.cos(gamma)
+        + 0.070257 * math.sin(gamma)
+        - 0.006758 * math.cos(2.0 * gamma)
+        + 0.000907 * math.sin(2.0 * gamma)
+        - 0.002697 * math.cos(3.0 * gamma)
+        + 0.00148 * math.sin(3.0 * gamma)
+    )
+    equation_minutes = 229.18 * (
+        0.000075
+        + 0.001868 * math.cos(gamma)
+        - 0.032077 * math.sin(gamma)
+        - 0.014615 * math.cos(2.0 * gamma)
+        - 0.040849 * math.sin(2.0 * gamma)
+    )
+    subsolar_lon = 180.0 - (hour * 15.0 + equation_minutes / 4.0)
+    while subsolar_lon < -180.0:
+        subsolar_lon += 360.0
+    while subsolar_lon > 180.0:
+        subsolar_lon -= 360.0
+    return math.degrees(declination), subsolar_lon
+
+
+def night_boundary_points(scan_time: datetime, step_deg: float = 1.0) -> list[tuple[float, float]]:
+    declination_deg, subsolar_lon = solar_declination_and_subsolar_lon(scan_time)
+    declination = math.radians(declination_deg)
+    points: list[tuple[float, float]] = []
+    cos_dec = math.cos(declination)
+    if abs(cos_dec) < 1e-6:
+        return points
+    tan_dec = math.tan(declination)
+    count = int(round(360.0 / step_deg)) + 1
+    for index in range(count):
+        lon = -180.0 + index * step_deg
+        hour_angle = math.radians(lon - subsolar_lon)
+        lat = math.degrees(math.atan(-math.cos(hour_angle) / tan_dec)) if abs(tan_dec) >= 1e-6 else 0.0
+        lat = max(-WEB_MERCATOR_MAX_LAT, min(WEB_MERCATOR_MAX_LAT, lat))
+        points.append((lon, lat))
+    return points
+
+
+def draw_night_boundary(image, area: AreaDefinition, scan_time: datetime) -> None:
+    from PIL import ImageDraw
+
+    draw = ImageDraw.Draw(image, "RGBA")
+    pixels = [lonlat_to_area_pixel(area, lon, lat) for lon, lat in night_boundary_points(scan_time)]
+    visible = [point for point in pixels if point is not None]
+    if len(visible) >= 2:
+        draw.line(visible, fill=(235, 235, 235, 160), width=2)
+
+
+def draw_crosshair(image, area: AreaDefinition) -> None:
+    from PIL import ImageDraw
+
+    draw = ImageDraw.Draw(image, "RGBA")
+    x = int(area.width) / 2.0
+    y = int(area.height) / 2.0
+    radius = max(8, min(int(area.width), int(area.height)) // 120)
+    draw.ellipse((x - radius, y - radius, x + radius, y + radius), outline=(255, 255, 255, 230), width=3)
+    draw.ellipse((x - radius + 4, y - radius + 4, x + radius - 4, y + radius - 4), fill=(92, 50, 220, 230))
+    draw.line((x - radius * 2, y, x - radius - 3, y), fill=(255, 255, 255, 210), width=2)
+    draw.line((x + radius + 3, y, x + radius * 2, y), fill=(255, 255, 255, 210), width=2)
+    draw.line((x, y - radius * 2, x, y - radius - 3), fill=(255, 255, 255, 210), width=2)
+    draw.line((x, y + radius + 3, x, y + radius * 2), fill=(255, 255, 255, 210), width=2)
+
+
+def apply_zoom_earth_true_color_enhancement(image):
+    from PIL import ImageEnhance
+
+    working = ImageEnhance.Contrast(image).enhance(1.08)
+    working = ImageEnhance.Color(working).enhance(1.12)
+    return ImageEnhance.Sharpness(working).enhance(1.05)
+
+
 def build_overlay_options(config: ProcessorConfig) -> dict | None:
     if not config.add_border_lines:
         return None
-    color = parse_rgb_color(config.border_line_color)
+    color_name = ZOOM_EARTH_BORDER_COLOR if config.zoom_earth_style and is_flat_map(config) else config.border_line_color
+    width = ZOOM_EARTH_BORDER_WIDTH if config.zoom_earth_style and is_flat_map(config) else config.border_line_width
+    color = parse_rgb_color(color_name)
     return {
         "coast_dir": str(PROJECT_DIR / "overlays"),
         "color": color,
-        "width": config.border_line_width,
+        "width": width,
         "level_coast": OVERLAY_LEVEL,
         "level_borders": OVERLAY_LEVEL,
         "resolution": OVERLAY_RESOLUTION,
@@ -2716,6 +2885,55 @@ def apply_direct_overlay_to_image_file(output_path: Path, area: AreaDefinition, 
             "Border overlay failed for direct RGB output (%s). Saving image without border lines.",
             exc,
         )
+    return output_path
+
+
+def apply_flat_map_visual_overlays(
+    output_path: Path,
+    area: AreaDefinition,
+    config: ProcessorConfig,
+    scan_time: datetime,
+    product: str,
+) -> Path:
+    if not is_flat_map(config) or not flat_map_visual_style_enabled(config):
+        return output_path
+    if output_path.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
+        if config.add_map_labels or config.add_night_boundary or config.add_crosshair:
+            LOG.warning(
+                "Labels, night boundary, and crosshair are not burned into %s output; use PNG for styled flat maps.",
+                output_path.suffix or "this",
+            )
+        return output_path
+
+    try:
+        from PIL import Image
+
+        tmp_path = temporary_output_path(output_path)
+        try:
+            tmp_path.unlink(missing_ok=True)
+            with Image.open(output_path) as image:
+                original_mode = image.mode
+                working = image.convert("RGBA")
+                if config.zoom_earth_style and true_color_product(product):
+                    working = apply_zoom_earth_true_color_enhancement(working)
+                if config.add_night_boundary:
+                    draw_night_boundary(working, area, scan_time)
+                if config.add_map_labels:
+                    draw_zoom_earth_labels(working, area)
+                if config.add_crosshair:
+                    draw_crosshair(working, area)
+                if original_mode != "RGBA":
+                    working = working.convert(original_mode)
+                working.save(tmp_path)
+            tmp_path.replace(output_path)
+        except Exception:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
+    except Exception as exc:
+        LOG.warning("Flat-map visual overlay styling failed (%s). Keeping unstyled image.", exc)
     return output_path
 
 
@@ -3669,6 +3887,7 @@ def save_satpy_dataset_output(
     output_path: Path,
     config: ProcessorConfig,
     overlay_options: dict | None,
+    scan_time: datetime,
 ) -> Path:
     dataset_name = satpy_name
     enhance = True
@@ -3686,7 +3905,7 @@ def save_satpy_dataset_output(
         enhance = False
         fill_value = 0
         LOG.info("Hybrid day/night fallback enabled for %s; filling dark side with B13 infrared.", active)
-    return save_dataset_with_optional_overlay(
+    saved_path = save_dataset_with_optional_overlay(
         resampled,
         dataset_name,
         output_path,
@@ -3695,6 +3914,9 @@ def save_satpy_dataset_output(
         fill_value=fill_value,
         overlay=overlay_options,
     )
+    if not is_flat_map(config) or not flat_map_visual_style_enabled(config):
+        return saved_path
+    return apply_flat_map_visual_overlays(saved_path, resampled[dataset_name].attrs["area"], config, scan_time, active)
 
 
 def save_custom_composite_output(
@@ -3705,6 +3927,7 @@ def save_custom_composite_output(
     config: ProcessorConfig,
     is_night: bool,
     overlay_options: dict | None,
+    scan_time: datetime,
     progress: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
 ) -> Path:
@@ -3760,6 +3983,7 @@ def save_custom_composite_output(
     elif output_path.suffix.lower() == ".png" and is_rgb_dataarray(dataset):
         output_path = write_rgb_png_low_ram(dataset, output_path)
         output_path = apply_direct_overlay_to_image_file(output_path, master_area, overlay_options)
+        output_path = apply_flat_map_visual_overlays(output_path, master_area, config, scan_time, active)
     else:
         output_path = save_dataset_with_optional_overlay(
             resampled,
@@ -3778,6 +4002,7 @@ def save_custom_composite_output(
                 degenerate, retry_reason = rgb_geotiff_is_degenerate(output_path)
                 if degenerate:
                     raise RuntimeError(f"GeoTIFF output is invalid after retry: {retry_reason}.")
+        output_path = apply_flat_map_visual_overlays(output_path, master_area, config, scan_time, active)
     log_memory("after save", config)
     return output_path
 
@@ -3791,6 +4016,7 @@ def save_custom_satpy_missing_dataset_fallback(
     config: ProcessorConfig,
     is_night: bool,
     overlay_options: dict | None,
+    scan_time: datetime,
     progress: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
 ) -> Path:
@@ -3806,6 +4032,7 @@ def save_custom_satpy_missing_dataset_fallback(
         config,
         is_night,
         overlay_options,
+        scan_time,
         progress=progress,
         cancel_event=cancel_event,
     )
@@ -3818,6 +4045,7 @@ def save_true_color_reproduction_fallback(
     config: ProcessorConfig,
     is_night: bool,
     overlay_options: dict | None,
+    scan_time: datetime,
     progress: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
 ) -> Path:
@@ -3830,6 +4058,7 @@ def save_true_color_reproduction_fallback(
         config,
         is_night,
         overlay_options,
+        scan_time,
         progress=progress,
         cancel_event=cancel_event,
     )
@@ -3943,6 +4172,7 @@ def process_frame(
                         config,
                         is_night,
                         overlay_options,
+                        dt,
                         progress=progress,
                         cancel_event=cancel_event,
                     )
@@ -3990,6 +4220,7 @@ def process_frame(
                     output_path,
                     config,
                     overlay_options,
+                    dt,
                 )
             except Exception as exc:
                 if use_custom_satpy_missing_dataset_fallback(exc, active, satpy_name):
@@ -4002,6 +4233,7 @@ def process_frame(
                         config,
                         is_night,
                         overlay_options,
+                        dt,
                         progress=progress,
                         cancel_event=cancel_event,
                     )
@@ -4019,6 +4251,7 @@ def process_frame(
             config,
             is_night,
             overlay_options,
+            dt,
             progress=progress,
             cancel_event=cancel_event,
         )
@@ -4137,6 +4370,8 @@ def validate_configuration(config: ProcessorConfig | None = None) -> None:
         parse_rgb_color(config.border_line_color)
         positive_finite_float(config.border_line_width, "Border line width")
         validate_overlay_ready_for_run(config)
+    if (config.add_map_labels or config.add_night_boundary or config.add_crosshair or config.zoom_earth_style) and not is_flat_map(config):
+        raise ValueError("Zoom Earth-style labels, night boundary, crosshair, and styling require flat map output.")
 
 
 def validate_overlay_ready_for_run(config: ProcessorConfig, project_dir: Path = PROJECT_DIR) -> None:
@@ -4204,6 +4439,10 @@ def build_run_summary(config: ProcessorConfig) -> RunSummary:
         warnings.append("Hybrid night fallback fills the dark side with B13 infrared while keeping sunlit true color.")
     if is_flat_map(config):
         warnings.append("Web Mercator flat map output uses nearest-neighbor reprojection and a bounded regional extent.")
+        if config.zoom_earth_style:
+            warnings.append("Zoom Earth-style flat maps keep the selected satellite product; no map tiles are added.")
+        if config.add_map_labels or config.add_night_boundary or config.add_crosshair:
+            warnings.append("Labels, night boundary, and crosshair are burned into PNG flat-map outputs.")
     if config.gpu_acceleration:
         warnings.append("GPU acceleration is experimental and only applies to compatible custom composite math.")
     if config.download_workers > 4:
@@ -4294,6 +4533,10 @@ def preset_config(name: str, base: ProcessorConfig | None = None) -> ProcessorCo
             ram_limit_gb=10.0,
             resampler="native",
             add_border_lines=False,
+            add_map_labels=False,
+            add_night_boundary=False,
+            add_crosshair=False,
+            zoom_earth_style=False,
         )
     elif name == "Fast IR Check":
         values.update(
@@ -4309,6 +4552,10 @@ def preset_config(name: str, base: ProcessorConfig | None = None) -> ProcessorCo
             ram_limit_gb=6.0,
             resampler="native",
             add_border_lines=False,
+            add_map_labels=False,
+            add_night_boundary=False,
+            add_crosshair=False,
+            zoom_earth_style=False,
         )
     elif name == "Low-RAM Timelapse":
         values.update(
@@ -4329,6 +4576,10 @@ def preset_config(name: str, base: ProcessorConfig | None = None) -> ProcessorCo
             ram_limit_gb=8.0,
             resampler="native",
             add_border_lines=False,
+            add_map_labels=False,
+            add_night_boundary=False,
+            add_crosshair=False,
+            zoom_earth_style=False,
         )
     else:
         raise KeyError(f"Unknown preset: {name}")
@@ -4987,6 +5238,8 @@ def setup_configuration_errors(config: ProcessorConfig) -> list[str]:
             positive_finite_float(config.border_line_width, "Border line width")
         except ValueError as exc:
             errors.append(str(exc))
+    if (config.add_map_labels or config.add_night_boundary or config.add_crosshair or config.zoom_earth_style) and not is_flat_map(config):
+        errors.append("Zoom Earth-style labels, night boundary, crosshair, and styling require flat map output.")
     if config.gpu_acceleration:
         status = gpu_support_status()
         if not status.ok:
@@ -5088,6 +5341,16 @@ def build_setup_status(
             warnings.append(
                 "Web Mercator flat map output uses nearest-neighbor reprojection and may be slower than native disk output."
             )
+            if config.zoom_earth_style:
+                details.append("Flat-map style: Zoom Earth-like satellite styling enabled")
+            if config.add_map_labels:
+                details.append("Map labels: curated static labels enabled")
+            if config.add_night_boundary:
+                details.append("Night boundary: approximate solar terminator enabled")
+            if config.add_crosshair:
+                details.append("Crosshair: center marker enabled")
+            if config.add_map_labels or config.add_night_boundary or config.add_crosshair:
+                warnings.append("Labels, night boundary, and crosshair are burned into PNG flat-map outputs only.")
             try:
                 validate_timelapse_frame_size(flat_map_area(config), config)
             except RuntimeError as exc:
@@ -5176,6 +5439,10 @@ class HimawariProcessorApp:
         self.border_lines_var = tk.BooleanVar(value=initial_config.add_border_lines)
         self.border_color_var = tk.StringVar(value=initial_config.border_line_color)
         self.border_width_var = tk.StringVar(value=str(initial_config.border_line_width))
+        self.map_labels_var = tk.BooleanVar(value=initial_config.add_map_labels)
+        self.night_boundary_var = tk.BooleanVar(value=initial_config.add_night_boundary)
+        self.crosshair_var = tk.BooleanVar(value=initial_config.add_crosshair)
+        self.zoom_earth_style_var = tk.BooleanVar(value=initial_config.zoom_earth_style)
         self.status_var = tk.StringVar(value="Ready")
         self.progress_var = tk.DoubleVar(value=0)
         self.setup_status_var = tk.StringVar(value="")
@@ -5439,13 +5706,39 @@ class HimawariProcessorApp:
         ).grid(row=2, column=0, sticky="w", pady=(4, 4))
         self.overlay_check_button = ttk.Button(options_frame, text="Check Overlay Setup", command=self._check_overlays)
         self.overlay_check_button.grid(row=2, column=1, sticky="e", padx=(0, 8), pady=(4, 4))
-        ttk.Label(options_frame, text="Border Color").grid(row=3, column=1, sticky="w", padx=(0, 8))
+        ttk.Checkbutton(
+            options_frame,
+            text="Zoom Earth-style flat map",
+            variable=self.zoom_earth_style_var,
+        ).grid(row=3, column=0, sticky="w", pady=(4, 4))
+        ttk.Checkbutton(
+            options_frame,
+            text="Labels",
+            variable=self.map_labels_var,
+        ).grid(row=3, column=1, sticky="w", pady=(4, 4))
+        ttk.Checkbutton(
+            options_frame,
+            text="Night Boundary",
+            variable=self.night_boundary_var,
+        ).grid(row=4, column=0, sticky="w", pady=(4, 4))
+        ttk.Checkbutton(
+            options_frame,
+            text="Crosshair",
+            variable=self.crosshair_var,
+        ).grid(row=4, column=1, sticky="w", pady=(4, 4))
+        ttk.Label(
+            options_frame,
+            text="Unavailable map feeds: " + ", ".join(UNSUPPORTED_MAP_OVERLAYS),
+            style="Status.TLabel",
+            wraplength=760,
+        ).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(4, 4))
+        ttk.Label(options_frame, text="Border Color").grid(row=6, column=1, sticky="w", padx=(0, 8))
         color_row = ttk.Frame(options_frame)
-        color_row.grid(row=4, column=1, sticky="ew")
+        color_row.grid(row=7, column=1, sticky="ew")
         color_row.columnconfigure(0, weight=1)
         ttk.Entry(color_row, textvariable=self.border_color_var, width=14).grid(row=0, column=0, sticky="ew")
         ttk.Button(color_row, text="Pick", command=self._choose_border_color).grid(row=0, column=1, padx=(8, 0))
-        ttk.Label(options_frame, text="Border Width").grid(row=3, column=0, sticky="w", pady=(4, 4))
+        ttk.Label(options_frame, text="Border Width").grid(row=6, column=0, sticky="w", pady=(4, 4))
         ttk.Spinbox(
             options_frame,
             from_=0.25,
@@ -5453,7 +5746,7 @@ class HimawariProcessorApp:
             increment=0.25,
             textvariable=self.border_width_var,
             width=8,
-        ).grid(row=4, column=0, sticky="w", pady=(2, 0))
+        ).grid(row=7, column=0, sticky="w", pady=(2, 0))
 
         simple_frame = ttk.LabelFrame(settings, text="Simple View", style="Section.TLabelframe")
         simple_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
@@ -6101,6 +6394,10 @@ class HimawariProcessorApp:
             self.border_lines_var,
             self.border_color_var,
             self.border_width_var,
+            self.map_labels_var,
+            self.night_boundary_var,
+            self.crosshair_var,
+            self.zoom_earth_style_var,
             self.output_template_var,
         )
         for watched_var in watched_vars:
@@ -6162,6 +6459,10 @@ class HimawariProcessorApp:
         self.border_lines_var.set(config.add_border_lines)
         self.border_color_var.set(config.border_line_color)
         self.border_width_var.set(str(config.border_line_width))
+        self.map_labels_var.set(config.add_map_labels)
+        self.night_boundary_var.set(config.add_night_boundary)
+        self.crosshair_var.set(config.add_crosshair)
+        self.zoom_earth_style_var.set(config.zoom_earth_style)
         self._refresh_mode_state()
         self._update_setup_status()
 
@@ -6437,6 +6738,10 @@ class HimawariProcessorApp:
             add_border_lines=self.border_lines_var.get(),
             border_line_color=self.border_color_var.get(),
             border_line_width=self._read_float_var(self.border_width_var, "Border line width"),
+            add_map_labels=self.map_labels_var.get(),
+            add_night_boundary=self.night_boundary_var.get(),
+            add_crosshair=self.crosshair_var.get(),
+            zoom_earth_style=self.zoom_earth_style_var.get(),
             map_view=self.map_view_var.get(),
             flat_min_lat=self._read_float_var(self.flat_min_lat_var, "Flat map min latitude"),
             flat_max_lat=self._read_float_var(self.flat_max_lat_var, "Flat map max latitude"),

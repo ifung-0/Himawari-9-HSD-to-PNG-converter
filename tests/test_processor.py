@@ -1984,6 +1984,106 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(overlay["color"], (0, 255, 0))
         self.assertIn("coast_dir", overlay)
 
+    def test_zoom_earth_style_uses_white_border_options_for_flat_map(self):
+        config = h.default_config()
+        config.map_view = "flat"
+        config.add_border_lines = True
+        config.border_line_color = "green"
+        config.border_line_width = 4.0
+        config.zoom_earth_style = True
+
+        overlay = h.build_overlay_options(config)
+
+        self.assertEqual(overlay["color"], (255, 255, 255))
+        self.assertEqual(overlay["width"], h.ZOOM_EARTH_BORDER_WIDTH)
+
+    def test_new_map_overlay_defaults_are_off_and_old_settings_load(self):
+        config = h.default_config()
+        self.assertFalse(config.add_map_labels)
+        self.assertFalse(config.add_night_boundary)
+        self.assertFalse(config.add_crosshair)
+        self.assertFalse(config.zoom_earth_style)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            settings_path = h.Path(tmp_dir) / "settings.json"
+            data = h.serialize_gui_settings(h.default_config(), h.Path(tmp_dir) / "out", h.Path(tmp_dir) / "temp")
+            for key in ("add_map_labels", "add_night_boundary", "add_crosshair", "zoom_earth_style"):
+                data["config"].pop(key, None)
+            h.write_json_file(settings_path, data)
+
+            loaded = h.load_gui_settings(settings_path)
+
+        self.assertIsNotNone(loaded)
+        loaded_config = loaded[0]
+        self.assertFalse(loaded_config.add_map_labels)
+        self.assertFalse(loaded_config.add_night_boundary)
+        self.assertFalse(loaded_config.add_crosshair)
+        self.assertFalse(loaded_config.zoom_earth_style)
+
+    def test_flat_map_visual_style_requires_flat_map(self):
+        config = h.default_config()
+        config.zoom_earth_style = True
+
+        errors = h.setup_configuration_errors(config)
+
+        self.assertTrue(any("require flat map output" in error for error in errors))
+
+    def test_apply_flat_map_visual_overlays_draws_supported_png_layers(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "styled.png"
+            Image.new("RGB", (120, 80), (80, 90, 100)).save(path)
+            area = AreaDefinition(
+                "flat",
+                "flat",
+                "flat",
+                h.WEB_MERCATOR_PROJ4,
+                120,
+                80,
+                h.web_mercator_extent(-60, 60, 80, 200),
+            )
+            config = h.default_config()
+            config.map_view = "flat"
+            config.zoom_earth_style = True
+            config.add_map_labels = True
+            config.add_night_boundary = True
+            config.add_crosshair = True
+
+            with Image.open(path) as image:
+                before = image.copy()
+            result = h.apply_flat_map_visual_overlays(
+                path,
+                area,
+                config,
+                h.datetime(2024, 7, 25, 4, 0),
+                "True Color Reproduction Image",
+            )
+            with Image.open(path) as image:
+                after = image.copy()
+
+        self.assertEqual(result, path)
+        self.assertNotEqual(before.tobytes(), after.tobytes())
+
+    def test_zoom_earth_enhancement_does_not_run_for_single_band_product(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "single.png"
+            Image.new("RGB", (20, 20), (80, 90, 100)).save(path)
+            area = AreaDefinition("flat", "flat", "flat", h.WEB_MERCATOR_PROJ4, 20, 20, (0, 0, 20, 20))
+            config = h.default_config()
+            config.map_view = "flat"
+            config.zoom_earth_style = True
+
+            with Image.open(path) as image:
+                before = image.copy()
+            h.apply_flat_map_visual_overlays(path, area, config, h.datetime(2024, 7, 25, 4, 0), "B13 (Infrared Window)")
+            with Image.open(path) as image:
+                after = image.copy()
+
+        self.assertEqual(before.tobytes(), after.tobytes())
+
     def test_large_png_switches_to_geotiff(self):
         area = mock.Mock(width=22000, height=22000)
         config = h.default_config()
@@ -2251,6 +2351,7 @@ class ProcessorTests(unittest.TestCase):
             config,
             is_night=False,
             overlay_options=None,
+            scan_time=h.datetime(2024, 7, 25, 4, 0),
         )
 
         self.assertEqual(result, output)
@@ -2302,6 +2403,7 @@ class ProcessorTests(unittest.TestCase):
             config,
             is_night=False,
             overlay_options=None,
+            scan_time=h.datetime(2024, 7, 25, 4, 0),
         )
 
         self.assertEqual(result, output)
@@ -3485,6 +3587,10 @@ class ProcessorTests(unittest.TestCase):
         app.border_lines_var = FakeVar(config.add_border_lines)
         app.border_color_var = FakeVar(config.border_line_color)
         app.border_width_var = FakeVar(str(config.border_line_width))
+        app.map_labels_var = FakeVar(config.add_map_labels)
+        app.night_boundary_var = FakeVar(config.add_night_boundary)
+        app.crosshair_var = FakeVar(config.add_crosshair)
+        app.zoom_earth_style_var = FakeVar(config.zoom_earth_style)
         app.map_view_var = FakeVar("flat")
         app.flat_min_lat_var = FakeVar("nan")
         app.flat_max_lat_var = FakeVar(str(config.flat_max_lat))
