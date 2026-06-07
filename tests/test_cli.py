@@ -63,6 +63,8 @@ class TestConfigFieldNames(unittest.TestCase):
             "add_map_labels",
             "add_night_boundary",
             "add_crosshair",
+            "crosshair_type",
+            "crosshair_color",
             "zoom_earth_style",
             "map_view",
             "flat_min_lat",
@@ -569,9 +571,16 @@ class TestEditAdvancedSettings(unittest.TestCase):
         "64MiB",
         "native",
         "native",
+        "plus",
     ])
     @mock.patch("himawari_cli.prompt_float", side_effect=[4.0, 1.0])
-    @mock.patch("himawari_cli.prompt_text", side_effect=["{scan_time}_{area}_{product}", "#00ff00", "/tmp/out", "/tmp/temp"])
+    @mock.patch("himawari_cli.prompt_text", side_effect=[
+        "{scan_time}_{area}_{product}",
+        "#00ff00",
+        "#ff0077",
+        "/tmp/out",
+        "/tmp/temp",
+    ])
     @mock.patch("himawari_cli.prompt_bool", return_value=True)
     def test_edits_advanced_settings(self, mock_bool, mock_text, mock_float, mock_choice, mock_int):
         config = h.default_config()
@@ -586,6 +595,8 @@ class TestEditAdvancedSettings(unittest.TestCase):
         self.assertTrue(result.add_border_lines)
         self.assertEqual(result.border_line_color, "#00ff00")
         self.assertEqual(result.border_line_width, 1.0)
+        self.assertEqual(result.crosshair_type, "plus")
+        self.assertEqual(result.crosshair_color, "#ff0077")
 
 
 class TestRunEnvironmentCheck(unittest.TestCase):

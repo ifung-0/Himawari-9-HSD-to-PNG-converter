@@ -52,7 +52,9 @@ CLOUD_SYNC_EXACT = ("box",)
 LAUNCHER_HELPERS = {
     "run_gui.bat": "himawari_lowram_processor.py",
     "run_cli.bat": "himawari_cli.py",
+    "runcli.bat": "run_cli.bat",
     "check_environment.bat": "check_environment.py",
+    "checkenv.bat": "check_environment.bat",
 }
 RUNTIME_JSON_FILES = (
     "himawari_gui_settings.json",
@@ -63,6 +65,7 @@ CORE_ROOT_FILES = {
     ".gitignore",
     "check_environment.bat",
     "check_environment.py",
+    "checkenv.bat",
     "himawari_cli.py",
     "himawari_lowram_processor.py",
     "install_requirements.py",
@@ -71,6 +74,7 @@ CORE_ROOT_FILES = {
     "requirements-gpu.txt",
     "requirements.txt",
     "run_cli.bat",
+    "runcli.bat",
     "run_gui.bat",
     *RUNTIME_JSON_FILES,
 }
@@ -1460,7 +1464,7 @@ def print_next_steps(results: list[CheckResult]) -> None:
 
     print()
     print("Environment looks ready for true color reproduction and low-RAM processing.")
-    print("Use run_gui.bat for the desktop app or run_cli.bat for the terminal interface.")
+    print("Use run_gui.bat for the desktop app or run_cli.bat/runcli.bat for the terminal interface.")
 
 
 def has_failures(results: list[CheckResult]) -> bool:

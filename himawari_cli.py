@@ -99,6 +99,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--map-labels", dest="add_map_labels", type=parse_bool, default=None)
     parser.add_argument("--night-boundary", dest="add_night_boundary", type=parse_bool, default=None)
     parser.add_argument("--crosshair", dest="add_crosshair", type=parse_bool, default=None)
+    parser.add_argument("--crosshair-type", choices=processor.CROSSHAIR_TYPES, default=None)
+    parser.add_argument("--crosshair-color", default=None)
     parser.add_argument("--zoom-earth-style", dest="zoom_earth_style", type=parse_bool, default=None)
     return parser
 
@@ -166,6 +168,7 @@ def print_config(config: processor.ProcessorConfig) -> None:
     print(f"Map labels:         {yes_no(config.add_map_labels)}")
     print(f"Night boundary:     {yes_no(config.add_night_boundary)}")
     print(f"Crosshair:          {yes_no(config.add_crosshair)}")
+    print(f"Crosshair style:    {config.crosshair_type} / {config.crosshair_color}")
     print(f"Zoom Earth style:   {yes_no(config.zoom_earth_style)}")
     print(f"Download workers:   {config.download_workers}")
     print(f"Dask workers:       {config.dask_num_workers}")
@@ -288,6 +291,8 @@ def edit_advanced_settings(config: processor.ProcessorConfig) -> processor.Proce
     values["add_map_labels"] = prompt_bool("Flat map labels", config.add_map_labels)
     values["add_night_boundary"] = prompt_bool("Flat map night boundary", config.add_night_boundary)
     values["add_crosshair"] = prompt_bool("Flat map crosshair", config.add_crosshair)
+    values["crosshair_type"] = prompt_choice("Crosshair type", config.crosshair_type, processor.CROSSHAIR_TYPES)
+    values["crosshair_color"] = prompt_text("Crosshair color", config.crosshair_color)
     values["zoom_earth_style"] = prompt_bool("Zoom Earth-style flat map", config.zoom_earth_style)
     output_dir = prompt_text("Output folder", str(processor.OUTPUT_DIR))
     temp_dir = prompt_text("Temp folder", str(processor.TEMP_DIR))

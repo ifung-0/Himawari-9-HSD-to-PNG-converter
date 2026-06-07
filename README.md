@@ -10,7 +10,7 @@ with defaults that favor lower peak RAM over speed.
 - `run_gui.bat` / `himawari_lowram_processor.py`: the main HSD processor.
   Use this for normal Himawari-9 AHI HSD downloads, true color, B13 infrared,
   flat-map output, overlays, single images, and timelapses.
-- `run_cli.bat` / `himawari_cli.py`: the terminal interface for the same HSD
+- `run_cli.bat` / `runcli.bat` / `himawari_cli.py`: the terminal interface for the same HSD
   processor. Use this for repeatable commands or scripted runs.
 
 ## Why This Version Is Low RAM
@@ -87,12 +87,14 @@ git pull origin main
 python himawari_cli.py --version
 python check_environment.py --plain
 python check_environment.py --auto
+checkenv.bat
 ```
 
-Expected current version: `2026.06.06.1`. If `--version` shows an older value,
+Expected current version: `2026.06.08.1`. If `--version` shows an older value,
 the machine is not running the latest update. If `--plain` reports a different
 Python than the one used to launch the GUI, use `run_gui.bat`, `run_cli.bat`,
-or `check_environment.bat` so the same Python environment is selected.
+`runcli.bat`, `check_environment.bat`, or `checkenv.bat` so the same Python
+environment is selected.
 
 Launch the GUI:
 
@@ -119,8 +121,8 @@ image, a quick B13 infrared check, and a lower-RAM B13 timelapse. Custom presets
 can save and reload your current settings without changing the locked safe
 presets.
 It also has optional coastline/country border overlays with a user-selected
-line color. The default border color is green, while Zoom Earth-style flat maps
-use white border lines for a closer map-view look.
+line color. The default border color is green, and the selected color is used
+for native and Zoom Earth-style flat maps.
 Overlay rendering uses Satpy/pycoast, so install requirements first and place
 pycoast-compatible coastline/border shapefiles under the project `overlays/`
 folder if your environment does not already provide them. `Check Overlay Setup`
@@ -144,10 +146,11 @@ while keeping the satellite image as the output. The default flat extent is lat
 equator; this creates a default target around `2400x3018` pixels because Web
 Mercator stretches latitude. Flat mode does not add Google labels, roads, map
 tiles, or basemap imagery. Zoom Earth-style flat maps keep the selected
-satellite product as the image, optionally add white border lines, static
-country/ocean labels, an approximate night boundary, and a center crosshair, and
-apply a bounded true-color contrast/saturation lift so true-color flat maps do
-not look washed out. Single-band products keep their normal band rendering.
+satellite product as the image, fill off-disk/invalid edges with dark ocean
+color, optionally add user-colored border lines, static country/ocean labels, a
+high-contrast approximate night boundary, and a configurable center crosshair,
+and apply a brighter true-color contrast/saturation lift so true-color flat maps
+do not look washed out. Single-band products keep their normal band rendering.
 Radar, wind animation, heat spots, active fires, tropical systems, and
 temperatures are shown as unavailable because this app does not include those
 external data feeds. Native disk output remains the low-RAM default.
@@ -176,6 +179,7 @@ Launch the terminal interface:
 python himawari_cli.py --help
 python himawari_cli.py --menu
 run_cli.bat
+runcli.bat
 ```
 
 The CLI uses the same `ProcessorConfig` and processing functions as the GUI.
@@ -186,7 +190,7 @@ flags for repeatable commands:
 python himawari_cli.py --run --composite "B13 (Infrared Window)" --mode "Single Image"
 python himawari_cli.py --run --composite "True Color Reproduction Image" --night-fallback-mode hybrid
 python himawari_cli.py --run --map-view flat --flat-min-lat -60 --flat-max-lat 60 --flat-min-lon 80 --flat-max-lon 200 --flat-resolution-deg 0.05
-python himawari_cli.py --run --map-view flat --zoom-earth-style yes --map-labels yes --night-boundary yes --crosshair yes
+python himawari_cli.py --run --map-view flat --zoom-earth-style yes --map-labels yes --night-boundary yes --crosshair yes --crosshair-type plus --crosshair-color "#ff0077"
 python himawari_cli.py --run --gpu-acceleration yes --composite "True Color Reproduction Image"
 ```
 
@@ -204,10 +208,10 @@ python himawari_cli.py --version
 python check_environment.py --plain
 ```
 
-Current fixed build: `2026.06.06.1`. Processing logs should include:
+Current fixed build: `2026.06.08.1`. Processing logs should include:
 
 ```text
-App version: 2026.06.06.1
+App version: 2026.06.08.1
 ```
 
 For official-looking true color and true color reproduction, keep the
@@ -267,6 +271,7 @@ git pull origin main
 python himawari_cli.py --version
 python check_environment.py --plain
 python check_environment.py --auto
+checkenv.bat
 ```
 
 If `check_environment.py --plain` shows optional warnings only, core processing
@@ -278,7 +283,7 @@ by the checker when installing or launching the app.
 Symptom: a friend says the fix is installed, but logs do not show:
 
 ```text
-App version: 2026.06.06.1
+App version: 2026.06.08.1
 ```
 
 Likely cause: their folder is still on an old commit, or they downloaded a ZIP

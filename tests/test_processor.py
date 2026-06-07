@@ -597,6 +597,22 @@ class ProcessorTests(unittest.TestCase):
         self.assertIn("GPU acceleration: experimental", status.display_text())
 
     @mock.patch("himawari_lowram_processor.gpu_support_status")
+    def test_setup_status_warns_when_gpu_settings_are_cpu_memory_bottlenecked(self, mock_status):
+        config = h.default_config()
+        config.gpu_acceleration = True
+        config.dask_chunk_size = "16MiB"
+        config.ram_limit_gb = 2.0
+        mock_status.return_value = h.GpuSupportStatus(True, "ready", device_name="Test GPU", device_count=1)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            status = h.build_setup_status(config, h.Path(tmp_dir) / "outputs", h.Path(tmp_dir) / "temp")
+
+        self.assertTrue(status.ok)
+        display = status.display_text()
+        self.assertIn("larger Dask chunks", display)
+        self.assertIn("RAM limit is low", display)
+
+    @mock.patch("himawari_lowram_processor.gpu_support_status")
     def test_preflight_blocks_gpu_for_unsupported_product(self, mock_status):
         config = h.default_config()
         config.gpu_acceleration = True
@@ -1089,6 +1105,16 @@ class ProcessorTests(unittest.TestCase):
         config.add_border_lines = True
         config.border_line_color = "not-a-color"
         with self.assertRaises(ValueError):
+            h.validate_configuration(config)
+
+        config = h.default_config()
+        config.crosshair_type = "triangle"
+        with self.assertRaisesRegex(ValueError, "Crosshair type"):
+            h.validate_configuration(config)
+
+        config = h.default_config()
+        config.crosshair_color = "not-a-color"
+        with self.assertRaisesRegex(ValueError, "Crosshair color"):
             h.validate_configuration(config)
 
     def test_config_validation_rejects_bad_user_inputs(self):
@@ -1622,6 +1648,8 @@ class ProcessorTests(unittest.TestCase):
         config = h.default_config()
         config.composite_choice = "B13 (Infrared Window)"
         config.map_view = "flat"
+        config.crosshair_type = "plus"
+        config.crosshair_color = "#12abef"
         config.flat_min_lat = -45.0
         config.flat_max_lat = 45.0
         config.flat_min_lon = 90.0
@@ -1639,6 +1667,8 @@ class ProcessorTests(unittest.TestCase):
         loaded_config, output_dir, temp_dir = loaded
         self.assertEqual(loaded_config.composite_choice, "B13 (Infrared Window)")
         self.assertEqual(loaded_config.map_view, "flat")
+        self.assertEqual(loaded_config.crosshair_type, "plus")
+        self.assertEqual(loaded_config.crosshair_color, "#12abef")
         self.assertEqual(loaded_config.flat_min_lat, -45.0)
         self.assertEqual(loaded_config.flat_max_lat, 45.0)
         self.assertEqual(loaded_config.flat_min_lon, 90.0)
@@ -1657,6 +1687,8 @@ class ProcessorTests(unittest.TestCase):
             "flat_min_lon",
             "flat_max_lon",
             "flat_resolution_deg",
+            "crosshair_type",
+            "crosshair_color",
         ):
             data["config"].pop(key)
 
@@ -1674,6 +1706,8 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(loaded_config.flat_min_lon, h.FLAT_MIN_LON)
         self.assertEqual(loaded_config.flat_max_lon, h.FLAT_MAX_LON)
         self.assertEqual(loaded_config.flat_resolution_deg, h.FLAT_RESOLUTION_DEG)
+        self.assertEqual(loaded_config.crosshair_type, h.CROSSHAIR_TYPE)
+        self.assertEqual(loaded_config.crosshair_color, h.CROSSHAIR_COLOR)
 
     def test_gui_settings_corrupt_file_returns_none(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1984,7 +2018,7 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(overlay["color"], (0, 255, 0))
         self.assertIn("coast_dir", overlay)
 
-    def test_zoom_earth_style_uses_white_border_options_for_flat_map(self):
+    def test_zoom_earth_style_respects_selected_border_options_for_flat_map(self):
         config = h.default_config()
         config.map_view = "flat"
         config.add_border_lines = True
@@ -1994,20 +2028,29 @@ class ProcessorTests(unittest.TestCase):
 
         overlay = h.build_overlay_options(config)
 
-        self.assertEqual(overlay["color"], (255, 255, 255))
-        self.assertEqual(overlay["width"], h.ZOOM_EARTH_BORDER_WIDTH)
+        self.assertEqual(overlay["color"], (0, 255, 0))
+        self.assertEqual(overlay["width"], 4.0)
 
     def test_new_map_overlay_defaults_are_off_and_old_settings_load(self):
         config = h.default_config()
         self.assertFalse(config.add_map_labels)
         self.assertFalse(config.add_night_boundary)
         self.assertFalse(config.add_crosshair)
+        self.assertEqual(config.crosshair_type, h.CROSSHAIR_TYPE)
+        self.assertEqual(config.crosshair_color, h.CROSSHAIR_COLOR)
         self.assertFalse(config.zoom_earth_style)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             settings_path = h.Path(tmp_dir) / "settings.json"
             data = h.serialize_gui_settings(h.default_config(), h.Path(tmp_dir) / "out", h.Path(tmp_dir) / "temp")
-            for key in ("add_map_labels", "add_night_boundary", "add_crosshair", "zoom_earth_style"):
+            for key in (
+                "add_map_labels",
+                "add_night_boundary",
+                "add_crosshair",
+                "crosshair_type",
+                "crosshair_color",
+                "zoom_earth_style",
+            ):
                 data["config"].pop(key, None)
             h.write_json_file(settings_path, data)
 
@@ -2018,6 +2061,8 @@ class ProcessorTests(unittest.TestCase):
         self.assertFalse(loaded_config.add_map_labels)
         self.assertFalse(loaded_config.add_night_boundary)
         self.assertFalse(loaded_config.add_crosshair)
+        self.assertEqual(loaded_config.crosshair_type, h.CROSSHAIR_TYPE)
+        self.assertEqual(loaded_config.crosshair_color, h.CROSSHAIR_COLOR)
         self.assertFalse(loaded_config.zoom_earth_style)
 
     def test_flat_map_visual_style_requires_flat_map(self):
@@ -2064,6 +2109,282 @@ class ProcessorTests(unittest.TestCase):
 
         self.assertEqual(result, path)
         self.assertNotEqual(before.tobytes(), after.tobytes())
+
+    def test_zoom_earth_enhancement_brightens_and_saturates_true_color(self):
+        from PIL import Image
+
+        pixels = h.np.zeros((24, 24, 3), dtype=h.np.uint8)
+        pixels[:, :] = (55, 75, 95)
+        pixels[6:18, 6:18] = (120, 90, 55)
+        before = Image.fromarray(pixels, mode="RGB")
+        after = h.apply_zoom_earth_true_color_enhancement(before).convert("RGB")
+
+        def luminance_and_saturation(image):
+            values = h.np.asarray(image, dtype=h.np.float32) / 255.0
+            luminance = (0.2126 * values[:, :, 0] + 0.7152 * values[:, :, 1] + 0.0722 * values[:, :, 2]).mean()
+            maximum = values.max(axis=2)
+            minimum = values.min(axis=2)
+            saturation = h.np.where(maximum > 0.0, (maximum - minimum) / maximum, 0.0).mean()
+            return float(luminance), float(saturation)
+
+        before_luminance, before_saturation = luminance_and_saturation(before)
+        after_luminance, after_saturation = luminance_and_saturation(after)
+
+        self.assertGreater(after_luminance, before_luminance + 0.05)
+        self.assertGreater(after_saturation, before_saturation + 0.03)
+
+    def test_flat_map_validity_mask_rejects_zero_source_fill(self):
+        area = AreaDefinition("flat", "flat", "flat", h.WEB_MERCATOR_PROJ4, 3, 2, h.web_mercator_extent(-10, 10, 100, 103))
+        attrs = {"area": area}
+        scene = {
+            "B01": xr.DataArray(
+                da.from_array([[1.0, 0.0, h.np.nan], [0.0, 2.0, 0.0]], chunks=(2, 3)),
+                dims=("y", "x"),
+                attrs=attrs,
+            ),
+            "B13": xr.DataArray(
+                da.from_array([[0.0, 0.0, 0.0], [250.0, 0.0, 0.0]], chunks=(2, 3)),
+                dims=("y", "x"),
+                attrs=attrs,
+            ),
+        }
+
+        mask = h.flat_map_validity_mask_from_scene(scene, ("B01", "B13"), area)
+
+        expected = h.np.asarray([[True, False, False], [True, True, False]], dtype=bool)
+        self.assertTrue(h.np.array_equal(mask, expected))
+
+    def test_flat_map_visual_overlays_fill_invalid_pixels_with_dark_ocean(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "styled.png"
+            Image.new("RGB", (12, 8), (120, 130, 140)).save(path)
+            area = AreaDefinition("flat", "flat", "flat", h.WEB_MERCATOR_PROJ4, 12, 8, h.web_mercator_extent(-10, 10, 100, 112))
+            config = h.default_config()
+            config.map_view = "flat"
+            config.zoom_earth_style = True
+            mask = h.np.ones((8, 12), dtype=bool)
+            mask[:, -3:] = False
+            h.apply_flat_map_visual_overlays(
+                path,
+                area,
+                config,
+                h.datetime(2024, 7, 25, 4, 0),
+                "True Color Reproduction Image",
+                valid_mask=mask,
+            )
+            with Image.open(path) as image:
+                pixels = h.np.asarray(image.convert("RGB"))
+
+        self.assertTrue(h.np.all(pixels[:, -3:, :] == h.np.asarray(h.FLAT_MAP_INVALID_FILL, dtype=h.np.uint8)))
+
+    def test_flat_map_visual_overlays_use_png_alpha_as_invalid_mask(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "alpha.png"
+            pixels = h.np.zeros((8, 12, 4), dtype=h.np.uint8)
+            pixels[:, :, :3] = (120, 130, 140)
+            pixels[:, :, 3] = 255
+            pixels[:, -3:, 3] = 0
+            Image.fromarray(pixels, mode="RGBA").save(path)
+            area = AreaDefinition("flat", "flat", "flat", h.WEB_MERCATOR_PROJ4, 12, 8, h.web_mercator_extent(-10, 10, 100, 112))
+            config = h.default_config()
+            config.map_view = "flat"
+            config.zoom_earth_style = True
+
+            h.apply_flat_map_visual_overlays(
+                path,
+                area,
+                config,
+                h.datetime(2024, 7, 25, 4, 0),
+                "True Color Reproduction Image",
+            )
+            with Image.open(path) as image:
+                styled = h.np.asarray(image.convert("RGB"))
+
+        self.assertTrue(h.np.all(styled[:, -3:, :] == h.np.asarray(h.FLAT_MAP_INVALID_FILL, dtype=h.np.uint8)))
+
+    def test_flat_map_visual_geotiff_preserves_profile_and_styles_rgb(self):
+        import rasterio
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "styled.tif"
+            area = AreaDefinition("flat", "flat", "flat", h.WEB_MERCATOR_PROJ4, 12, 8, h.web_mercator_extent(-10, 10, 100, 112))
+            rgb = xr.DataArray(
+                da.from_array(
+                    [
+                        [[80] * 12 for _ in range(8)],
+                        [[90] * 12 for _ in range(8)],
+                        [[100] * 12 for _ in range(8)],
+                    ],
+                    chunks=(1, 4, 6),
+                ),
+                dims=("bands", "y", "x"),
+                coords={"bands": ["R", "G", "B"]},
+                attrs={"area": area, "mode": "RGB"},
+            ).astype(h.np.uint8)
+            h.write_rgb_geotiff_low_ram(rgb, path, area)
+            with rasterio.open(path) as src:
+                original_transform = src.transform
+                original_crs = src.crs
+            config = h.default_config()
+            config.map_view = "flat"
+            config.zoom_earth_style = True
+            config.add_night_boundary = True
+            mask = h.np.ones((8, 12), dtype=bool)
+            mask[-2:, -2:] = False
+
+            result = h.apply_flat_map_visual_overlays(
+                path,
+                area,
+                config,
+                h.datetime(2024, 7, 25, 4, 0),
+                "True Color Reproduction Image",
+                valid_mask=mask,
+            )
+            with rasterio.open(path) as src:
+                styled = src.read((1, 2, 3))
+                colorinterp = tuple(src.colorinterp)
+                styled_width = src.width
+                styled_height = src.height
+                styled_count = src.count
+                styled_crs = src.crs
+                styled_transform = src.transform
+
+        self.assertEqual(result, path)
+        self.assertEqual(styled_width, 12)
+        self.assertEqual(styled_height, 8)
+        self.assertEqual(styled_count, 3)
+        self.assertEqual(styled_crs, original_crs)
+        self.assertEqual(styled_transform, original_transform)
+        self.assertEqual(colorinterp[0], rasterio.enums.ColorInterp.red)
+        self.assertTrue(h.np.all(h.np.moveaxis(styled, 0, -1)[-2:, -2:, :] == h.np.asarray(h.FLAT_MAP_INVALID_FILL, dtype=h.np.uint8)))
+
+    def test_flat_map_visual_geotiff_uses_alpha_band_as_invalid_mask(self):
+        import rasterio
+        from rasterio.transform import from_origin
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "alpha.tif"
+            area = AreaDefinition("flat", "flat", "flat", h.WEB_MERCATOR_PROJ4, 12, 8, h.web_mercator_extent(-10, 10, 100, 112))
+            profile = {
+                "driver": "GTiff",
+                "width": 12,
+                "height": 8,
+                "count": 4,
+                "dtype": "uint8",
+                "crs": area.crs,
+                "transform": from_origin(0, 0, 1, 1),
+                "photometric": "RGB",
+            }
+            data = h.np.zeros((4, 8, 12), dtype=h.np.uint8)
+            data[0:3, :, :] = h.np.asarray([120, 130, 140], dtype=h.np.uint8)[:, None, None]
+            data[3, :, :] = 255
+            data[3, :, -3:] = 0
+            with rasterio.open(path, "w", **profile) as dst:
+                dst.write(data)
+                dst.colorinterp = (
+                    rasterio.enums.ColorInterp.red,
+                    rasterio.enums.ColorInterp.green,
+                    rasterio.enums.ColorInterp.blue,
+                    rasterio.enums.ColorInterp.alpha,
+                )
+            config = h.default_config()
+            config.map_view = "flat"
+            config.zoom_earth_style = True
+
+            h.apply_flat_map_visual_overlays(
+                path,
+                area,
+                config,
+                h.datetime(2024, 7, 25, 4, 0),
+                "True Color Reproduction Image",
+            )
+            with rasterio.open(path) as src:
+                styled = h.np.moveaxis(src.read((1, 2, 3)), 0, -1)
+
+        self.assertTrue(h.np.all(styled[:, -3:, :] == h.np.asarray(h.FLAT_MAP_INVALID_FILL, dtype=h.np.uint8)))
+
+    def test_flat_map_visual_style_draws_selected_border_color_after_enhancement(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "border.png"
+            from PIL import Image
+
+            Image.new("RGB", (20, 10), (90, 95, 100)).save(path)
+            area = AreaDefinition("flat", "flat", "flat", h.WEB_MERCATOR_PROJ4, 20, 10, h.web_mercator_extent(-10, 10, 100, 120))
+            config = h.default_config()
+            config.map_view = "flat"
+            config.zoom_earth_style = True
+            config.add_border_lines = True
+            config.border_line_color = "green"
+            overlay = h.build_overlay_options(config)
+
+            with mock.patch("himawari_lowram_processor.direct_overlay_to_image") as mock_overlay:
+                h.apply_flat_map_visual_overlays(
+                    path,
+                    area,
+                    config,
+                    h.datetime(2024, 7, 25, 4, 0),
+                    "True Color Reproduction Image",
+                    overlay_options=overlay,
+                )
+
+        mock_overlay.assert_called_once()
+        self.assertEqual(mock_overlay.call_args.args[2]["color"], (0, 255, 0))
+
+    def test_flat_map_visual_style_draws_configured_crosshair(self):
+        from PIL import Image
+
+        for crosshair_type in h.CROSSHAIR_TYPES:
+            with self.subTest(crosshair_type=crosshair_type):
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    path = h.Path(tmp_dir) / "crosshair.png"
+                    Image.new("RGB", (80, 80), (20, 25, 30)).save(path)
+                    area = AreaDefinition("flat", "flat", "flat", h.WEB_MERCATOR_PROJ4, 80, 80, h.web_mercator_extent(-10, 10, 100, 120))
+                    config = h.default_config()
+                    config.map_view = "flat"
+                    config.add_crosshair = True
+                    config.crosshair_type = crosshair_type
+                    config.crosshair_color = "#ff0000"
+
+                    h.apply_flat_map_visual_overlays(
+                        path,
+                        area,
+                        config,
+                        h.datetime(2024, 7, 25, 4, 0),
+                        "B13 (Infrared Window)",
+                    )
+                    with Image.open(path) as image:
+                        pixels = h.np.asarray(image.convert("RGB"))
+
+                red_pixels = (pixels[:, :, 0] > 180) & (pixels[:, :, 1] < 90) & (pixels[:, :, 2] < 90)
+                self.assertGreater(int(red_pixels.sum()), 0)
+
+    def test_night_boundary_draws_visible_high_contrast_pixels(self):
+        from PIL import Image
+
+        area = AreaDefinition("flat", "flat", "flat", h.WEB_MERCATOR_PROJ4, 240, 120, h.web_mercator_extent(-60, 60, 80, 200))
+        image = Image.new("RGBA", (240, 120), (120, 120, 120, 255))
+
+        h.draw_night_boundary(image, area, h.datetime(2024, 7, 25, 4, 0))
+        pixels = h.np.asarray(image.convert("RGB"))
+
+        bright_pixels = (pixels[:, :, 0] > 220) & (pixels[:, :, 1] > 220) & (pixels[:, :, 2] > 220)
+        dark_pixels = (pixels[:, :, 0] < 50) & (pixels[:, :, 1] < 50) & (pixels[:, :, 2] < 50)
+        self.assertGreater(int(bright_pixels.sum()), 0)
+        self.assertGreater(int(dark_pixels.sum()), 0)
+
+    def test_visible_polyline_segments_split_projection_jumps(self):
+        segments = h.visible_polyline_segments(
+            [(0.0, 0.0), (1.0, 0.0), (200.0, 0.0), (201.0, 0.0), None, (2.0, 2.0), (3.0, 2.0)],
+            max_jump_px=10.0,
+        )
+
+        self.assertEqual(len(segments), 3)
+        self.assertEqual(segments[0], [(0.0, 0.0), (1.0, 0.0)])
+        self.assertEqual(segments[1], [(200.0, 0.0), (201.0, 0.0)])
 
     def test_zoom_earth_enhancement_does_not_run_for_single_band_product(self):
         from PIL import Image
@@ -2313,6 +2634,61 @@ class ProcessorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             with self.assertRaisesRegex(ValueError, "dimensions do not match"):
                 h.write_rgb_geotiff_low_ram(rgb, h.Path(tmp_dir) / "rgb.tif", area)
+
+    @mock.patch("himawari_lowram_processor.apply_flat_map_visual_overlays")
+    @mock.patch("himawari_lowram_processor.save_dataset_with_optional_overlay")
+    def test_satpy_flat_true_color_passes_validity_mask_to_styling(self, mock_save, mock_style):
+        area = AreaDefinition(
+            "flat",
+            "flat",
+            "latlon",
+            {"proj": "longlat", "datum": "WGS84"},
+            3,
+            2,
+            (100.0, -10.0, 103.0, -8.0),
+        )
+        output = h.Path("out.png")
+        mock_save.return_value = output
+        mock_style.return_value = output
+        b01 = xr.DataArray(
+            da.from_array([[1.0, 0.0, h.np.nan], [1.0, 2.0, 0.0]], chunks=(2, 3)),
+            dims=("y", "x"),
+            attrs={"area": area},
+        )
+        b02 = xr.DataArray(
+            da.from_array([[h.np.nan, h.np.nan, h.np.nan], [1.0, h.np.nan, h.np.nan]], chunks=(2, 3)),
+            dims=("y", "x"),
+            attrs={"area": area},
+        )
+        dataset = xr.DataArray(
+            da.ones((2, 3), chunks=(2, 3)),
+            dims=("y", "x"),
+            attrs={"area": area},
+        )
+        blank = xr.DataArray(
+            da.from_array([[h.np.nan, h.np.nan, h.np.nan], [h.np.nan, h.np.nan, h.np.nan]], chunks=(2, 3)),
+            dims=("y", "x"),
+            attrs={"area": area},
+        )
+        resampled = {"true_color": dataset, "B01": b01, "B02": b02, "B03": blank, "B04": blank}
+        config = h.default_config()
+        config.map_view = "flat"
+        config.zoom_earth_style = True
+        config.use_night_fallback = False
+
+        h.save_satpy_dataset_output(
+            resampled,
+            "True Color RGB (Enhanced)",
+            "true_color",
+            output,
+            config,
+            overlay_options=None,
+            scan_time=h.datetime(2024, 7, 25, 4, 0),
+        )
+
+        valid_mask = mock_style.call_args.kwargs["valid_mask"]
+        expected = h.np.asarray([[True, False, False], [True, True, False]], dtype=bool)
+        self.assertTrue(h.np.array_equal(valid_mask, expected))
 
     @mock.patch("himawari_lowram_processor.save_dataset_with_optional_overlay")
     @mock.patch("himawari_lowram_processor.write_rgb_png_low_ram")
@@ -2955,6 +3331,19 @@ class ProcessorTests(unittest.TestCase):
 
         self.assertNotEqual(first, second)
 
+    def test_stable_run_id_changes_for_crosshair_style(self):
+        config = h.default_config()
+        config.mode = "Timelapse"
+        config.map_view = "flat"
+        config.add_crosshair = True
+        info = h.parse_url(config.user_url)
+        steps = [h.datetime(2024, 7, 25, 4, 0)]
+        first = h.stable_run_id(config, info, steps)
+        config.crosshair_color = "#ff0000"
+        second = h.stable_run_id(config, info, steps)
+
+        self.assertNotEqual(first, second)
+
     def test_load_or_create_timelapse_manifest_reuses_existing(self):
         config = h.default_config()
         config.mode = "Timelapse"
@@ -3590,6 +3979,8 @@ class ProcessorTests(unittest.TestCase):
         app.map_labels_var = FakeVar(config.add_map_labels)
         app.night_boundary_var = FakeVar(config.add_night_boundary)
         app.crosshair_var = FakeVar(config.add_crosshair)
+        app.crosshair_type_var = FakeVar(config.crosshair_type)
+        app.crosshair_color_var = FakeVar(config.crosshair_color)
         app.zoom_earth_style_var = FakeVar(config.zoom_earth_style)
         app.map_view_var = FakeVar("flat")
         app.flat_min_lat_var = FakeVar("nan")
@@ -3662,7 +4053,9 @@ class ProcessorTests(unittest.TestCase):
         self.assertTrue(app.gpu_acceleration_var.get())
         app._update_setup_status.assert_called_once()
         app._write_current_settings.assert_called_once()
-        app._append_log.assert_called_once()
+        messages = [call.args[0] for call in app._append_log.call_args_list]
+        self.assertTrue(any("GPU acceleration enabled: ready" in message for message in messages))
+        self.assertTrue(any("custom true-color math only" in message for message in messages))
 
     @mock.patch("himawari_lowram_processor.messagebox.showinfo")
     @mock.patch("himawari_lowram_processor.import_local_hsd_segments")

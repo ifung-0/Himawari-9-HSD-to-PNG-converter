@@ -1176,6 +1176,8 @@ class EnvironmentCheckTests(unittest.TestCase):
         self.assertFalse(result.critical)
         self.assertIn("run_gui.bat does not reference", result.detail)
         self.assertIn("missing check_environment.bat", result.detail)
+        self.assertIn("missing checkenv.bat", result.detail)
+        self.assertIn("missing runcli.bat", result.detail)
 
     def test_check_writable_folder_target_accepts_missing_child_with_writable_parent(self):
         with TemporaryDirectory() as tmp_dir:
