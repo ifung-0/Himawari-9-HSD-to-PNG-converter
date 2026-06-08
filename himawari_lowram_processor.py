@@ -64,7 +64,7 @@ except KeyboardInterrupt:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-APP_VERSION = "2026.06.08.7"
+APP_VERSION = "2026.06.08.8"
 APP_DISPLAY_NAME = "Himawari-8/9 Low-RAM Processor"
 USER_URL = "https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/2024/07/25/0400/HS_H09_20240725_0400_B01_FLDK_R10_S0110.DAT.bz2"
 MODE = "Single Image"  # "Single Image" or "Timelapse"
@@ -2911,6 +2911,10 @@ def true_color_product(composite_choice: str) -> bool:
     return composite_choice in {"True Color RGB (Enhanced)", "True Color Reproduction Image"}
 
 
+def should_force_low_ram_flat_true_color(config: ProcessorConfig, active: str) -> bool:
+    return is_flat_map(config) and true_color_product(active)
+
+
 def projected_point_to_pixel(area: AreaDefinition, x: float, y: float) -> tuple[float, float] | None:
     left, bottom, right, top = area.area_extent
     if right == left or top == bottom:
@@ -4900,6 +4904,24 @@ def process_frame(
         output_path = enforce_safe_output_format(output_path, master_area, config)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         overlay_options = build_overlay_options(config)
+
+        if should_force_low_ram_flat_true_color(config, active):
+            LOG.info("Flat-map %s will use direct low-RAM RGB output instead of Satpy composite saving.", active)
+            output_path = save_custom_composite_output(
+                scene,
+                active,
+                master_area,
+                output_path,
+                config,
+                is_night,
+                overlay_options,
+                dt,
+                progress=progress,
+                cancel_event=cancel_event,
+            )
+            log_memory("after save", config)
+            frame_succeeded = True
+            return output_path
 
         if active in SATPY_COMPOSITE_NAMES:
             satpy_name = SATPY_COMPOSITE_NAMES[active]

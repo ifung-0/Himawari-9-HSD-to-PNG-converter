@@ -3210,6 +3210,52 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(mock_write_png.call_args.args[1], output)
         mock_save.assert_not_called()
 
+    @mock.patch("himawari_lowram_processor.cleanup_paths")
+    @mock.patch("himawari_lowram_processor.save_custom_composite_output")
+    @mock.patch("himawari_lowram_processor.save_satpy_dataset_output")
+    @mock.patch("himawari_lowram_processor.resample_scene_low_ram")
+    @mock.patch("himawari_lowram_processor.download_segments")
+    @mock.patch("himawari_lowram_processor.Scene")
+    def test_flat_true_color_process_frame_bypasses_satpy_composite_writer(
+        self,
+        mock_scene_class,
+        mock_download,
+        mock_resample,
+        mock_satpy_save,
+        mock_custom_save,
+        _mock_cleanup,
+    ):
+        scene = mock.Mock()
+        scene.load.return_value = None
+        mock_scene_class.return_value = scene
+        output = h.Path("out.png")
+        mock_custom_save.return_value = output
+        config = h.default_config()
+        config.map_view = "flat"
+        config.composite_choice = "True Color Reproduction Image"
+        config.use_night_fallback = False
+        info = h.parse_url(h.USER_URL)
+        expected_segments = len(
+            h.required_bands(
+                "True Color Reproduction Image",
+                use_night_fallback=False,
+                night_fallback_mode=config.night_fallback_mode,
+            )
+        ) * info.total_segments
+        mock_download.return_value = [h.Path(f"segment-{idx}.dat") for idx in range(expected_segments)]
+        dt = h.datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
+        area = h.flat_map_area(config)
+
+        result = h.process_frame(dt, info, area, 0, 1, config=config)
+
+        self.assertEqual(result, output)
+        scene.load.assert_not_called()
+        mock_resample.assert_not_called()
+        mock_satpy_save.assert_not_called()
+        mock_custom_save.assert_called_once()
+        self.assertEqual(mock_custom_save.call_args.args[1], "True Color Reproduction Image")
+        self.assertEqual(mock_custom_save.call_args.args[2], area)
+
     def test_require_module_reports_missing_dependency(self):
         with self.assertRaises(RuntimeError):
             h.require_module("definitely_missing_himawari_dependency", "testing")
@@ -3361,9 +3407,7 @@ class ProcessorTests(unittest.TestCase):
         _mock_cleanup,
     ):
         original_scene = mock.Mock()
-        original_scene.load.side_effect = KeyError(
-            "\"No dataset matching 'DataQuery(name='true_color_reproduction')' found\""
-        )
+        original_scene.load.return_value = None
         attrs = {"area": h.flat_map_area(h.default_config()), "sensor": "ahi"}
         bands = {
             band: xr.DataArray(da.ones((4, 4), chunks=(2, 2)) * 50, dims=("y", "x"), attrs=attrs)
@@ -3373,7 +3417,7 @@ class ProcessorTests(unittest.TestCase):
         fallback_scene.__getitem__.side_effect = lambda key: bands[key]
         fallback_scene.__setitem__.return_value = None
         fallback_scene.load.return_value = None
-        mock_scene_class.side_effect = [original_scene, fallback_scene]
+        mock_scene_class.return_value = original_scene
         mock_direct_sample.return_value = fallback_scene
         mock_save.return_value = h.Path("out.png")
         mock_download.return_value = [h.Path(f"segment-{idx}.dat") for idx in range(40)]
@@ -3388,10 +3432,12 @@ class ProcessorTests(unittest.TestCase):
         result = h.process_frame(dt, info, master_area, 0, 1, config=config)
 
         self.assertEqual(result, h.Path("out.png"))
+        self.assertEqual(original_scene.load.call_count, 4)
+        self.assertEqual(mock_scene_class.call_count, 1)
         mock_native_compatibility.assert_not_called()
         mock_resample.assert_not_called()
         mock_direct_sample.assert_called_once_with(
-            fallback_scene,
+            original_scene,
             h.required_bands("True Color Reproduction Image", False, config.night_fallback_mode),
             master_area,
         )
