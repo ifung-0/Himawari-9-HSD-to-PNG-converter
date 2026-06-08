@@ -64,8 +64,8 @@ except KeyboardInterrupt:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-APP_VERSION = "2026.06.08.6"
-APP_DISPLAY_NAME = "Himawari-9 Low-RAM Processor"
+APP_VERSION = "2026.06.08.7"
+APP_DISPLAY_NAME = "Himawari-8/9 Low-RAM Processor"
 USER_URL = "https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/2024/07/25/0400/HS_H09_20240725_0400_B01_FLDK_R10_S0110.DAT.bz2"
 MODE = "Single Image"  # "Single Image" or "Timelapse"
 COMPOSITE_CHOICE = "True Color Reproduction Image"
@@ -175,7 +175,12 @@ GUI_SETTINGS_SCHEMA_VERSION = 1
 RECENT_RUNS_SCHEMA_VERSION = 2
 CUSTOM_PRESETS_SCHEMA_VERSION = 1
 TIMELAPSE_MANIFEST_SCHEMA_VERSION = 1
+NOAA_HIMAWARI8_BUCKET = "https://noaa-himawari8.s3.amazonaws.com"
 NOAA_HIMAWARI9_BUCKET = "https://noaa-himawari9.s3.amazonaws.com"
+HIMAWARI_BUCKET_BY_SAT_ID = {
+    "HS_H08": NOAA_HIMAWARI8_BUCKET,
+    "HS_H09": NOAA_HIMAWARI9_BUCKET,
+}
 RECENT_RUN_LIMIT = 50
 CUSTOM_PRESET_LIMIT = 25
 PREVIEW_MAX_BYTES = 100 * 1024 * 1024
@@ -1265,15 +1270,50 @@ def parse_url(url: str) -> UrlInfo:
     if match:
         area = match.group("area_type")
         timestamp = f"{match.group('year')}{match.group('month')}{match.group('day')}_{match.group('hhmm')}"
+        root = f"https://{match.group('host')}/AHI-L1b-{area}/"
         return UrlInfo(
-            root=f"https://{match.group('host')}/AHI-L1b-{area}/",
-            sat_id="HS_H09",
+            root=root,
+            sat_id=sat_id_from_himawari_bucket_url(root),
             timestamp=timestamp,
             area=area,
             total_segments=10,
         )
 
     raise ValueError(f"URL not recognised: {url}")
+
+
+def normalized_himawari_sat_id(sat_id: str | None) -> str:
+    normalized = (sat_id or "HS_H09").strip().upper()
+    if normalized not in HIMAWARI_BUCKET_BY_SAT_ID:
+        raise ValueError(f"Unsupported Himawari satellite id: {sat_id}")
+    return normalized
+
+
+def himawari_bucket_for_sat_id(sat_id: str | None = None) -> str:
+    return HIMAWARI_BUCKET_BY_SAT_ID[normalized_himawari_sat_id(sat_id)]
+
+
+def sat_id_from_himawari_bucket_url(url: str) -> str:
+    host = re.search(r"https?://([^/]+)", url.strip(), flags=re.IGNORECASE)
+    hostname = host.group(1).lower() if host else ""
+    if "himawari8" in hostname:
+        return "HS_H08"
+    if "himawari9" in hostname:
+        return "HS_H09"
+    return "HS_H09"
+
+
+def sat_id_from_himawari_source(value: str | None) -> str:
+    text = (value or "").strip()
+    if not text:
+        return "HS_H09"
+    try:
+        return parse_url(text).sat_id
+    except ValueError:
+        try:
+            return parse_local_hsd_segment(text).sat_id
+        except ValueError:
+            return sat_id_from_himawari_bucket_url(text)
 
 
 def noaa_scan_prefix(dt: datetime, area: str = "FLDK") -> str:
@@ -1289,27 +1329,29 @@ def parse_s3_listing_keys(xml_text: str) -> list[str]:
     return keys
 
 
-def object_url_from_s3_key(key: str) -> str:
-    return f"{NOAA_HIMAWARI9_BUCKET}/{key}"
+def object_url_from_s3_key(key: str, sat_id: str | None = None) -> str:
+    return f"{himawari_bucket_for_sat_id(sat_id)}/{key}"
 
 
-def latest_fldk_url_from_listing(xml_text: str) -> str | None:
+def latest_fldk_url_from_listing(xml_text: str, sat_id: str | None = None) -> str | None:
+    sat_id = normalized_himawari_sat_id(sat_id)
     keys = parse_s3_listing_keys(xml_text)
     candidates = [
         key
         for key in keys
-        if key.endswith(".DAT.bz2") and re.search(r"_B01_FLDK_R10_S01\d{2}\.DAT\.bz2$", key)
+        if key.endswith(".DAT.bz2") and re.search(rf"{re.escape(sat_id)}_\d{{8}}_\d{{4}}_B01_FLDK_R10_S01\d{{2}}\.DAT\.bz2$", key)
     ]
     if not candidates:
         return None
-    return object_url_from_s3_key(sorted(candidates)[0])
+    return object_url_from_s3_key(sorted(candidates)[0], sat_id=sat_id)
 
 
-def fldk_scan_choices_from_listing(xml_text: str) -> list[RecentScanChoice]:
+def fldk_scan_choices_from_listing(xml_text: str, sat_id: str | None = None) -> list[RecentScanChoice]:
+    sat_id = normalized_himawari_sat_id(sat_id)
     keys = parse_s3_listing_keys(xml_text)
     choices: list[RecentScanChoice] = []
     for key in sorted(keys):
-        match = re.search(r"HS_H09_(\d{8}_\d{4})_(B\d{2})_FLDK_R\d{2}_S01\d{2}\.DAT\.bz2$", key)
+        match = re.search(rf"{re.escape(sat_id)}_(\d{{8}}_\d{{4}})_(B\d{{2}})_FLDK_R\d{{2}}_S01\d{{2}}\.DAT\.bz2$", key)
         if not match:
             continue
         timestamp, band = match.groups()
@@ -1317,16 +1359,16 @@ def fldk_scan_choices_from_listing(xml_text: str) -> list[RecentScanChoice]:
             RecentScanChoice(
                 timestamp=timestamp,
                 band=band,
-                url=object_url_from_s3_key(key),
+                url=object_url_from_s3_key(key, sat_id=sat_id),
                 label=f"{timestamp} {band}",
             )
         )
     return choices
 
 
-def fetch_s3_prefix_listing(prefix: str, timeout: int = 20) -> str:
+def fetch_s3_prefix_listing(prefix: str, timeout: int = 20, sat_id: str | None = None) -> str:
     response = requests.get(
-        NOAA_HIMAWARI9_BUCKET,
+        himawari_bucket_for_sat_id(sat_id),
         params={"list-type": "2", "prefix": prefix, "max-keys": "25"},
         timeout=timeout,
     )
@@ -1350,13 +1392,15 @@ def find_latest_fldk_url(
     now: datetime | None = None,
     lookback_hours: int = 48,
     fetch_listing: Callable[[str], str] | None = None,
+    sat_id: str | None = None,
 ) -> str:
-    fetch_listing = fetch_listing or fetch_s3_prefix_listing
+    sat_id = normalized_himawari_sat_id(sat_id)
+    fetch_listing = fetch_listing or (lambda prefix: fetch_s3_prefix_listing(prefix, sat_id=sat_id))
     last_error: Exception | None = None
     for dt in recent_himawari_scan_datetimes(now=now, lookback_hours=lookback_hours):
         prefix = noaa_scan_prefix(dt, "FLDK")
         try:
-            url = latest_fldk_url_from_listing(fetch_listing(prefix))
+            url = latest_fldk_url_from_listing(fetch_listing(prefix), sat_id=sat_id)
         except Exception as exc:
             last_error = exc
             continue
@@ -1372,14 +1416,16 @@ def find_recent_fldk_scan_choices(
     lookback_hours: int = 6,
     fetch_listing: Callable[[str], str] | None = None,
     limit: int = 24,
+    sat_id: str | None = None,
 ) -> list[RecentScanChoice]:
-    fetch_listing = fetch_listing or fetch_s3_prefix_listing
+    sat_id = normalized_himawari_sat_id(sat_id)
+    fetch_listing = fetch_listing or (lambda prefix: fetch_s3_prefix_listing(prefix, sat_id=sat_id))
     choices: list[RecentScanChoice] = []
     seen: set[tuple[str, str]] = set()
     last_error: Exception | None = None
     for dt in recent_himawari_scan_datetimes(now=now, lookback_hours=lookback_hours):
         try:
-            listing_choices = fldk_scan_choices_from_listing(fetch_listing(noaa_scan_prefix(dt, "FLDK")))
+            listing_choices = fldk_scan_choices_from_listing(fetch_listing(noaa_scan_prefix(dt, "FLDK")), sat_id=sat_id)
         except Exception as exc:
             last_error = exc
             continue
@@ -1440,7 +1486,9 @@ def parse_local_hsd_segment(path: str | Path) -> LocalSegmentInfo:
     if not match:
         raise ValueError(
             "Local HSD file name must look like "
-            "HS_H09_YYYYMMDD_HHMM_B13_FLDK_R20_S0110.DAT or .DAT.bz2."
+            "HS_H08_YYYYMMDD_HHMM_B13_FLDK_R20_S0110.DAT "
+            "or HS_H09_YYYYMMDD_HHMM_B13_FLDK_R20_S0110.DAT, "
+            "with optional .bz2."
         )
     sat_id, timestamp, band, area, resolution, segment, total_segments = match.groups()
     band = band.upper()
@@ -1608,7 +1656,7 @@ def offline_source_url_for_import(result: LocalImportResult) -> str:
         f"{result.sat_id}_{result.timestamp}_{band}_{result.area}_"
         f"{BAND_RESOLUTION[band]}_S01{result.total_segments:02d}.DAT.bz2"
     )
-    return f"{NOAA_HIMAWARI9_BUCKET}/AHI-L1b-{ahi_l1b_folder_for_area(result.area)}/{timestamp_path(timestamp)}{filename}"
+    return f"{himawari_bucket_for_sat_id(result.sat_id)}/AHI-L1b-{ahi_l1b_folder_for_area(result.area)}/{timestamp_path(timestamp)}{filename}"
 
 
 def make_download_tasks(info: UrlInfo, dt: datetime, bands: Iterable[str], temp_dir: Path) -> list[DownloadTask]:
@@ -7129,13 +7177,14 @@ class HimawariProcessorApp:
     def _open_scan_browser(self) -> None:
         if self.is_running:
             return
+        sat_id = sat_id_from_himawari_source(self.url_var.get())
         self.scan_browser_button.configure(state="disabled")
         self.status_var.set("Loading recent scans")
-        self._append_log("Loading recent FLDK scan choices from NOAA AWS.")
+        self._append_log(f"Loading recent {sat_id} FLDK scan choices from NOAA AWS.")
 
         def worker() -> None:
             try:
-                self.messages.put(("scan_choices", find_recent_fldk_scan_choices()))
+                self.messages.put(("scan_choices", find_recent_fldk_scan_choices(sat_id=sat_id)))
             except Exception as exc:
                 self.messages.put(("scan_choices_error", str(exc)))
 
@@ -7513,13 +7562,14 @@ class HimawariProcessorApp:
             messagebox.showwarning("Overlay setup", status.display_text())
 
     def _fill_latest_fldk_url(self) -> None:
+        sat_id = sat_id_from_himawari_source(self.url_var.get())
         self.status_var.set("Finding latest FLDK")
         self.latest_url_button.configure(state="disabled")
-        self._append_log("Looking for latest FLDK scan on NOAA AWS.")
+        self._append_log(f"Looking for latest {sat_id} FLDK scan on NOAA AWS.")
 
         def worker() -> None:
             try:
-                self.messages.put(("latest_url", find_latest_fldk_url()))
+                self.messages.put(("latest_url", find_latest_fldk_url(sat_id=sat_id)))
             except Exception as exc:
                 self.messages.put(("latest_url_error", str(exc)))
 

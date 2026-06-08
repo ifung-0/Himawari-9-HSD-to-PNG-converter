@@ -42,7 +42,7 @@ def set_temp_dir(path: str | None) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Command-line interface for the Himawari-9 low-RAM processor.",
+        description="Command-line interface for the Himawari-8/9 low-RAM processor.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--menu", action="store_true", help="Open the interactive CLI menu.")

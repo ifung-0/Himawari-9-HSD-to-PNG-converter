@@ -1,6 +1,6 @@
-# Himawari-9 Low-RAM Imagery Processor
+# Himawari-8/9 Low-RAM Imagery Processor
 
-This project downloads Himawari-9 AHI-L1b HSD segments from NOAA AWS S3,
+This project downloads Himawari-8 and Himawari-9 AHI-L1b HSD segments from NOAA AWS S3,
 processes them with Satpy, and writes either a single PNG or a GIF/MP4
 timelapse. The pipeline is designed for a conservative 10 GiB memory budget,
 with defaults that favor lower peak RAM over speed.
@@ -8,7 +8,7 @@ with defaults that favor lower peak RAM over speed.
 ## Which Entry Point Should I Use?
 
 - `run_gui.bat` / `himawari_lowram_processor.py`: the main HSD processor.
-  Use this for normal Himawari-9 AHI HSD downloads, true color, B13 infrared,
+  Use this for normal Himawari-8/9 AHI HSD downloads, true color, B13 infrared,
   flat-map output, overlays, single images, and timelapses.
 - `run_cli.bat` / `runcli.bat` / `himawari_cli.py`: the terminal interface for the same HSD
   processor. Use this for repeatable commands or scripted runs.
@@ -90,7 +90,7 @@ python check_environment.py --auto
 checkenv.bat
 ```
 
-Expected current version: `2026.06.08.6`. If `--version` shows an older value,
+Expected current version: `2026.06.08.7`. If `--version` shows an older value,
 the machine is not running the latest update. If `--plain` reports a different
 Python than the one used to launch the GUI, use `run_gui.bat`, `run_cli.bat`,
 `runcli.bat`, `check_environment.bat`, or `checkenv.bat` so the same Python
@@ -210,13 +210,14 @@ python himawari_cli.py --version
 python check_environment.py --plain
 ```
 
-Current fixed build: `2026.06.08.6`. Processing logs should include:
+Current fixed build: `2026.06.08.7`. Processing logs should include:
 
 ```text
-App version: 2026.06.08.6
+App version: 2026.06.08.7
 ```
 
-This build avoids the high-memory KD-tree path for custom true-color flat maps.
+This build accepts Himawari-8 and Himawari-9 raw HSD file names and NOAA S3 URLs.
+It also avoids the high-memory KD-tree path for custom true-color flat maps.
 It samples the Himawari source grid into Web Mercator tiles directly, then
 keeps the existing Zoom Earth-style enhancement, basemap blend, borders, labels,
 night boundary, and crosshair overlays.
@@ -291,7 +292,7 @@ by the checker when installing or launching the app.
 Symptom: a friend says the fix is installed, but logs do not show:
 
 ```text
-App version: 2026.06.08.6
+App version: 2026.06.08.7
 ```
 
 Likely cause: their folder is still on an old commit, or they downloaded a ZIP
@@ -632,6 +633,13 @@ Example object URL:
 
 ```text
 https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/2024/07/25/0400/HS_H09_20240725_0400_B01_FLDK_R10_S0110.DAT.bz2
+```
+
+Himawari-8 raw HSD object URLs and local filenames are also accepted:
+
+```text
+https://noaa-himawari8.s3.amazonaws.com/AHI-L1b-FLDK/2022/12/13/0400/HS_H08_20221213_0400_B01_FLDK_R10_S0110.DAT.bz2
+HS_H08_20221213_0400_B13_FLDK_R20_S0110.DAT
 ```
 
 ## Verification

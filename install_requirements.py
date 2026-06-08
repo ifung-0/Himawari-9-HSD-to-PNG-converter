@@ -18,7 +18,7 @@ def build_command(upgrade: bool) -> list[str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Install the Python requirements for the Himawari-9 processor."
+        description="Install the Python requirements for the Himawari-8/9 processor."
     )
     parser.add_argument(
         "--upgrade",

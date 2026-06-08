@@ -160,11 +160,43 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(info.area, "FLDK")
         self.assertEqual(info.total_segments, 10)
 
+    def test_parse_himawari8_object_url(self):
+        url = (
+            "https://noaa-himawari8.s3.amazonaws.com/AHI-L1b-FLDK/2022/12/13/0400/"
+            "HS_H08_20221213_0400_B01_FLDK_R10_S0110.DAT.bz2"
+        )
+
+        info = h.parse_url(url)
+
+        self.assertEqual(info.root, "https://noaa-himawari8.s3.amazonaws.com/AHI-L1b-FLDK/")
+        self.assertEqual(info.sat_id, "HS_H08")
+        self.assertEqual(info.timestamp, "20221213_0400")
+        self.assertEqual(info.area, "FLDK")
+        self.assertEqual(info.total_segments, 10)
+
+    def test_sat_id_from_himawari_source_accepts_h8_url_and_local_name(self):
+        url = (
+            "https://noaa-himawari8.s3.amazonaws.com/AHI-L1b-FLDK/2022/12/13/0400/"
+            "HS_H08_20221213_0400_B01_FLDK_R10_S0110.DAT.bz2"
+        )
+
+        self.assertEqual(h.sat_id_from_himawari_source(url), "HS_H08")
+        self.assertEqual(h.sat_id_from_himawari_source("HS_H08_20221213_0400_B13_FLDK_R20_S0110.DAT"), "HS_H08")
+        self.assertEqual(h.sat_id_from_himawari_source(""), "HS_H09")
+
     def test_parse_index_folder_url(self):
         info = h.parse_url("https://noaa-himawari9.s3.amazonaws.com/index.html#AHI-L1b-FLDK/2025/07/11/0050/")
         self.assertEqual(info.root, "https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/")
         self.assertEqual(info.sat_id, "HS_H09")
         self.assertEqual(info.timestamp, "20250711_0050")
+        self.assertEqual(info.area, "FLDK")
+        self.assertEqual(info.total_segments, 10)
+
+    def test_parse_himawari8_index_folder_url(self):
+        info = h.parse_url("https://noaa-himawari8.s3.amazonaws.com/index.html#AHI-L1b-FLDK/2022/12/13/0400/")
+        self.assertEqual(info.root, "https://noaa-himawari8.s3.amazonaws.com/AHI-L1b-FLDK/")
+        self.assertEqual(info.sat_id, "HS_H08")
+        self.assertEqual(info.timestamp, "20221213_0400")
         self.assertEqual(info.area, "FLDK")
         self.assertEqual(info.total_segments, 10)
 
@@ -183,10 +215,36 @@ class ProcessorTests(unittest.TestCase):
             "https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/2026/05/25/0400/HS_H09_20260525_0400_B01_FLDK_R10_S0110.DAT.bz2",
         )
 
+    def test_latest_fldk_url_from_listing_supports_himawari8(self):
+        xml = """<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+          <Contents><Key>AHI-L1b-FLDK/2022/12/13/0400/HS_H08_20221213_0400_B01_FLDK_R10_S0110.DAT.bz2</Key></Contents>
+          <Contents><Key>AHI-L1b-FLDK/2022/12/13/0400/HS_H09_20221213_0400_B01_FLDK_R10_S0110.DAT.bz2</Key></Contents>
+        </ListBucketResult>"""
+
+        url = h.latest_fldk_url_from_listing(xml, sat_id="HS_H08")
+
+        self.assertEqual(
+            url,
+            "https://noaa-himawari8.s3.amazonaws.com/AHI-L1b-FLDK/2022/12/13/0400/HS_H08_20221213_0400_B01_FLDK_R10_S0110.DAT.bz2",
+        )
+
     def test_latest_fldk_url_from_listing_returns_none_without_scan_key(self):
         xml = """<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></ListBucketResult>"""
 
         self.assertIsNone(h.latest_fldk_url_from_listing(xml))
+
+    @mock.patch("himawari_lowram_processor.requests.get")
+    def test_fetch_s3_prefix_listing_uses_himawari8_bucket(self, mock_get):
+        response = mock.Mock()
+        response.text = "<ListBucketResult />"
+        response.raise_for_status = mock.Mock()
+        mock_get.return_value = response
+
+        text = h.fetch_s3_prefix_listing("AHI-L1b-FLDK/2022/12/13/0400/", sat_id="HS_H08")
+
+        self.assertEqual(text, "<ListBucketResult />")
+        self.assertEqual(mock_get.call_args.args[0], h.NOAA_HIMAWARI8_BUCKET)
+        self.assertEqual(mock_get.call_args.kwargs["params"]["prefix"], "AHI-L1b-FLDK/2022/12/13/0400/")
 
     def test_find_latest_fldk_url_continues_after_network_failure(self):
         xml = """<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -250,6 +308,20 @@ class ProcessorTests(unittest.TestCase):
                 expected_calibration = "brightness_temperature" if band in h.IR_BANDS else "reflectance"
                 self.assertEqual(h.calibration_for_band(band), expected_calibration)
 
+    def test_himawari8_download_tasks_keep_h08_filenames_and_bucket(self):
+        info = h.parse_url(
+            "https://noaa-himawari8.s3.amazonaws.com/AHI-L1b-FLDK/2022/12/13/0400/"
+            "HS_H08_20221213_0400_B13_FLDK_R20_S0110.DAT.bz2"
+        )
+        dt = h.datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = h.make_download_tasks(info, dt, ("B13",), h.Path(tmp_dir))[0]
+
+        self.assertIn("HS_H08_20221213_0400_B13_FLDK_R20_S0110.DAT.bz2", task.url)
+        self.assertTrue(task.url.startswith(h.NOAA_HIMAWARI8_BUCKET))
+        self.assertEqual(task.destination.name, "HS_H08_20221213_0400_B13_FLDK_R20_S0110.DAT")
+
     def test_parse_local_hsd_segment_accepts_dat_and_bz2(self):
         dat = h.parse_local_hsd_segment("HS_H09_20240725_0400_B13_FLDK_R20_S0110.DAT")
         compressed = h.parse_local_hsd_segment("HS_H09_20240725_0400_B13_FLDK_R20_S0210.dat.bz2")
@@ -260,6 +332,13 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(dat.segment, 1)
         self.assertFalse(dat.compressed)
         self.assertTrue(compressed.compressed)
+
+    def test_parse_local_himawari8_hsd_segment(self):
+        info = h.parse_local_hsd_segment("HS_H08_20221213_0400_B13_FLDK_R20_S0110.DAT")
+
+        self.assertEqual(info.sat_id, "HS_H08")
+        self.assertEqual(info.timestamp, "20221213_0400")
+        self.assertEqual(info.band, "B13")
 
     def test_parse_local_hsd_segment_rejects_bad_name_and_resolution(self):
         with self.assertRaisesRegex(ValueError, "file name"):
@@ -350,6 +429,23 @@ class ProcessorTests(unittest.TestCase):
 
         self.assertIn("AHI-L1b-Target", url)
         self.assertEqual(info.area, "R301")
+
+    def test_offline_source_url_for_himawari8_uses_h8_bucket(self):
+        result = h.LocalImportResult(
+            sat_id="HS_H08",
+            timestamp="20221213_0400",
+            area="FLDK",
+            total_segments=10,
+            imported_paths=(),
+            reused_paths=(),
+            bands=("B13",),
+        )
+
+        url = h.offline_source_url_for_import(result)
+        info = h.parse_url(url)
+
+        self.assertTrue(url.startswith(h.NOAA_HIMAWARI8_BUCKET))
+        self.assertEqual(info.sat_id, "HS_H08")
 
     def test_import_local_hsd_segments_cleans_failed_bz2_part(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -985,6 +1081,18 @@ class ProcessorTests(unittest.TestCase):
 
         self.assertEqual([choice.band for choice in choices], ["B01", "B13"])
         self.assertTrue(choices[0].url.startswith(h.NOAA_HIMAWARI9_BUCKET))
+
+    def test_scan_choice_listing_supports_himawari8(self):
+        xml = """<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+          <Contents><Key>AHI-L1b-FLDK/2022/12/13/0400/HS_H08_20221213_0400_B01_FLDK_R10_S0110.DAT.bz2</Key></Contents>
+          <Contents><Key>AHI-L1b-FLDK/2022/12/13/0400/HS_H08_20221213_0400_B13_FLDK_R20_S0110.DAT.bz2</Key></Contents>
+          <Contents><Key>AHI-L1b-FLDK/2022/12/13/0400/HS_H09_20221213_0400_B01_FLDK_R10_S0110.DAT.bz2</Key></Contents>
+        </ListBucketResult>"""
+
+        choices = h.fldk_scan_choices_from_listing(xml, sat_id="HS_H08")
+
+        self.assertEqual([choice.band for choice in choices], ["B01", "B13"])
+        self.assertTrue(all(choice.url.startswith(h.NOAA_HIMAWARI8_BUCKET) for choice in choices))
 
     def test_find_recent_scan_choices_handles_network_failures(self):
         xml = """<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -4477,6 +4585,32 @@ class ProcessorTests(unittest.TestCase):
         app._update_setup_status.assert_called_once()
         app._write_current_settings.assert_called_once()
         mock_info.assert_called_once()
+
+    @mock.patch("himawari_lowram_processor.find_latest_fldk_url", return_value="https://example.test/h8.bz2")
+    def test_gui_latest_fldk_infers_himawari8_from_current_url(self, mock_latest):
+        class ImmediateThread:
+            def __init__(self, target, **_kwargs):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        app = object.__new__(h.HimawariProcessorApp)
+        app.url_var = FakeVar(
+            "https://noaa-himawari8.s3.amazonaws.com/AHI-L1b-FLDK/2022/12/13/0400/"
+            "HS_H08_20221213_0400_B01_FLDK_R10_S0110.DAT.bz2"
+        )
+        app.status_var = FakeVar("")
+        app.latest_url_button = FakeWidget()
+        app.messages = mock.Mock()
+        app._append_log = mock.Mock()
+
+        with mock.patch("himawari_lowram_processor.threading.Thread", ImmediateThread):
+            h.HimawariProcessorApp._fill_latest_fldk_url(app)
+
+        mock_latest.assert_called_once_with(sat_id="HS_H08")
+        app.messages.put.assert_called_once_with(("latest_url", "https://example.test/h8.bz2"))
+        self.assertEqual(app.latest_url_button.configured["state"], "disabled")
 
     def test_gui_optional_drop_target_skips_without_tkinterdnd2(self):
         app = object.__new__(h.HimawariProcessorApp)

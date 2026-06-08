@@ -1391,7 +1391,7 @@ def status_label(result: CheckResult) -> str:
 
 
 def print_banner() -> None:
-    print("Himawari-9 processor environment check")
+    print("Himawari-8/9 processor environment check")
     try:
         import himawari_lowram_processor as app
 
@@ -1596,7 +1596,7 @@ def run_auto_fix(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Diagnose and repair the Python environment used by the Himawari-9 processor."
+        description="Diagnose and repair the Python environment used by the Himawari-8/9 processor."
     )
     parser.add_argument(
         "--fix",
