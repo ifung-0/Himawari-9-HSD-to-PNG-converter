@@ -64,7 +64,7 @@ except KeyboardInterrupt:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-APP_VERSION = "2026.06.08.3"
+APP_VERSION = "2026.06.08.4"
 APP_DISPLAY_NAME = "Himawari-9 Low-RAM Processor"
 USER_URL = "https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/2024/07/25/0400/HS_H09_20240725_0400_B01_FLDK_R10_S0110.DAT.bz2"
 MODE = "Single Image"  # "Single Image" or "Timelapse"
@@ -98,6 +98,9 @@ FLAT_MAP_SOURCE_VALID_MIN = 1.0e-6
 FLAT_MAP_BASEMAP_OCEAN = (5, 18, 32)
 FLAT_MAP_BASEMAP_LAND = (80, 92, 62)
 FLAT_MAP_BASEMAP_COAST = (166, 180, 168)
+FLAT_MAP_LIMB_FADE_FRACTION = 0.075
+FLAT_MAP_LIMB_FADE_MIN_PX = 8
+FLAT_MAP_LIMB_FADE_MAX_PX = 240
 CROSSHAIR_TYPES = ("target", "dot", "plus", "ring")
 UNSUPPORTED_MAP_OVERLAYS = (
     "Radar",
@@ -3193,29 +3196,72 @@ def flat_map_edge_artifact_mask(image) -> np.ndarray | None:
     return edge_connected_mask(candidate)
 
 
-def flat_map_basemap_replacement_mask(image, valid_mask: np.ndarray | None) -> np.ndarray | None:
+def flat_map_limb_seed_mask(image, valid_mask: np.ndarray | None) -> np.ndarray | None:
     mask = normalize_validity_mask(valid_mask, image.width, image.height)
-    replacement = np.zeros((image.height, image.width), dtype=bool)
+    seed = np.zeros((image.height, image.width), dtype=bool)
     if mask is not None:
-        replacement |= ~mask
+        edge_invalid = edge_connected_mask(~mask) if not bool(mask.all()) else None
+        if edge_invalid is not None:
+            seed |= edge_invalid
     edge_mask = flat_map_edge_artifact_mask(image)
-    if edge_mask is not None and (mask is None or bool(mask.all())):
-        replacement |= edge_mask
-    if not bool(replacement.any()):
+    if edge_mask is not None:
+        seed |= edge_mask
+    if not bool(seed.any()):
         return None
-    return replacement
+    return seed
+
+
+def flat_map_limb_fade_width(width: int, height: int) -> int:
+    scaled = int(round(min(width, height) * FLAT_MAP_LIMB_FADE_FRACTION))
+    return max(1, min(FLAT_MAP_LIMB_FADE_MAX_PX, max(FLAT_MAP_LIMB_FADE_MIN_PX, scaled)))
+
+
+def flat_map_basemap_blend_alpha(image, valid_mask: np.ndarray | None) -> np.ndarray | None:
+    seed = flat_map_limb_seed_mask(image, valid_mask)
+    if seed is None:
+        return None
+    fade_width = flat_map_limb_fade_width(image.width, image.height)
+    try:
+        from scipy import ndimage
+
+        distance_from_seed = ndimage.distance_transform_edt(~seed)
+    except Exception:
+        distance_from_seed = np.full(seed.shape, fade_width + 1.0, dtype=np.float32)
+        current = seed.copy()
+        visited = seed.copy()
+        for step in range(1, fade_width + 1):
+            expanded = current.copy()
+            expanded[1:, :] |= current[:-1, :]
+            expanded[:-1, :] |= current[1:, :]
+            expanded[:, 1:] |= current[:, :-1]
+            expanded[:, :-1] |= current[:, 1:]
+            ring = expanded & ~visited
+            distance_from_seed[ring] = float(step)
+            visited |= ring
+            current = expanded
+
+    alpha = np.clip(1.0 - (distance_from_seed / float(max(fade_width, 1))), 0.0, 1.0).astype(np.float32)
+    alpha[seed] = 1.0
+    mask = normalize_validity_mask(valid_mask, image.width, image.height)
+    if mask is not None:
+        interior_invalid = ~mask & ~seed
+        alpha[interior_invalid] = 0.0
+    if not bool((alpha > 0.0).any()):
+        return None
+    return alpha
 
 
 def composite_flat_map_basemap(image, area: AreaDefinition, valid_mask: np.ndarray | None) -> None:
     from PIL import Image
 
-    replacement = flat_map_basemap_replacement_mask(image, valid_mask)
-    if replacement is None:
+    alpha = flat_map_basemap_blend_alpha(image, valid_mask)
+    if alpha is None:
         return
-    rgb = np.asarray(image.convert("RGB")).copy()
-    background = np.asarray(build_flat_map_basemap_image(area).convert("RGB"), dtype=np.uint8)
-    rgb[replacement] = background[replacement]
-    image.paste(Image.fromarray(rgb, mode="RGB").convert(image.mode))
+    rgb = np.asarray(image.convert("RGB"), dtype=np.float32)
+    background = np.asarray(build_flat_map_basemap_image(area).convert("RGB"), dtype=np.float32)
+    blend = alpha[:, :, None]
+    styled = np.clip((rgb * (1.0 - blend)) + (background * blend), 0, 255).astype(np.uint8)
+    image.paste(Image.fromarray(styled, mode="RGB").convert(image.mode))
 
 
 def apply_flat_map_style_to_image(

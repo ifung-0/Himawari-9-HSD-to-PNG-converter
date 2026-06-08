@@ -2218,6 +2218,67 @@ class ProcessorTests(unittest.TestCase):
         self.assertTrue(h.np.array_equal(styled[:, -4:, :], basemap[:, -4:, :]))
         self.assertFalse(h.np.array_equal(styled[8:12, 8:12, :], basemap[8:12, 8:12, :]))
 
+    def test_flat_map_visual_overlays_blend_valid_edge_limb_into_basemap(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "valid-limb.png"
+            pixels = h.np.zeros((80, 100, 3), dtype=h.np.uint8)
+            pixels[:, :] = (105, 125, 145)
+            pixels[:, -12:] = (4, 6, 10)
+            pixels[35:45, 40:50] = (4, 6, 10)
+            Image.fromarray(pixels, mode="RGB").save(path)
+            area = AreaDefinition("flat", "flat", "flat", h.WEB_MERCATOR_PROJ4, 100, 80, h.web_mercator_extent(-30, 30, 100, 150))
+            config = h.default_config()
+            config.map_view = "flat"
+            config.zoom_earth_style = True
+
+            h.apply_flat_map_visual_overlays(
+                path,
+                area,
+                config,
+                h.datetime(2024, 7, 25, 4, 0),
+                "True Color Reproduction Image",
+            )
+            with Image.open(path) as image:
+                styled = h.np.asarray(image.convert("RGB"))
+            basemap = h.np.asarray(h.build_flat_map_basemap_image(area).convert("RGB"))
+
+        right_delta = h.np.abs(styled[:, -1, :].astype(int) - basemap[:, -1, :].astype(int)).max()
+        fade_delta = h.np.abs(styled[:, -16, :].astype(int) - basemap[:, -16, :].astype(int)).mean()
+        center_delta = h.np.abs(styled[35:45, 40:50, :].astype(int) - basemap[35:45, 40:50, :].astype(int)).mean()
+        self.assertLessEqual(int(right_delta), 1)
+        self.assertLess(float(fade_delta), 90.0)
+        self.assertGreater(float(center_delta), 30.0)
+
+    def test_flat_map_limb_blend_does_not_replace_central_dark_pixels(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "central-night.png"
+            pixels = h.np.zeros((60, 80, 3), dtype=h.np.uint8)
+            pixels[:, :] = (100, 120, 140)
+            pixels[20:40, 25:55] = (5, 7, 11)
+            Image.fromarray(pixels, mode="RGB").save(path)
+            area = AreaDefinition("flat", "flat", "flat", h.WEB_MERCATOR_PROJ4, 80, 60, h.web_mercator_extent(-25, 25, 100, 140))
+            config = h.default_config()
+            config.map_view = "flat"
+            config.zoom_earth_style = True
+
+            h.apply_flat_map_visual_overlays(
+                path,
+                area,
+                config,
+                h.datetime(2024, 7, 25, 4, 0),
+                "True Color Reproduction Image",
+            )
+            with Image.open(path) as image:
+                styled = h.np.asarray(image.convert("RGB"))
+            basemap = h.np.asarray(h.build_flat_map_basemap_image(area).convert("RGB"))
+
+        center_delta = h.np.abs(styled[20:40, 25:55, :].astype(int) - basemap[20:40, 25:55, :].astype(int)).mean()
+        self.assertGreater(float(center_delta), 30.0)
+
     def test_flat_map_visual_overlays_replace_invalid_true_color_pixels_with_basemap(self):
         from PIL import Image
 
@@ -2363,6 +2424,49 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(styled_transform, original_transform)
         self.assertEqual(colorinterp[0], rasterio.enums.ColorInterp.red)
         self.assertTrue(h.np.array_equal(h.np.moveaxis(styled, 0, -1)[-2:, -2:, :], basemap[-2:, -2:, :]))
+
+    def test_flat_map_visual_geotiff_blends_valid_edge_limb_and_preserves_profile(self):
+        import rasterio
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "valid-limb.tif"
+            area = AreaDefinition("flat", "flat", "flat", h.WEB_MERCATOR_PROJ4, 80, 60, h.web_mercator_extent(-25, 25, 100, 140))
+            data = h.np.zeros((3, 60, 80), dtype=h.np.uint8)
+            data[:, :, :] = h.np.asarray([105, 125, 145], dtype=h.np.uint8)[:, None, None]
+            data[:, :, -10:] = h.np.asarray([4, 6, 10], dtype=h.np.uint8)[:, None, None]
+            rgb = xr.DataArray(
+                da.from_array(data, chunks=(1, 20, 20)),
+                dims=("bands", "y", "x"),
+                coords={"bands": ["R", "G", "B"]},
+                attrs={"area": area, "mode": "RGB"},
+            )
+            h.write_rgb_geotiff_low_ram(rgb, path, area)
+            with rasterio.open(path) as src:
+                original_transform = src.transform
+                original_crs = src.crs
+            config = h.default_config()
+            config.map_view = "flat"
+            config.zoom_earth_style = True
+
+            h.apply_flat_map_visual_overlays(
+                path,
+                area,
+                config,
+                h.datetime(2024, 7, 25, 4, 0),
+                "True Color Reproduction Image",
+            )
+            with rasterio.open(path) as src:
+                styled = h.np.moveaxis(src.read((1, 2, 3)), 0, -1)
+                styled_crs = src.crs
+                styled_transform = src.transform
+                styled_shape = (src.height, src.width, src.count)
+            basemap = h.np.asarray(h.build_flat_map_basemap_image(area).convert("RGB"))
+
+        right_delta = h.np.abs(styled[:, -1, :].astype(int) - basemap[:, -1, :].astype(int)).max()
+        self.assertEqual(styled_shape, (60, 80, 3))
+        self.assertEqual(styled_crs, original_crs)
+        self.assertEqual(styled_transform, original_transform)
+        self.assertLessEqual(int(right_delta), 1)
 
     def test_flat_map_visual_geotiff_uses_alpha_band_as_invalid_mask(self):
         import rasterio
