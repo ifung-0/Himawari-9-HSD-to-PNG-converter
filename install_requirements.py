@@ -9,14 +9,11 @@ import check_environment
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
-REQUIREMENTS_FILE = PROJECT_DIR / "requirements.txt"
+REQUIREMENTS_FILE = check_environment.REQUIREMENTS_FILE
 
 
 def build_command(upgrade: bool) -> list[str]:
-    command = [sys.executable, "-m", "pip", "install", "-r", str(REQUIREMENTS_FILE)]
-    if upgrade:
-        command.insert(4, "--upgrade")
-    return command
+    return check_environment.pip_install_command(upgrade=upgrade)
 
 
 def main() -> int:
@@ -50,7 +47,12 @@ def main() -> int:
         return 1
 
     command = build_command(args.upgrade)
-    print("Running:", " ".join(f'"{part}"' if " " in part else part for part in command))
+    pip_result = check_environment.check_pip_available()
+    if not pip_result.ok:
+        print(f"Cannot install requirements: {pip_result.detail}", file=sys.stderr)
+        return 1
+
+    print("Running:", check_environment.command_text(command))
     result = subprocess.call(command, cwd=PROJECT_DIR)
     if result != 0:
         return result
