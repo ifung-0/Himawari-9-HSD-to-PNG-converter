@@ -64,7 +64,7 @@ except KeyboardInterrupt:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-APP_VERSION = "2026.06.08.5"
+APP_VERSION = "2026.06.08.6"
 APP_DISPLAY_NAME = "Himawari-9 Low-RAM Processor"
 USER_URL = "https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/2024/07/25/0400/HS_H09_20240725_0400_B01_FLDK_R10_S0110.DAT.bz2"
 MODE = "Single Image"  # "Single Image" or "Timelapse"
@@ -101,6 +101,9 @@ FLAT_MAP_BASEMAP_COAST = (166, 180, 168)
 FLAT_MAP_LIMB_FADE_FRACTION = 0.075
 FLAT_MAP_LIMB_FADE_MIN_PX = 8
 FLAT_MAP_LIMB_FADE_MAX_PX = 240
+FLAT_MAP_DIRECT_SAMPLE_CHUNK = 256
+GPU_CUSTOM_COMPOSITE_MAX_CHUNK_EDGE = 512
+GPU_CUSTOM_COMPOSITE_MAX_CHUNK_PIXELS = 262_144
 CROSSHAIR_TYPES = ("target", "dot", "plus", "ring")
 UNSUPPORTED_MAP_OVERLAYS = (
     "Radar",
@@ -846,6 +849,42 @@ def maybe_cpu_dataset_after_gpu(dataset: xr.DataArray, config: ProcessorConfig) 
     return dataarray_to_cpu_chunks(dataset)
 
 
+def chunk_sizes_for_length(length: int, chunk_size: int) -> tuple[int, ...]:
+    length = int(length)
+    chunk_size = max(1, int(chunk_size))
+    if length <= 0:
+        return ()
+    chunks: list[int] = []
+    remaining = length
+    while remaining > 0:
+        size = min(chunk_size, remaining)
+        chunks.append(size)
+        remaining -= size
+    return tuple(chunks)
+
+
+def bounded_2d_chunk_grid(
+    shape: tuple[int, int],
+    max_edge: int = GPU_CUSTOM_COMPOSITE_MAX_CHUNK_EDGE,
+    max_pixels: int = GPU_CUSTOM_COMPOSITE_MAX_CHUNK_PIXELS,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    height, width = int(shape[0]), int(shape[1])
+    if height <= 0 or width <= 0:
+        raise ValueError(f"Chunked 2D data requires a positive shape, got {shape}.")
+    y_chunk = min(height, max(1, int(max_edge)))
+    x_limit_from_pixels = max(1, int(max_pixels) // max(1, y_chunk))
+    x_chunk = min(width, max(1, int(max_edge)), x_limit_from_pixels)
+    return chunk_sizes_for_length(height, y_chunk), chunk_sizes_for_length(width, x_chunk)
+
+
+def rechunk_2d_array_to_grid(array: da.Array, chunks: tuple[tuple[int, ...], tuple[int, ...]]) -> da.Array:
+    if array.ndim != 2:
+        raise ValueError(f"Expected a 2D Dask array, got {array.ndim} dimensions.")
+    if array.chunks == chunks:
+        return array
+    return array.rechunk(chunks)
+
+
 def gpu_scale_reflectance_block(cp, data, max_value: float = 100.0, gamma: float = 1.0):
     scaled = cp.clip(cp.nan_to_num(data, nan=0.0), 0.0, max_value) / cp.float32(max_value)
     if gamma != 1.0:
@@ -981,7 +1020,14 @@ def build_gpu_custom_composite(scene: Scene, composite_choice: str, config: Proc
                 "This usually means the source bands did not resample to the same target grid."
             )
         arrays.append(source.data if isinstance(source.data, da.Array) else da.from_array(source.data, chunks=source.shape))
-    chunks = ((3,), arrays[0].chunks[0], arrays[0].chunks[1])
+    spatial_chunks = bounded_2d_chunk_grid(expected_shape)
+    arrays = [rechunk_2d_array_to_grid(array, spatial_chunks) for array in arrays]
+    chunks = ((3,), spatial_chunks[0], spatial_chunks[1])
+    LOG.info(
+        "GPU custom composite chunk grid: y=%s x=%s",
+        max(spatial_chunks[0]),
+        max(spatial_chunks[1]),
+    )
     try:
         rgb_data = da.map_blocks(
             gpu_true_color_reproduction_block,
@@ -1046,6 +1092,92 @@ def flat_map_validity_mask_from_scene(scene: Scene, bands: Iterable[str], area: 
     for mask in masks[1:]:
         combined = combined | mask
     return np.asarray(combined.compute(), dtype=bool)
+
+
+def flat_map_tile_lonlat(area: AreaDefinition, y_offset: int, height: int, x_offset: int, width: int) -> tuple[np.ndarray, np.ndarray]:
+    left, bottom, right, top = area.area_extent
+    pixel_width = (right - left) / float(area.width)
+    pixel_height = (top - bottom) / float(area.height)
+    x_values = left + (np.arange(x_offset, x_offset + width, dtype=np.float64) + 0.5) * pixel_width
+    y_values = top - (np.arange(y_offset, y_offset + height, dtype=np.float64) + 0.5) * pixel_height
+    x_grid, y_grid = np.meshgrid(x_values, y_values)
+    lon, lat = area.get_lonlat_from_projection_coordinates(x_grid, y_grid)
+    return np.asarray(lon, dtype=np.float64), np.asarray(lat, dtype=np.float64)
+
+
+def sample_source_band_tile(
+    source_data,
+    source_area: AreaDefinition,
+    target_area: AreaDefinition,
+    y_offset: int,
+    height: int,
+    x_offset: int,
+    width: int,
+) -> np.ndarray:
+    lon, lat = flat_map_tile_lonlat(target_area, y_offset, height, x_offset, width)
+    cols, rows = source_area.get_array_coordinates_from_lonlat(lon, lat)
+    rows = np.broadcast_to(np.asarray(np.rint(rows), dtype=np.int64), (height, width))
+    cols = np.broadcast_to(np.asarray(np.rint(cols), dtype=np.int64), (height, width))
+    valid = (
+        np.isfinite(lon)
+        & np.isfinite(lat)
+        & (rows >= 0)
+        & (rows < int(source_area.height))
+        & (cols >= 0)
+        & (cols < int(source_area.width))
+    )
+    output = np.full((height, width), np.nan, dtype=np.float32)
+    if not np.any(valid):
+        return output
+
+    valid_rows = rows[valid]
+    valid_cols = cols[valid]
+    row_min, row_max = int(valid_rows.min()), int(valid_rows.max()) + 1
+    col_min, col_max = int(valid_cols.min()), int(valid_cols.max()) + 1
+    source_slice = source_data[row_min:row_max, col_min:col_max]
+    if isinstance(source_slice, da.Array):
+        source_slice = source_slice.compute(scheduler="synchronous")
+    source_block = np.asarray(source_slice, dtype=np.float32)
+    sampled = source_block[valid_rows - row_min, valid_cols - col_min]
+    output[valid] = sampled
+    return output
+
+
+def direct_flat_map_sample_band(source: xr.DataArray, target_area: AreaDefinition, chunk_size: int = FLAT_MAP_DIRECT_SAMPLE_CHUNK) -> xr.DataArray:
+    if len(source.dims) < 2:
+        raise RuntimeError("Direct flat-map sampling requires a two-dimensional source band.")
+    source_area = source.attrs.get("area")
+    if source_area is None:
+        raise RuntimeError("Direct flat-map sampling requires source bands with area metadata.")
+    y_dim, x_dim = source.dims[-2], source.dims[-1]
+    source_data = source.data if isinstance(source.data, da.Array) else da.from_array(source.data, chunks=source.shape)
+    y_chunks, x_chunks = bounded_2d_chunk_grid(
+        (int(target_area.height), int(target_area.width)),
+        max_edge=max(1, int(chunk_size)),
+        max_pixels=max(1, int(chunk_size)) * max(1, int(chunk_size)),
+    )
+    rows: list[list[da.Array]] = []
+    def sample_tile(y_offset: int, y_size: int, x_offset: int, x_size: int) -> np.ndarray:
+        return sample_source_band_tile(source_data, source_area, target_area, y_offset, y_size, x_offset, x_size)
+
+    for y_offset, y_size in chunk_offsets(y_chunks):
+        row_blocks: list[da.Array] = []
+        for x_offset, x_size in chunk_offsets(x_chunks):
+            delayed_tile = dask.delayed(sample_tile, pure=False)(y_offset, y_size, x_offset, x_size)
+            row_blocks.append(da.from_delayed(delayed_tile, shape=(y_size, x_size), dtype=np.float32))
+        rows.append(row_blocks)
+    data = da.block(rows)
+    attrs = source.attrs.copy()
+    attrs["area"] = target_area
+    attrs.pop("_FillValue", None)
+    return xr.DataArray(data, dims=(y_dim, x_dim), attrs=attrs)
+
+
+def direct_flat_map_sample_scene(scene: Scene, bands: Iterable[str], target_area: AreaDefinition) -> dict[str, xr.DataArray]:
+    sampled: dict[str, xr.DataArray] = {}
+    for band in bands:
+        sampled[band] = direct_flat_map_sample_band(scene[band], target_area)
+    return sampled
 
 
 def memory_gb() -> float | None:
@@ -4463,6 +4595,7 @@ def save_custom_composite_output(
     load_bands(scene, custom_bands)
     log_memory("after load", config)
     check_cancel(cancel_event)
+    use_direct_flat_map = is_flat_map(config) and active in {"True Color RGB (Enhanced)", "True Color Reproduction Image"}
     if not is_flat_map(config):
         band_areas = {band: scene[band].attrs["area"] for band in custom_bands}
         compatibility_error = native_area_compatibility_error(band_areas, master_area)
@@ -4477,12 +4610,21 @@ def save_custom_composite_output(
             else:
                 emit_progress(progress, f"Skipping frame; {active} is not native-compatible with target area", None, None)
             raise RuntimeError(compatibility_error)
-    emit_progress(progress, "Resampling", None, None)
-    resampled = resample_scene_low_ram(scene, master_area, config, datasets=custom_bands)
-    log_memory("after resample", config)
+    if use_direct_flat_map:
+        emit_progress(progress, "Direct flat-map sampling", None, None)
+        LOG.info(
+            "Using direct flat-map source sampling for %s to avoid high-memory KD-tree resampling.",
+            active,
+        )
+        resampled = direct_flat_map_sample_scene(scene, custom_bands, master_area)
+        log_memory("after direct sample setup", config)
+    else:
+        emit_progress(progress, "Resampling", None, None)
+        resampled = resample_scene_low_ram(scene, master_area, config, datasets=custom_bands)
+        log_memory("after resample", config)
     check_cancel(cancel_event)
     emit_progress(progress, f"Building {active}", None, None)
-    if config.gpu_acceleration and can_build_gpu_custom_composite(active):
+    if config.gpu_acceleration and can_build_gpu_custom_composite(active) and not use_direct_flat_map:
         emit_progress(progress, "GPU acceleration enabled for custom composite math", None, None)
         LOG.info("GPU custom composite will return CPU chunks for saving.")
         try:
@@ -4493,6 +4635,8 @@ def save_custom_composite_output(
                 f"{exc.__class__.__name__}: {exc}"
             ) from exc
     else:
+        if use_direct_flat_map and config.gpu_acceleration:
+            LOG.info("GPU custom composite skipped for direct flat-map sampling; sampled chunks stay on the CPU path.")
         dataset_name, dataset = build_custom_composite(resampled, active, is_night, config)
         dataset = maybe_cpu_dataset_after_gpu(dataset, config)
     resampled[dataset_name] = dataset

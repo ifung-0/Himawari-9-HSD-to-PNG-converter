@@ -704,6 +704,46 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(computed.dtype, h.np.uint8)
 
     @mock.patch("himawari_lowram_processor.gpu_support_status")
+    def test_build_gpu_custom_composite_aligns_mismatched_input_chunks(self, mock_status):
+        mock_status.return_value = h.GpuSupportStatus(True, "ready", device_name="Test GPU", device_count=1)
+        area = AreaDefinition(
+            "test",
+            "test",
+            "latlon",
+            {"proj": "longlat", "datum": "WGS84"},
+            9,
+            7,
+            (100.0, -10.0, 109.0, -3.0),
+        )
+        attrs = {"area": area, "sensor": "ahi"}
+        chunking = {
+            "B01": (7, 1),
+            "B02": (2, 9),
+            "B03": (3, 4),
+            "B04": (1, 5),
+        }
+        values = {"B01": 20.0, "B02": 30.0, "B03": 40.0, "B04": 25.0}
+        data = {
+            band: xr.DataArray(
+                da.ones((7, 9), chunks=chunking[band]) * value,
+                dims=("y", "x"),
+                attrs=attrs,
+            )
+            for band, value in values.items()
+        }
+        scene = mock.MagicMock()
+        scene.__getitem__.side_effect = lambda key: data[key]
+        config = h.default_config()
+        config.gpu_acceleration = True
+        config.use_night_fallback = False
+
+        _name, dataset = h.build_gpu_custom_composite(scene, "True Color Reproduction Image", config)
+
+        expected_chunks = h.bounded_2d_chunk_grid((7, 9))
+        self.assertEqual(dataset.data.chunks[0], (3,))
+        self.assertEqual(dataset.data.chunks[1:], expected_chunks)
+
+    @mock.patch("himawari_lowram_processor.gpu_support_status")
     def test_build_gpu_custom_composite_reports_missing_band(self, mock_status):
         mock_status.return_value = h.GpuSupportStatus(True, "ready", device_name="Test GPU", device_count=1)
         area = AreaDefinition(
@@ -1520,6 +1560,39 @@ class ProcessorTests(unittest.TestCase):
 
         self.assertIn("flat target 2400x3018 px", output)
         self.assertIn(".tif", output)
+
+    def test_direct_flat_map_sample_band_reads_source_windows(self):
+        source_area = AreaDefinition(
+            "source",
+            "source",
+            "latlon",
+            {"proj": "longlat", "datum": "WGS84"},
+            4,
+            4,
+            (100.0, -10.0, 104.0, -6.0),
+        )
+        target_area = AreaDefinition(
+            "target",
+            "target",
+            "latlon",
+            {"proj": "longlat", "datum": "WGS84"},
+            2,
+            2,
+            (101.0, -9.0, 103.0, -7.0),
+        )
+        values = h.np.arange(16, dtype=h.np.float32).reshape(4, 4)
+        source = xr.DataArray(
+            da.from_array(values, chunks=(2, 2)),
+            dims=("y", "x"),
+            attrs={"area": source_area},
+        )
+
+        sampled = h.direct_flat_map_sample_band(source, target_area, chunk_size=1)
+        result = sampled.data.compute()
+
+        expected = h.np.asarray([[5.0, 6.0], [9.0, 10.0]], dtype=h.np.float32)
+        self.assertTrue(h.np.array_equal(result, expected))
+        self.assertEqual(sampled.attrs["area"], target_area)
 
     def test_timelapse_frame_size_guard_blocks_large_targets(self):
         config = h.default_config()
@@ -2972,8 +3045,10 @@ class ProcessorTests(unittest.TestCase):
     @mock.patch("himawari_lowram_processor.write_rgb_png_low_ram")
     @mock.patch("himawari_lowram_processor.build_gpu_custom_composite")
     @mock.patch("himawari_lowram_processor.resample_scene_low_ram")
-    def test_gpu_flat_true_color_png_uses_gpu_block_and_direct_writer(
+    @mock.patch("himawari_lowram_processor.direct_flat_map_sample_scene")
+    def test_gpu_flat_true_color_png_uses_direct_sampler_and_direct_writer(
         self,
+        mock_direct_sample,
         mock_resample,
         mock_build_gpu,
         mock_write_png,
@@ -2995,30 +3070,36 @@ class ProcessorTests(unittest.TestCase):
             attrs={"area": area, "mode": "RGB", "name": "gpu_rgb"},
         )
         scene = mock.MagicMock()
-        resampled = mock.MagicMock()
-        mock_resample.return_value = resampled
-        mock_build_gpu.return_value = ("gpu_rgb", rgb)
-        output = h.Path("out.png")
-        mock_write_png.return_value = output
-        config = h.default_config()
-        config.map_view = "flat"
-        config.gpu_acceleration = True
-        config.use_night_fallback = False
+        sampled = mock.MagicMock()
+        mock_direct_sample.return_value = sampled
+        with mock.patch("himawari_lowram_processor.build_custom_composite", return_value=("gpu_rgb", rgb)) as mock_build_cpu:
+            output = h.Path("out.png")
+            mock_write_png.return_value = output
+            config = h.default_config()
+            config.map_view = "flat"
+            config.gpu_acceleration = True
+            config.use_night_fallback = False
 
-        result = h.save_custom_composite_output(
-            scene,
-            "True Color Reproduction Image",
-            area,
-            output,
-            config,
-            is_night=False,
-            overlay_options=None,
-            scan_time=h.datetime(2024, 7, 25, 4, 0),
-        )
+            result = h.save_custom_composite_output(
+                scene,
+                "True Color Reproduction Image",
+                area,
+                output,
+                config,
+                is_night=False,
+                overlay_options=None,
+                scan_time=h.datetime(2024, 7, 25, 4, 0),
+            )
 
         self.assertEqual(result, output)
-        mock_build_gpu.assert_called_once_with(resampled, "True Color Reproduction Image", config)
-        mock_write_png.assert_called_once_with(rgb, output)
+        mock_direct_sample.assert_called_once_with(scene, ("B01", "B02", "B03", "B04"), area)
+        mock_resample.assert_not_called()
+        mock_build_gpu.assert_not_called()
+        mock_build_cpu.assert_called_once_with(sampled, "True Color Reproduction Image", False, config)
+        mock_write_png.assert_called_once()
+        self.assertTrue(h.is_rgb_dataarray(mock_write_png.call_args.args[0]))
+        self.assertEqual(mock_write_png.call_args.args[0].attrs["name"], "gpu_rgb")
+        self.assertEqual(mock_write_png.call_args.args[1], output)
         mock_save.assert_not_called()
 
     def test_require_module_reports_missing_dependency(self):
@@ -3158,12 +3239,14 @@ class ProcessorTests(unittest.TestCase):
     @mock.patch("himawari_lowram_processor.native_area_compatibility_error")
     @mock.patch("himawari_lowram_processor.write_rgb_png_low_ram")
     @mock.patch("himawari_lowram_processor.resample_scene_low_ram")
+    @mock.patch("himawari_lowram_processor.direct_flat_map_sample_scene")
     @mock.patch("himawari_lowram_processor.download_segments")
     @mock.patch("himawari_lowram_processor.Scene")
     def test_flat_map_custom_fallback_skips_native_compatibility_check(
         self,
         mock_scene_class,
         mock_download,
+        mock_direct_sample,
         mock_resample,
         mock_save,
         mock_native_compatibility,
@@ -3183,7 +3266,7 @@ class ProcessorTests(unittest.TestCase):
         fallback_scene.__setitem__.return_value = None
         fallback_scene.load.return_value = None
         mock_scene_class.side_effect = [original_scene, fallback_scene]
-        mock_resample.return_value = fallback_scene
+        mock_direct_sample.return_value = fallback_scene
         mock_save.return_value = h.Path("out.png")
         mock_download.return_value = [h.Path(f"segment-{idx}.dat") for idx in range(40)]
         config = h.default_config()
@@ -3198,11 +3281,11 @@ class ProcessorTests(unittest.TestCase):
 
         self.assertEqual(result, h.Path("out.png"))
         mock_native_compatibility.assert_not_called()
-        mock_resample.assert_called_once_with(
+        mock_resample.assert_not_called()
+        mock_direct_sample.assert_called_once_with(
             fallback_scene,
+            h.required_bands("True Color Reproduction Image", False, config.night_fallback_mode),
             master_area,
-            config,
-            datasets=h.required_bands("True Color Reproduction Image", False, config.night_fallback_mode),
         )
 
     @mock.patch("himawari_lowram_processor.cleanup_paths")
