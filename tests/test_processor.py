@@ -2780,6 +2780,32 @@ class ProcessorTests(unittest.TestCase):
                 self.assertEqual(image.size, (2, 2))
                 self.assertEqual(image.getpixel((1, 0)), (64, 74, 84))
 
+    def test_direct_rgb_png_writer_keeps_spatial_chunks(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "chunked.png"
+            source = h.np.arange(3 * 6 * 8, dtype=h.np.uint8).reshape(3, 6, 8)
+            rgb = xr.DataArray(
+                da.from_array(source, chunks=(1, 2, 3)),
+                dims=("bands", "y", "x"),
+                coords={"bands": ["R", "G", "B"]},
+            )
+            original_rechunk = da.Array.rechunk
+            rechunk_calls = []
+
+            def tracking_rechunk(self, chunks="auto", *args, **kwargs):
+                rechunk_calls.append(chunks)
+                return original_rechunk(self, chunks, *args, **kwargs)
+
+            with mock.patch.object(da.Array, "rechunk", tracking_rechunk):
+                h.write_rgb_png_low_ram(rgb, path)
+
+            from PIL import Image
+
+            with Image.open(path) as image:
+                self.assertEqual(image.size, (8, 6))
+                self.assertEqual(image.getpixel((7, 5)), tuple(int(source[band, 5, 7]) for band in range(3)))
+        self.assertFalse(any(chunks == (1, 6, 8) for chunks in rechunk_calls))
+
     @mock.patch("himawari_lowram_processor.direct_overlay_writer")
     def test_direct_png_overlay_draws_coastlines_and_borders(self, mock_writer_class):
         with tempfile.TemporaryDirectory() as tmp_dir:

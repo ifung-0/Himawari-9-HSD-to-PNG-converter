@@ -90,7 +90,7 @@ python check_environment.py --auto
 checkenv.bat
 ```
 
-Expected current version: `2026.06.08.4`. If `--version` shows an older value,
+Expected current version: `2026.06.08.5`. If `--version` shows an older value,
 the machine is not running the latest update. If `--plain` reports a different
 Python than the one used to launch the GUI, use `run_gui.bat`, `run_cli.bat`,
 `runcli.bat`, `check_environment.bat`, or `checkenv.bat` so the same Python
@@ -210,10 +210,10 @@ python himawari_cli.py --version
 python check_environment.py --plain
 ```
 
-Current fixed build: `2026.06.08.4`. Processing logs should include:
+Current fixed build: `2026.06.08.5`. Processing logs should include:
 
 ```text
-App version: 2026.06.08.4
+App version: 2026.06.08.5
 ```
 
 For official-looking true color and true color reproduction, keep the
@@ -286,7 +286,7 @@ by the checker when installing or launching the app.
 Symptom: a friend says the fix is installed, but logs do not show:
 
 ```text
-App version: 2026.06.08.4
+App version: 2026.06.08.5
 ```
 
 Likely cause: their folder is still on an old commit, or they downloaded a ZIP

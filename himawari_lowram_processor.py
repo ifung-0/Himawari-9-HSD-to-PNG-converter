@@ -64,7 +64,7 @@ except KeyboardInterrupt:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-APP_VERSION = "2026.06.08.4"
+APP_VERSION = "2026.06.08.5"
 APP_DISPLAY_NAME = "Himawari-9 Low-RAM Processor"
 USER_URL = "https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/2024/07/25/0400/HS_H09_20240725_0400_B01_FLDK_R10_S0110.DAT.bz2"
 MODE = "Single Image"  # "Single Image" or "Timelapse"
@@ -4230,35 +4230,56 @@ def write_rgb_png_low_ram(dataset: xr.DataArray, output_path: Path) -> Path:
     validate_rgb_dataset_for_direct_output(dataset)
     data = prepared_rgb_dask_array(dataset)
     dask_data = data.data
-    band_chunks, y_chunks, x_chunks = dask_data.chunks
-    if len(y_chunks) > 1 or len(x_chunks) > 1:
-        dask_data = dask_data.rechunk((1, data.sizes[data.dims[-2]], data.sizes[data.dims[-1]]))
+    height = int(data.sizes[data.dims[-2]])
+    width = int(data.sizes[data.dims[-1]])
+    if len(dask_data.chunks[0]) != 3 or any(chunk != 1 for chunk in dask_data.chunks[0]):
+        dask_data = dask_data.rechunk((1, dask_data.chunks[1], dask_data.chunks[2]))
     delayed_blocks = dask_data.to_delayed().flatten()
-    rgb_planes: list[np.ndarray] = []
-    for index, band_height in enumerate(dask_data.chunks[0]):
-        block = delayed_blocks[index].compute()
-        if is_cupy_array_like(block):
-            import cupy as cp  # type: ignore
-
-            block = cp.asnumpy(block)
-        if band_height != 1:
-            raise ValueError("RGB PNG writer expects one band per block.")
-        rgb_planes.append(np.asarray(block[0], dtype=np.uint8))
-    if len(rgb_planes) != 3:
-        raise ValueError("RGB PNG writer expected exactly three bands.")
-    rgb = np.stack(rgb_planes, axis=-1)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = temporary_output_path(output_path)
+    work_path = tmp_path.with_suffix(tmp_path.suffix + ".rgb")
     try:
         tmp_path.unlink(missing_ok=True)
-        Image.fromarray(rgb, mode="RGB").save(tmp_path)
+        work_path.unlink(missing_ok=True)
+        rgb = np.memmap(work_path, dtype=np.uint8, mode="w+", shape=(height, width, 3))
+        index = 0
+        _band_chunks, y_chunks, x_chunks = dask_data.chunks
+        for band_index, band_height in enumerate(dask_data.chunks[0]):
+            if band_height != 1:
+                raise ValueError("RGB PNG writer expects one band per block.")
+            for y_offset, y_size in chunk_offsets(y_chunks):
+                for x_offset, x_size in chunk_offsets(x_chunks):
+                    block = delayed_blocks[index].compute()
+                    index += 1
+                    if is_cupy_array_like(block):
+                        import cupy as cp  # type: ignore
+
+                        block = cp.asnumpy(block)
+                    rgb[y_offset : y_offset + y_size, x_offset : x_offset + x_size, band_index] = np.asarray(
+                        block[0],
+                        dtype=np.uint8,
+                    )
+        rgb.flush()
+        image_array = np.asarray(rgb)
+        Image.fromarray(image_array, mode="RGB").save(tmp_path)
+        del image_array
+        del rgb
         tmp_path.replace(output_path)
     except Exception:
         try:
             tmp_path.unlink(missing_ok=True)
         except Exception:
             pass
+        try:
+            work_path.unlink(missing_ok=True)
+        except Exception:
+            pass
         raise
+    finally:
+        try:
+            work_path.unlink(missing_ok=True)
+        except Exception:
+            pass
     return output_path
 
 
