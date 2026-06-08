@@ -90,7 +90,7 @@ python check_environment.py --auto
 checkenv.bat
 ```
 
-Expected current version: `2026.06.08.2`. If `--version` shows an older value,
+Expected current version: `2026.06.08.3`. If `--version` shows an older value,
 the machine is not running the latest update. If `--plain` reports a different
 Python than the one used to launch the GUI, use `run_gui.bat`, `run_cli.bat`,
 `runcli.bat`, `check_environment.bat`, or `checkenv.bat` so the same Python
@@ -171,9 +171,9 @@ overlay setup, invalid flat-map bounds, and unsafe output sizes before expensive
 downloads or Satpy processing start. After completion, use `Open Last` and
 `Copy Paths`; after a failure, use `Copy Error` for a support report. The
 `Recent Runs` tab persists completed, canceled, and failed GUI runs, including
-outputs, manifest/frame locations, re-run settings, copy/open actions, and a
-safe preview for normal image outputs. Very large images, GeoTIFFs, MP4s, and
-unsupported files show metadata only.
+outputs, manifest/frame locations, per-run log files, re-run settings,
+copy/open actions, and a safe preview for normal image outputs. Very large
+images, GeoTIFFs, MP4s, and unsupported files show metadata only.
 
 Launch the terminal interface:
 
@@ -210,10 +210,10 @@ python himawari_cli.py --version
 python check_environment.py --plain
 ```
 
-Current fixed build: `2026.06.08.2`. Processing logs should include:
+Current fixed build: `2026.06.08.3`. Processing logs should include:
 
 ```text
-App version: 2026.06.08.2
+App version: 2026.06.08.3
 ```
 
 For official-looking true color and true color reproduction, keep the
@@ -235,8 +235,9 @@ IMAGE_FORMAT = "png"
 GUI settings are saved in `himawari_gui_settings.json` and loaded on startup.
 Recent run history is saved in `himawari_recent_runs.json`, and custom presets
 are saved in `himawari_custom_presets.json`; all three files are ignored by git
-because they contain local paths and preferences. Outputs are written to
-`outputs/`. Downloaded `.DAT` files are cached under `temp/` for retry reuse.
+because they contain local paths and preferences. Persistent processing logs
+are written under `%LOCALAPPDATA%\Himawari9LowRamProcessor\logs`. Outputs are
+written to `outputs/`. Downloaded `.DAT` files are cached under `temp/` for retry reuse.
 Incomplete `.part` files are cleaned after each frame. Timelapse frame images
 are written under `outputs/frames/<run_id>/`, with a manifest under
 `outputs/manifests/`. Retrying the same timelapse automatically reuses completed
@@ -285,7 +286,7 @@ by the checker when installing or launching the app.
 Symptom: a friend says the fix is installed, but logs do not show:
 
 ```text
-App version: 2026.06.08.2
+App version: 2026.06.08.3
 ```
 
 Likely cause: their folder is still on an old commit, or they downloaded a ZIP
@@ -524,8 +525,9 @@ or switch to a smaller Target area for true-color timelapses.
 
 Symptom: the GUI reports failure and no image appears in `outputs/`.
 
-Likely cause: the only requested frame failed. Check the log panel for the
-first `Frame failed` message.
+Likely cause: the only requested frame failed. The error now includes the real
+frame failure summary and the persistent run log path; open that log from
+`Recent Runs > Open Log` or copy it with `Copy Error`.
 
 Quick fix:
 

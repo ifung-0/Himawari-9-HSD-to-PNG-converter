@@ -1741,12 +1741,14 @@ class ProcessorTests(unittest.TestCase):
         config = h.default_config()
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = h.Path(tmp_dir) / "recent.json"
+            log_path = h.Path(tmp_dir) / "run.log"
             for idx in range(h.RECENT_RUN_LIMIT + 2):
                 record = h.build_recent_run_record(
                     "complete",
                     config,
                     f"2026-05-26T00:{idx:02d}:00Z",
                     outputs=[h.Path(f"out_{idx}.png")],
+                    log_path=log_path,
                 )
                 h.append_recent_run(record, path)
 
@@ -1754,7 +1756,35 @@ class ProcessorTests(unittest.TestCase):
 
         self.assertEqual(len(loaded), h.RECENT_RUN_LIMIT)
         self.assertIn("Status: complete", h.format_recent_run_summary(loaded[0]))
+        self.assertIn("Log:", h.format_recent_run_summary(loaded[0]))
+        self.assertEqual(loaded[0].log_path, str(log_path))
         self.assertEqual(h.config_from_recent_run(loaded[0]).composite_choice, config.composite_choice)
+
+    def test_recent_runs_load_old_schema_without_log_path(self):
+        config = h.default_config()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "recent-old.json"
+            path.write_text(
+                h.json.dumps(
+                    {
+                        "schema_version": 1,
+                        "runs": [
+                            {
+                                "status": "failed",
+                                "started_at_utc": "2026-05-26T00:00:00Z",
+                                "config": config.__dict__,
+                                "outputs": [],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = h.load_recent_runs(path)
+
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].log_path, "")
 
     def test_recent_runs_corrupt_file_returns_empty(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -3632,6 +3662,30 @@ class ProcessorTests(unittest.TestCase):
     @mock.patch("himawari_lowram_processor.process_frame")
     @mock.patch("himawari_lowram_processor.validate_runtime_dependencies")
     @mock.patch("himawari_lowram_processor.common_area_from_frames")
+    def test_run_creates_persistent_log_file(self, mock_common_area, _mock_validate, mock_process):
+        config = h.default_config()
+        mock_common_area.return_value = mock.Mock(width=10, height=10)
+
+        def fake_process(*_args, **_kwargs):
+            h.warnings.warn("persistent warning test", RuntimeWarning)
+            return h.Path("out.png")
+
+        mock_process.side_effect = fake_process
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            log_path = h.run_log_path("2026-05-26T00:00:00Z", config, h.Path(tmp_dir))
+            with mock.patch("himawari_lowram_processor.run_log_path", return_value=log_path):
+                h.run(config, started_at_utc="2026-05-26T00:00:00Z")
+            text = log_path.read_text(encoding="utf-8")
+
+        self.assertIn(f"App version: {h.APP_VERSION}", text)
+        self.assertIn("Settings:", text)
+        self.assertIn("Run log:", text)
+        self.assertIn("persistent warning test", text)
+
+    @mock.patch("himawari_lowram_processor.process_frame")
+    @mock.patch("himawari_lowram_processor.validate_runtime_dependencies")
+    @mock.patch("himawari_lowram_processor.common_area_from_frames")
     def test_run_single_band_common_area_keeps_single_required_band(
         self,
         mock_common_area,
@@ -3651,12 +3705,13 @@ class ProcessorTests(unittest.TestCase):
     @mock.patch("himawari_lowram_processor.process_frame", return_value=None)
     @mock.patch("himawari_lowram_processor.validate_runtime_dependencies")
     @mock.patch("himawari_lowram_processor.common_area_from_frames")
-    def test_single_image_raises_when_no_frame_processes(self, mock_common_area, _mock_validate, _mock_process):
+    def test_single_image_raises_when_no_frame_processes(self, mock_common_area, _mock_validate, mock_process):
         config = h.default_config()
         config.mode = "Single Image"
         mock_common_area.return_value = mock.Mock(width=10, height=10)
+        mock_process.last_error = "RuntimeError: simulated frame boom"
 
-        with self.assertRaisesRegex(RuntimeError, "no output was created"):
+        with self.assertRaisesRegex(RuntimeError, "simulated frame boom.*Log:"):
             h.run(config)
 
 
@@ -3740,11 +3795,12 @@ class ProcessorTests(unittest.TestCase):
         result.name = "psutil"
 
         text = h.format_environment_results([result])
-        report = h.build_error_report("boom", h.default_config(), "log line", [h.Path("out.png")])
+        report = h.build_error_report("boom", h.default_config(), "log line", [h.Path("out.png")], h.Path("run.log"))
 
         self.assertIn("[WARN] psutil: missing", text)
         self.assertIn("boom", report)
         self.assertIn("out.png", report)
+        self.assertIn("run.log", report)
 
     @mock.patch("himawari_lowram_processor.subprocess.Popen")
     def test_gui_environment_fix_uses_current_python_with_fix_flag(self, mock_popen):
@@ -3776,11 +3832,12 @@ class ProcessorTests(unittest.TestCase):
         app = object.__new__(h.HimawariProcessorApp)
         app.root = FakeRoot()
         app.last_outputs = [h.Path("out.png")]
+        app.last_log_path = h.Path("run.log")
         app._append_log = mock.Mock()
 
         h.HimawariProcessorApp._copy_output_paths(app)
 
-        self.assertEqual(app.root.clipboard, "out.png")
+        self.assertEqual(app.root.clipboard, "out.png\nrun.log")
         app._append_log.assert_called_once()
 
     def test_gui_copy_error_report_generates_report(self):
@@ -3789,6 +3846,7 @@ class ProcessorTests(unittest.TestCase):
         app.last_error_report = ""
         app.last_config = h.default_config()
         app.last_outputs = []
+        app.last_log_path = h.Path("run.log")
         app.log_text = mock.Mock()
         app.log_text.get.return_value = "log"
         app._append_log = mock.Mock()
@@ -3796,6 +3854,7 @@ class ProcessorTests(unittest.TestCase):
         h.HimawariProcessorApp._copy_error_report(app)
 
         self.assertIn("No processing error", app.root.clipboard)
+        self.assertIn("run.log", app.root.clipboard)
 
     @mock.patch("himawari_lowram_processor.messagebox.showwarning")
     @mock.patch("himawari_lowram_processor.os.startfile")
@@ -3970,6 +4029,7 @@ class ProcessorTests(unittest.TestCase):
             config,
             "2026-05-26T00:00:00Z",
             outputs=[h.Path("out.png")],
+            log_path=h.Path("run.log"),
         )
         app.root = FakeRoot()
         app.recent_runs = [record]
@@ -3979,7 +4039,50 @@ class ProcessorTests(unittest.TestCase):
 
         h.HimawariProcessorApp._copy_selected_recent_paths(app)
 
-        self.assertEqual(app.root.clipboard, "out.png")
+        self.assertEqual(app.root.clipboard, "out.png\nrun.log")
+
+    @mock.patch("himawari_lowram_processor.os.startfile")
+    def test_gui_open_selected_recent_log_uses_log_path(self, mock_startfile):
+        app = object.__new__(h.HimawariProcessorApp)
+        config = h.default_config()
+        app._append_log = mock.Mock()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            log_path = h.Path(tmp_dir) / "run.log"
+            log_path.write_text("log", encoding="utf-8")
+            record = h.build_recent_run_record(
+                "failed",
+                config,
+                "2026-05-26T00:00:00Z",
+                log_path=log_path,
+            )
+            app.recent_runs = [record]
+            app.recent_tree = mock.Mock()
+            app.recent_tree.selection.return_value = [record.run_id]
+
+            h.HimawariProcessorApp._open_selected_recent_log(app)
+
+            mock_startfile.assert_called_once_with(str(log_path))
+
+    def test_gui_copy_selected_recent_error_includes_log_path(self):
+        app = object.__new__(h.HimawariProcessorApp)
+        config = h.default_config()
+        record = h.build_recent_run_record(
+            "failed",
+            config,
+            "2026-05-26T00:00:00Z",
+            error="boom",
+            log_path=h.Path("run.log"),
+        )
+        app.root = FakeRoot()
+        app.recent_runs = [record]
+        app.recent_tree = mock.Mock()
+        app.recent_tree.selection.return_value = [record.run_id]
+        app._append_log = mock.Mock()
+
+        h.HimawariProcessorApp._copy_selected_recent_error(app)
+
+        self.assertIn("run.log", app.root.clipboard)
 
     @mock.patch("himawari_lowram_processor.os.startfile")
     @mock.patch("himawari_lowram_processor.messagebox.showwarning")

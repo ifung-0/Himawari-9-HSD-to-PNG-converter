@@ -64,7 +64,7 @@ except KeyboardInterrupt:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-APP_VERSION = "2026.06.08.2"
+APP_VERSION = "2026.06.08.3"
 APP_DISPLAY_NAME = "Himawari-9 Low-RAM Processor"
 USER_URL = "https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/2024/07/25/0400/HS_H09_20240725_0400_B01_FLDK_R10_S0110.DAT.bz2"
 MODE = "Single Image"  # "Single Image" or "Timelapse"
@@ -160,11 +160,12 @@ LOCAL_APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppD
 APP_DATA_DIR = LOCAL_APP_DATA_DIR / "Himawari9LowRamProcessor"
 OUTPUT_DIR = APP_DATA_DIR / "outputs"
 TEMP_DIR = APP_DATA_DIR / "temp"
+LOG_DIR = APP_DATA_DIR / "logs"
 GUI_SETTINGS_FILE = PROJECT_DIR / "himawari_gui_settings.json"
 RECENT_RUNS_FILE = PROJECT_DIR / "himawari_recent_runs.json"
 CUSTOM_PRESETS_FILE = PROJECT_DIR / "himawari_custom_presets.json"
 GUI_SETTINGS_SCHEMA_VERSION = 1
-RECENT_RUNS_SCHEMA_VERSION = 1
+RECENT_RUNS_SCHEMA_VERSION = 2
 CUSTOM_PRESETS_SCHEMA_VERSION = 1
 TIMELAPSE_MANIFEST_SCHEMA_VERSION = 1
 NOAA_HIMAWARI9_BUCKET = "https://noaa-himawari9.s3.amazonaws.com"
@@ -578,6 +579,7 @@ class RecentRunRecord:
     outputs: tuple[str, ...]
     manifest_path: str
     frame_dir: str
+    log_path: str
     error: str
     config: dict[str, object]
 
@@ -613,6 +615,7 @@ def configure_logging() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
+    logging.captureWarnings(True)
 
 
 def configure_dask(config: ProcessorConfig | None = None) -> None:
@@ -4557,6 +4560,7 @@ def process_frame(
     frame_output_dir: Path | None = None,
 ) -> Path | None:
     config = config or default_config()
+    setattr(process_frame, "last_error", "")
     check_cancel(cancel_event)
     requested = config.composite_choice
     bands = required_bands(
@@ -4742,6 +4746,7 @@ def process_frame(
         LOG.info("Frame canceled.")
         raise
     except Exception as exc:
+        setattr(process_frame, "last_error", f"{exc.__class__.__name__}: {exc}")
         LOG.exception("Frame failed: %s", exc)
         return None
     finally:
@@ -5216,6 +5221,33 @@ def run_record_id(started_at_utc: str, config: ProcessorConfig) -> str:
     return digest[:12]
 
 
+def safe_log_timestamp(value: str) -> str:
+    return re.sub(r"[^0-9A-Za-z]+", "_", value).strip("_") or "run"
+
+
+def run_log_path(started_at_utc: str, config: ProcessorConfig, log_dir: Path = LOG_DIR) -> Path:
+    return log_dir / f"{safe_log_timestamp(started_at_utc)}_{run_record_id(started_at_utc, config)}.log"
+
+
+def add_run_file_log_handler(log_path: Path) -> logging.Handler:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S"))
+    LOG.addHandler(handler)
+    logging.getLogger("py.warnings").addHandler(handler)
+    return handler
+
+
+def remove_run_file_log_handler(handler: logging.Handler) -> None:
+    for logger in (LOG, logging.getLogger("py.warnings")):
+        try:
+            logger.removeHandler(handler)
+        except ValueError:
+            pass
+    handler.close()
+
+
 def recent_run_source(config: ProcessorConfig) -> str:
     try:
         info = parse_url(config.user_url)
@@ -5244,6 +5276,7 @@ def build_recent_run_record(
     completed_at_utc: str | None = None,
     outputs: Iterable[Path] | None = None,
     error: str = "",
+    log_path: Path | str | None = None,
     output_dir: Path = OUTPUT_DIR,
 ) -> RecentRunRecord:
     completed = completed_at_utc or utc_timestamp()
@@ -5260,6 +5293,7 @@ def build_recent_run_record(
         outputs=tuple(str(path) for path in (outputs or ())),
         manifest_path=manifest_path,
         frame_dir=frame_dir,
+        log_path=str(log_path or ""),
         error=error,
         config=config.__dict__.copy(),
     )
@@ -5278,6 +5312,7 @@ def serialize_recent_run_record(record: RecentRunRecord) -> dict:
         "outputs": list(record.outputs),
         "manifest_path": record.manifest_path,
         "frame_dir": record.frame_dir,
+        "log_path": record.log_path,
         "error": record.error,
         "config": dict(record.config),
     }
@@ -5305,6 +5340,7 @@ def recent_run_record_from_mapping(raw_record: object) -> RecentRunRecord | None
         outputs=tuple(str(path) for path in raw_outputs),
         manifest_path=str(raw_record.get("manifest_path") or ""),
         frame_dir=str(raw_record.get("frame_dir") or ""),
+        log_path=str(raw_record.get("log_path") or ""),
         error=str(raw_record.get("error") or ""),
         config=dict(raw_config) if isinstance(raw_config, dict) else {},
     )
@@ -5312,7 +5348,7 @@ def recent_run_record_from_mapping(raw_record: object) -> RecentRunRecord | None
 
 def load_recent_runs(history_path: Path = RECENT_RUNS_FILE) -> list[RecentRunRecord]:
     data = load_json_file(history_path)
-    if not data or data.get("schema_version") != RECENT_RUNS_SCHEMA_VERSION:
+    if not data or data.get("schema_version") not in {1, RECENT_RUNS_SCHEMA_VERSION}:
         return []
     raw_runs = data.get("runs", [])
     if not isinstance(raw_runs, list):
@@ -5361,6 +5397,8 @@ def format_recent_run_summary(record: RecentRunRecord) -> str:
         lines.extend(["", f"Manifest: {record.manifest_path}"])
     if record.frame_dir:
         lines.append(f"Frames: {record.frame_dir}")
+    if record.log_path:
+        lines.append(f"Log: {record.log_path}")
     if record.error:
         lines.extend(["", "Error:", record.error])
     return "\n".join(lines)
@@ -5457,6 +5495,7 @@ def build_error_report(
     config: ProcessorConfig | None = None,
     log_text: str = "",
     outputs: Iterable[Path] | None = None,
+    log_path: Path | str | None = None,
 ) -> str:
     lines = [
         app_version_label(),
@@ -5473,6 +5512,8 @@ def build_error_report(
     if outputs:
         lines.extend(["", "Outputs:"])
         lines.extend(str(path) for path in outputs)
+    if log_path:
+        lines.extend(["", f"Log: {log_path}"])
     if log_text:
         lines.extend(["", "Recent log:", log_text.strip()])
     return "\n".join(lines).strip() + "\n"
@@ -5483,138 +5524,168 @@ def run(
     progress: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
     resume_timelapse: bool = True,
+    started_at_utc: str | None = None,
 ) -> list[Path]:
     config = config or default_config()
     configure_logging()
-    validate_configuration(config)
-    check_cancel(cancel_event)
-    LOG.info("App version: %s", APP_VERSION)
-    configure_dask(config)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    TEMP_DIR.mkdir(parents=True, exist_ok=True)
-
-    info = parse_url(config.user_url)
-    start = datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
-    steps = frame_datetimes(start, config.mode, config.hours_back, config.interval_minutes)
-    run_id: str | None = None
-    frame_dir: Path | None = None
-    manifest_path: Path | None = None
-    manifest: dict | None = None
-    if config.mode == "Timelapse":
-        run_id = stable_run_id(config, info, steps)
-        frame_dir = timelapse_frame_dir(run_id, OUTPUT_DIR)
-        manifest_path = timelapse_manifest_path(run_id, OUTPUT_DIR)
-        frame_dir.mkdir(parents=True, exist_ok=True)
-        manifest = load_or_create_timelapse_manifest(
-            manifest_path,
-            run_id,
-            config,
-            info,
-            steps,
-            frame_dir,
-            resume=resume_timelapse,
-        )
-        LOG.info("Timelapse run id: %s", run_id)
-        LOG.info("Timelapse manifest: %s", manifest_path)
-    check_cancel(cancel_event)
-    log_memory("startup", config)
-    if is_flat_map(config):
-        min_lat, max_lat, min_lon, max_lon, resolution_deg, _height, _width = checked_flat_map_parameters(config)
-        master_area = flat_map_area(config)
-        LOG.info(
-            "Web Mercator flat map area locked: %sx%s px, lat %.3f..%.3f lon %.3f..%.3f at %.4g deg/pixel at equator",
-            master_area.width,
-            master_area.height,
-            min_lat,
-            max_lat,
-            min_lon,
-            max_lon,
-            resolution_deg,
-        )
-    else:
-        area_band = area_reference_band(config.composite_choice)
-        master_area = common_area_from_frames(
-            info,
-            steps,
-            target_pixel_size_m(
-                config.composite_choice,
-                config.use_night_fallback,
-                config.night_fallback_mode,
-            ),
-            area_band,
-            compatibility_bands=area_compatibility_bands(
-                config.composite_choice,
-                config.use_night_fallback,
-                config.night_fallback_mode,
-            ),
-            config=config,
-            progress=progress,
-            cancel_event=cancel_event,
-        )
-    check_cancel(cancel_event)
-    validate_runtime_dependencies(config, info, start, master_area)
-
-    outputs: list[Path] = []
-    for idx, dt in enumerate(steps):
+    started_at_utc = started_at_utc or utc_timestamp()
+    current_log_path = run_log_path(started_at_utc, config)
+    log_handler = add_run_file_log_handler(current_log_path)
+    frame_failures: list[str] = []
+    setattr(run, "last_log_path", current_log_path)
+    try:
+        validate_configuration(config)
         check_cancel(cancel_event)
-        if manifest is not None and resume_timelapse:
-            resumed = resume_frame_path(manifest, idx)
-            if resumed is not None:
-                LOG.info("Reusing existing timelapse frame %s", resumed)
-                emit_progress(progress, f"Reusing frame {idx + 1}/{len(steps)}", idx + 1, len(steps))
-                outputs.append(resumed)
-                update_manifest_frame(manifest, idx, resumed, "reused")
-                if manifest_path is not None:
-                    save_timelapse_manifest(manifest_path, manifest)
-                continue
-        result = process_frame(
-            dt,
-            info,
-            master_area,
-            idx,
-            len(steps),
-            config=config,
-            progress=progress,
-            cancel_event=cancel_event,
-            frame_output_dir=frame_dir,
-        )
-        if result:
-            outputs.append(result)
-            if manifest is not None:
-                update_manifest_frame(manifest, idx, result, "complete")
-        elif manifest is not None:
-            update_manifest_frame(manifest, idx, None, "failed")
-        if manifest is not None and manifest_path is not None:
-            save_timelapse_manifest(manifest_path, manifest)
+        LOG.info("App version: %s", APP_VERSION)
+        LOG.info("Run log: %s", current_log_path)
+        LOG.info("Settings: %s", json.dumps(config.__dict__, sort_keys=True, default=str))
+        configure_dask(config)
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-    if config.mode == "Timelapse" and outputs:
-        if len(outputs) != len(steps):
-            LOG.warning(
-                "Timelapse assembled from %s/%s successful frame(s). Check earlier frame errors.",
-                len(outputs),
-                len(steps),
+        info = parse_url(config.user_url)
+        start = datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
+        steps = frame_datetimes(start, config.mode, config.hours_back, config.interval_minutes)
+        run_id: str | None = None
+        frame_dir: Path | None = None
+        manifest_path: Path | None = None
+        manifest: dict | None = None
+        if config.mode == "Timelapse":
+            run_id = stable_run_id(config, info, steps)
+            frame_dir = timelapse_frame_dir(run_id, OUTPUT_DIR)
+            manifest_path = timelapse_manifest_path(run_id, OUTPUT_DIR)
+            frame_dir.mkdir(parents=True, exist_ok=True)
+            manifest = load_or_create_timelapse_manifest(
+                manifest_path,
+                run_id,
+                config,
+                info,
+                steps,
+                frame_dir,
+                resume=resume_timelapse,
             )
-            emit_progress(
-                progress,
-                f"Timelapse using {len(outputs)}/{len(steps)} successful frames",
-                len(outputs),
-                len(steps),
+            LOG.info("Timelapse run id: %s", run_id)
+            LOG.info("Timelapse manifest: %s", manifest_path)
+        check_cancel(cancel_event)
+        log_memory("startup", config)
+        if is_flat_map(config):
+            min_lat, max_lat, min_lon, max_lon, resolution_deg, _height, _width = checked_flat_map_parameters(config)
+            master_area = flat_map_area(config)
+            LOG.info(
+                "Web Mercator flat map area locked: %sx%s px, lat %.3f..%.3f lon %.3f..%.3f at %.4g deg/pixel at equator",
+                master_area.width,
+                master_area.height,
+                min_lat,
+                max_lat,
+                min_lon,
+                max_lon,
+                resolution_deg,
             )
-        movie = assemble_timelapse(outputs, info, config=config, progress=progress, cancel_event=cancel_event)
-        if manifest is not None and manifest_path is not None:
-            manifest["movie"] = str(movie) if movie else None
-            manifest["completed_at_utc"] = datetime.now(UTC).replace(tzinfo=None).isoformat(timespec="seconds") + "Z"
-            save_timelapse_manifest(manifest_path, manifest)
-        return [movie] if movie else []
-    if config.mode == "Timelapse":
-        raise RuntimeError("Timelapse failed: no frames were processed successfully, so no GIF/MP4 was created.")
+        else:
+            area_band = area_reference_band(config.composite_choice)
+            master_area = common_area_from_frames(
+                info,
+                steps,
+                target_pixel_size_m(
+                    config.composite_choice,
+                    config.use_night_fallback,
+                    config.night_fallback_mode,
+                ),
+                area_band,
+                compatibility_bands=area_compatibility_bands(
+                    config.composite_choice,
+                    config.use_night_fallback,
+                    config.night_fallback_mode,
+                ),
+                config=config,
+                progress=progress,
+                cancel_event=cancel_event,
+            )
+        check_cancel(cancel_event)
+        validate_runtime_dependencies(config, info, start, master_area)
 
-    if config.mode == "Single Image" and outputs:
-        LOG.info("Saved: %s", outputs[0])
+        outputs: list[Path] = []
+        for idx, dt in enumerate(steps):
+            check_cancel(cancel_event)
+            if manifest is not None and resume_timelapse:
+                resumed = resume_frame_path(manifest, idx)
+                if resumed is not None:
+                    LOG.info("Reusing existing timelapse frame %s", resumed)
+                    emit_progress(progress, f"Reusing frame {idx + 1}/{len(steps)}", idx + 1, len(steps))
+                    outputs.append(resumed)
+                    update_manifest_frame(manifest, idx, resumed, "reused")
+                    if manifest_path is not None:
+                        save_timelapse_manifest(manifest_path, manifest)
+                    continue
+            result = process_frame(
+                dt,
+                info,
+                master_area,
+                idx,
+                len(steps),
+                config=config,
+                progress=progress,
+                cancel_event=cancel_event,
+                frame_output_dir=frame_dir,
+            )
+            if result:
+                outputs.append(result)
+                if manifest is not None:
+                    update_manifest_frame(manifest, idx, result, "complete")
+            else:
+                raw_failure = getattr(process_frame, "last_error", "")
+                failure = (
+                    raw_failure
+                    if isinstance(raw_failure, str) and raw_failure
+                    else f"Frame {idx + 1}/{len(steps)} did not create output."
+                )
+                frame_failures.append(failure)
+                if manifest is not None:
+                    update_manifest_frame(manifest, idx, None, "failed")
+            if manifest is not None and manifest_path is not None:
+                save_timelapse_manifest(manifest_path, manifest)
+
+        if config.mode == "Timelapse" and outputs:
+            if len(outputs) != len(steps):
+                LOG.warning(
+                    "Timelapse assembled from %s/%s successful frame(s). Check earlier frame errors.",
+                    len(outputs),
+                    len(steps),
+                )
+                emit_progress(
+                    progress,
+                    f"Timelapse using {len(outputs)}/{len(steps)} successful frames",
+                    len(outputs),
+                    len(steps),
+                )
+            movie = assemble_timelapse(outputs, info, config=config, progress=progress, cancel_event=cancel_event)
+            if manifest is not None and manifest_path is not None:
+                manifest["movie"] = str(movie) if movie else None
+                manifest["completed_at_utc"] = datetime.now(UTC).replace(tzinfo=None).isoformat(timespec="seconds") + "Z"
+                save_timelapse_manifest(manifest_path, manifest)
+            return [movie] if movie else []
+        if config.mode == "Timelapse":
+            detail = frame_failures[-1] if frame_failures else "no frames were processed successfully"
+            raise RuntimeError(
+                f"Timelapse failed: no frames were processed successfully; "
+                f"{len(frame_failures)}/{len(steps)} frame(s) failed; {detail}. Log: {current_log_path}"
+            )
+
+        if config.mode == "Single Image" and outputs:
+            LOG.info("Saved: %s", outputs[0])
+            return outputs
+        if config.mode == "Single Image":
+            detail = frame_failures[-1] if frame_failures else "no output was created"
+            raise RuntimeError(f"Single image failed: {detail}. Log: {current_log_path}")
         return outputs
-    if config.mode == "Single Image":
-        raise RuntimeError("Single image failed: no output was created. Check the log for the frame error.")
-    return outputs
+    except ProcessingCancelled:
+        LOG.info("Run canceled.")
+        raise
+    except Exception:
+        LOG.exception("Run failed")
+        raise
+    finally:
+        remove_run_file_log_handler(log_handler)
 
 
 class QueueLogHandler(logging.Handler):
@@ -5901,6 +5972,7 @@ class HimawariProcessorApp:
         self.cancel_event = threading.Event()
         self.last_outputs: list[Path] = []
         self.last_config: ProcessorConfig | None = None
+        self.last_log_path: Path | None = None
         self.last_error_report = ""
         self.run_started_at_utc = ""
         self.recent_runs = load_recent_runs()
@@ -6553,13 +6625,16 @@ class HimawariProcessorApp:
         ttk.Button(actions, text="Copy Error", command=self._copy_selected_recent_error).grid(
             row=0, column=3, sticky="ew", pady=(0, 6)
         )
-        ttk.Button(actions, text="Re-run Settings", command=self._rerun_selected_recent_settings).grid(
+        ttk.Button(actions, text="Open Log", command=self._open_selected_recent_log).grid(
             row=1, column=0, sticky="ew", padx=(0, 6)
         )
-        ttk.Button(actions, text="Refresh", command=self._refresh_recent_runs).grid(
+        ttk.Button(actions, text="Re-run Settings", command=self._rerun_selected_recent_settings).grid(
             row=1, column=1, sticky="ew", padx=(0, 6)
         )
-        ttk.Button(actions, text="Clear History", command=self._clear_recent_runs).grid(row=1, column=2, sticky="ew")
+        ttk.Button(actions, text="Refresh", command=self._refresh_recent_runs).grid(
+            row=1, column=2, sticky="ew", padx=(0, 6)
+        )
+        ttk.Button(actions, text="Clear History", command=self._clear_recent_runs).grid(row=1, column=3, sticky="ew")
 
         detail_frame = ttk.LabelFrame(recent, text="Details and Preview", style="Section.TLabelframe")
         detail_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=(0, 10))
@@ -6658,13 +6733,26 @@ class HimawariProcessorApp:
         target = Path(record.main_output).parent if record.main_output else OUTPUT_DIR
         self._open_path(target)
 
+    def _open_selected_recent_log(self) -> None:
+        record = self._selected_recent_run()
+        if record is None or not record.log_path:
+            messagebox.showinfo("Open log", "No recent run log is recorded.")
+            return
+        self._open_existing_path(Path(record.log_path), "Log")
+
     def _copy_selected_recent_paths(self) -> None:
         record = self._selected_recent_run()
-        if record is None or not record.outputs:
-            messagebox.showinfo("Copy paths", "No recent output paths are selected.")
+        if record is None:
+            messagebox.showinfo("Copy paths", "No recent run is selected.")
             return
-        self._copy_to_clipboard("\n".join(record.outputs))
-        self._append_log("Recent output path(s) copied to clipboard.")
+        paths = [*record.outputs]
+        if record.log_path:
+            paths.append(record.log_path)
+        if not paths:
+            messagebox.showinfo("Copy paths", "No recent output or log paths are selected.")
+            return
+        self._copy_to_clipboard("\n".join(paths))
+        self._append_log("Recent output/log path(s) copied to clipboard.")
 
     def _copy_selected_recent_error(self) -> None:
         record = self._selected_recent_run()
@@ -6677,6 +6765,7 @@ class HimawariProcessorApp:
             config,
             "",
             [Path(path) for path in record.outputs],
+            record.log_path,
         )
         self._copy_to_clipboard(report)
         self._append_log("Recent run error report copied to clipboard.")
@@ -7139,12 +7228,15 @@ class HimawariProcessorApp:
         self.root.update_idletasks()
 
     def _copy_output_paths(self) -> None:
-        if not self.last_outputs:
-            messagebox.showinfo("Copy paths", "No completed output paths are available yet.")
+        paths = [str(path) for path in self.last_outputs]
+        last_log_path = getattr(self, "last_log_path", None)
+        if last_log_path:
+            paths.append(str(last_log_path))
+        if not paths:
+            messagebox.showinfo("Copy paths", "No completed output or log paths are available yet.")
             return
-        text = "\n".join(str(path) for path in self.last_outputs)
-        self._copy_to_clipboard(text)
-        self._append_log("Output path(s) copied to clipboard.")
+        self._copy_to_clipboard("\n".join(paths))
+        self._append_log("Output/log path(s) copied to clipboard.")
 
     def _copy_error_report(self) -> None:
         if not self.last_error_report:
@@ -7153,6 +7245,7 @@ class HimawariProcessorApp:
                 self.last_config,
                 self.log_text.get("1.0", "end"),
                 self.last_outputs,
+                getattr(self, "last_log_path", None),
             )
         self._copy_to_clipboard(self.last_error_report)
         self._append_log("Error report copied to clipboard.")
@@ -7306,6 +7399,7 @@ class HimawariProcessorApp:
         self.last_config = config
         self.last_error_report = ""
         self.run_started_at_utc = utc_timestamp()
+        self.last_log_path = run_log_path(self.run_started_at_utc, config)
         self._write_current_settings()
         self._append_log(f"Starting processing - version {APP_VERSION}")
         self._append_log(preflight.display_text())
@@ -7332,7 +7426,12 @@ class HimawariProcessorApp:
             self.messages.put(("progress", (message, current, total)))
 
         try:
-            outputs = run(config, progress=progress, cancel_event=self.cancel_event)
+            outputs = run(
+                config,
+                progress=progress,
+                cancel_event=self.cancel_event,
+                started_at_utc=self.run_started_at_utc or None,
+            )
             self.messages.put(("done", outputs))
         except ProcessingCancelled as exc:
             LOG.info("%s", exc)
@@ -7371,6 +7470,7 @@ class HimawariProcessorApp:
                         self.last_config,
                         self.run_started_at_utc or utc_timestamp(),
                         outputs=self.last_outputs,
+                        log_path=self.last_log_path,
                     )
                     self._record_recent_run(record)
                     done_text = completion_message(self.last_outputs, self.last_config, OUTPUT_DIR)
@@ -7422,6 +7522,7 @@ class HimawariProcessorApp:
                             self.run_started_at_utc or utc_timestamp(),
                             outputs=self.last_outputs,
                             error=str(payload),
+                            log_path=self.last_log_path,
                         )
                     )
                 self._append_log(cancel_text)
@@ -7435,6 +7536,7 @@ class HimawariProcessorApp:
                     self.last_config,
                     self.log_text.get("1.0", "end"),
                     self.last_outputs,
+                    self.last_log_path,
                 )
                 if self.last_config is not None:
                     self._record_recent_run(
@@ -7444,6 +7546,7 @@ class HimawariProcessorApp:
                             self.run_started_at_utc or utc_timestamp(),
                             outputs=self.last_outputs,
                             error=str(payload),
+                            log_path=self.last_log_path,
                         )
                     )
                 messagebox.showerror("Processing failed", str(payload))
