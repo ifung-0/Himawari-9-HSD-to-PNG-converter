@@ -90,7 +90,7 @@ python check_environment.py --auto
 checkenv.bat
 ```
 
-Expected current version: `2026.06.08.1`. If `--version` shows an older value,
+Expected current version: `2026.06.08.2`. If `--version` shows an older value,
 the machine is not running the latest update. If `--plain` reports a different
 Python than the one used to launch the GUI, use `run_gui.bat`, `run_cli.bat`,
 `runcli.bat`, `check_environment.bat`, or `checkenv.bat` so the same Python
@@ -144,13 +144,15 @@ Web Mercator map, the same projection style used by Google Maps and OpenStreetMa
 while keeping the satellite image as the output. The default flat extent is lat
 `-60..60`, lon `80E..200E`, at approximately `0.05` degrees per pixel at the
 equator; this creates a default target around `2400x3018` pixels because Web
-Mercator stretches latitude. Flat mode does not add Google labels, roads, map
-tiles, or basemap imagery. Zoom Earth-style flat maps keep the selected
-satellite product as the image, fill off-disk/invalid edges with dark ocean
-color, optionally add user-colored border lines, static country/ocean labels, a
-high-contrast approximate night boundary, and a configurable center crosshair,
-and apply a brighter true-color contrast/saturation lift so true-color flat maps
-do not look washed out. Single-band products keep their normal band rendering.
+Mercator stretches latitude. Flat mode does not add Google labels, roads, or
+live map tiles. Zoom Earth-style true-color flat maps keep valid Himawari pixels
+as the image and replace off-disk/invalid edges with a generated rectangular
+ocean/land basemap, using the local GSHHS overlay data for land fill when it is
+available. They can also add user-colored border lines, static country/ocean
+labels, a high-contrast approximate night boundary, and a configurable center
+crosshair, then apply a brighter true-color contrast/saturation lift so
+true-color flat maps do not look washed out. Single-band products keep their
+normal band rendering.
 Radar, wind animation, heat spots, active fires, tropical systems, and
 temperatures are shown as unavailable because this app does not include those
 external data feeds. Native disk output remains the low-RAM default.
@@ -208,10 +210,10 @@ python himawari_cli.py --version
 python check_environment.py --plain
 ```
 
-Current fixed build: `2026.06.08.1`. Processing logs should include:
+Current fixed build: `2026.06.08.2`. Processing logs should include:
 
 ```text
-App version: 2026.06.08.1
+App version: 2026.06.08.2
 ```
 
 For official-looking true color and true color reproduction, keep the
@@ -283,7 +285,7 @@ by the checker when installing or launching the app.
 Symptom: a friend says the fix is installed, but logs do not show:
 
 ```text
-App version: 2026.06.08.1
+App version: 2026.06.08.2
 ```
 
 Likely cause: their folder is still on an old commit, or they downloaded a ZIP

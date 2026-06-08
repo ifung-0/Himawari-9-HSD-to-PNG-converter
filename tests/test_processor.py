@@ -2159,7 +2159,7 @@ class ProcessorTests(unittest.TestCase):
         expected = h.np.asarray([[True, False, False], [True, True, False]], dtype=bool)
         self.assertTrue(h.np.array_equal(mask, expected))
 
-    def test_flat_map_visual_overlays_fill_edge_connected_black_limb(self):
+    def test_flat_map_visual_overlays_replace_edge_limb_with_rectangular_basemap(self):
         from PIL import Image
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2183,11 +2183,12 @@ class ProcessorTests(unittest.TestCase):
             )
             with Image.open(path) as image:
                 styled = h.np.asarray(image.convert("RGB"))
+            basemap = h.np.asarray(h.build_flat_map_basemap_image(area).convert("RGB"))
 
-        self.assertTrue(h.np.all(styled[:, -4:, :] == h.np.asarray(h.FLAT_MAP_INVALID_FILL, dtype=h.np.uint8)))
-        self.assertFalse(h.np.all(styled[8:12, 8:12, :] == h.np.asarray(h.FLAT_MAP_INVALID_FILL, dtype=h.np.uint8)))
+        self.assertTrue(h.np.array_equal(styled[:, -4:, :], basemap[:, -4:, :]))
+        self.assertFalse(h.np.array_equal(styled[8:12, 8:12, :], basemap[8:12, 8:12, :]))
 
-    def test_flat_map_visual_overlays_fill_invalid_pixels_with_dark_ocean(self):
+    def test_flat_map_visual_overlays_replace_invalid_true_color_pixels_with_basemap(self):
         from PIL import Image
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2205,6 +2206,42 @@ class ProcessorTests(unittest.TestCase):
                 config,
                 h.datetime(2024, 7, 25, 4, 0),
                 "True Color Reproduction Image",
+                valid_mask=mask,
+            )
+            with Image.open(path) as image:
+                pixels = h.np.asarray(image.convert("RGB"))
+            basemap = h.np.asarray(h.build_flat_map_basemap_image(area).convert("RGB"))
+
+        self.assertTrue(h.np.array_equal(pixels[:, -3:, :], basemap[:, -3:, :]))
+        self.assertFalse(h.np.array_equal(pixels[:, :-3, :], basemap[:, :-3, :]))
+
+    def test_generated_flat_map_basemap_is_rectangular_and_varied(self):
+        area = AreaDefinition("flat", "flat", "flat", h.WEB_MERCATOR_PROJ4, 120, 80, h.web_mercator_extent(-60, 60, 80, 200))
+
+        basemap = h.np.asarray(h.build_flat_map_basemap_image(area).convert("RGB"))
+
+        self.assertEqual(basemap.shape, (80, 120, 3))
+        self.assertGreater(int(h.np.unique(basemap.reshape(-1, 3), axis=0).shape[0]), 8)
+        self.assertFalse(h.np.all(basemap == h.np.asarray(h.FLAT_MAP_INVALID_FILL, dtype=h.np.uint8)))
+
+    def test_flat_map_visual_overlays_fill_invalid_single_band_pixels_with_dark_ocean(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "single.png"
+            Image.new("RGB", (12, 8), (120, 130, 140)).save(path)
+            area = AreaDefinition("flat", "flat", "flat", h.WEB_MERCATOR_PROJ4, 12, 8, h.web_mercator_extent(-10, 10, 100, 112))
+            config = h.default_config()
+            config.map_view = "flat"
+            config.zoom_earth_style = True
+            mask = h.np.ones((8, 12), dtype=bool)
+            mask[:, -3:] = False
+            h.apply_flat_map_visual_overlays(
+                path,
+                area,
+                config,
+                h.datetime(2024, 7, 25, 4, 0),
+                "B13 (Infrared Window)",
                 valid_mask=mask,
             )
             with Image.open(path) as image:
@@ -2236,8 +2273,9 @@ class ProcessorTests(unittest.TestCase):
             )
             with Image.open(path) as image:
                 styled = h.np.asarray(image.convert("RGB"))
+            basemap = h.np.asarray(h.build_flat_map_basemap_image(area).convert("RGB"))
 
-        self.assertTrue(h.np.all(styled[:, -3:, :] == h.np.asarray(h.FLAT_MAP_INVALID_FILL, dtype=h.np.uint8)))
+        self.assertTrue(h.np.array_equal(styled[:, -3:, :], basemap[:, -3:, :]))
 
     def test_flat_map_visual_geotiff_preserves_profile_and_styles_rgb(self):
         import rasterio
@@ -2285,6 +2323,7 @@ class ProcessorTests(unittest.TestCase):
                 styled_count = src.count
                 styled_crs = src.crs
                 styled_transform = src.transform
+            basemap = h.np.asarray(h.build_flat_map_basemap_image(area).convert("RGB"))
 
         self.assertEqual(result, path)
         self.assertEqual(styled_width, 12)
@@ -2293,7 +2332,7 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(styled_crs, original_crs)
         self.assertEqual(styled_transform, original_transform)
         self.assertEqual(colorinterp[0], rasterio.enums.ColorInterp.red)
-        self.assertTrue(h.np.all(h.np.moveaxis(styled, 0, -1)[-2:, -2:, :] == h.np.asarray(h.FLAT_MAP_INVALID_FILL, dtype=h.np.uint8)))
+        self.assertTrue(h.np.array_equal(h.np.moveaxis(styled, 0, -1)[-2:, -2:, :], basemap[-2:, -2:, :]))
 
     def test_flat_map_visual_geotiff_uses_alpha_band_as_invalid_mask(self):
         import rasterio
@@ -2337,8 +2376,9 @@ class ProcessorTests(unittest.TestCase):
             )
             with rasterio.open(path) as src:
                 styled = h.np.moveaxis(src.read((1, 2, 3)), 0, -1)
+            basemap = h.np.asarray(h.build_flat_map_basemap_image(area).convert("RGB"))
 
-        self.assertTrue(h.np.all(styled[:, -3:, :] == h.np.asarray(h.FLAT_MAP_INVALID_FILL, dtype=h.np.uint8)))
+        self.assertTrue(h.np.array_equal(styled[:, -3:, :], basemap[:, -3:, :]))
 
     def test_flat_map_visual_style_draws_selected_border_color_after_enhancement(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

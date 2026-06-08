@@ -64,7 +64,7 @@ except KeyboardInterrupt:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-APP_VERSION = "2026.06.08.1"
+APP_VERSION = "2026.06.08.2"
 APP_DISPLAY_NAME = "Himawari-9 Low-RAM Processor"
 USER_URL = "https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/2024/07/25/0400/HS_H09_20240725_0400_B01_FLDK_R10_S0110.DAT.bz2"
 MODE = "Single Image"  # "Single Image" or "Timelapse"
@@ -95,6 +95,9 @@ CROSSHAIR_COLOR = "#7c3cff"
 ZOOM_EARTH_STYLE = False
 FLAT_MAP_INVALID_FILL = (4, 15, 28)
 FLAT_MAP_SOURCE_VALID_MIN = 1.0e-6
+FLAT_MAP_BASEMAP_OCEAN = (5, 18, 32)
+FLAT_MAP_BASEMAP_LAND = (80, 92, 62)
+FLAT_MAP_BASEMAP_COAST = (166, 180, 168)
 CROSSHAIR_TYPES = ("target", "dot", "plus", "ring")
 UNSUPPORTED_MAP_OVERLAYS = (
     "Radar",
@@ -3079,6 +3082,72 @@ def fill_invalid_flat_map_pixels(image, valid_mask: np.ndarray | None) -> None:
     image.paste(Image.fromarray(rgb, mode="RGB").convert(image.mode))
 
 
+def flat_map_pixel_center_vectors(area: AreaDefinition) -> tuple[np.ndarray, np.ndarray]:
+    left, bottom, right, top = area.area_extent
+    width = int(area.width)
+    height = int(area.height)
+    x_step = (float(right) - float(left)) / max(width, 1)
+    y_step = (float(top) - float(bottom)) / max(height, 1)
+    xs = float(left) + (np.arange(width, dtype=np.float64) + 0.5) * x_step
+    ys = float(top) - (np.arange(height, dtype=np.float64) + 0.5) * y_step
+    return xs, ys
+
+
+def flat_map_lonlat_vectors(area: AreaDefinition) -> tuple[np.ndarray, np.ndarray]:
+    from pyproj import Transformer
+
+    xs, ys = flat_map_pixel_center_vectors(area)
+    left, bottom, right, top = area.area_extent
+    transformer = Transformer.from_crs(area.crs, "EPSG:4326", always_xy=True)
+    lon, _lat_sample = transformer.transform(xs, np.full(xs.shape, (float(bottom) + float(top)) * 0.5))
+    _lon_sample, lat = transformer.transform(np.full(ys.shape, (float(left) + float(right)) * 0.5), ys)
+    return np.asarray(lon, dtype=np.float32), np.asarray(lat, dtype=np.float32)
+
+
+def generated_flat_map_ocean_image(area: AreaDefinition):
+    from PIL import Image
+
+    width = int(area.width)
+    height = int(area.height)
+    lon, lat = flat_map_lonlat_vectors(area)
+    lat_norm = (1.0 - np.clip(np.abs(lat) / WEB_MERCATOR_MAX_LAT, 0.0, 1.0))[:, None]
+    y_grad = np.linspace(0.0, 1.0, height, dtype=np.float32)[:, None]
+    lon_wave = ((np.sin(np.deg2rad(lon * 1.7)) + 1.0) * 0.5)[None, :]
+    rgb = np.empty((height, width, 3), dtype=np.uint8)
+    rgb[:, :, 0] = np.clip(FLAT_MAP_BASEMAP_OCEAN[0] + 5.0 * lat_norm + 2.0 * lon_wave, 0, 255).astype(np.uint8)
+    rgb[:, :, 1] = np.clip(FLAT_MAP_BASEMAP_OCEAN[1] + 18.0 * lat_norm + 5.0 * lon_wave, 0, 255).astype(np.uint8)
+    rgb[:, :, 2] = np.clip(
+        FLAT_MAP_BASEMAP_OCEAN[2] + 34.0 * lat_norm + 9.0 * lon_wave + 8.0 * y_grad,
+        0,
+        255,
+    ).astype(np.uint8)
+    return Image.fromarray(rgb, mode="RGB").convert("RGBA")
+
+
+def draw_flat_map_basemap_land(image, area: AreaDefinition) -> None:
+    try:
+        writer = direct_overlay_writer(str(PROJECT_DIR / "overlays"))
+        writer.add_coastlines(
+            image,
+            area,
+            resolution=OVERLAY_RESOLUTION,
+            level=OVERLAY_LEVEL,
+            fill=FLAT_MAP_BASEMAP_LAND,
+            fill_opacity=230,
+            outline=FLAT_MAP_BASEMAP_COAST,
+            width=0.65,
+            outline_opacity=135,
+        )
+    except Exception as exc:
+        LOG.debug("Flat-map generated basemap land layer skipped (%s).", exc)
+
+
+def build_flat_map_basemap_image(area: AreaDefinition):
+    image = generated_flat_map_ocean_image(area)
+    draw_flat_map_basemap_land(image, area)
+    return image
+
+
 def edge_connected_mask(candidate: np.ndarray) -> np.ndarray | None:
     mask = np.asarray(candidate, dtype=bool)
     if mask.ndim != 2 or not bool(mask.any()):
@@ -3114,16 +3183,35 @@ def edge_connected_mask(candidate: np.ndarray) -> np.ndarray | None:
     return np.asarray(connected, dtype=bool)
 
 
-def fill_flat_map_edge_artifacts(image) -> None:
-    from PIL import Image
-
+def flat_map_edge_artifact_mask(image) -> np.ndarray | None:
     rgb = np.asarray(image.convert("RGB")).copy()
     luminance = 0.2126 * rgb[:, :, 0] + 0.7152 * rgb[:, :, 1] + 0.0722 * rgb[:, :, 2]
     candidate = (luminance < 22.0) & (rgb.max(axis=2) < 55)
-    edge_mask = edge_connected_mask(candidate)
-    if edge_mask is None:
+    return edge_connected_mask(candidate)
+
+
+def flat_map_basemap_replacement_mask(image, valid_mask: np.ndarray | None) -> np.ndarray | None:
+    mask = normalize_validity_mask(valid_mask, image.width, image.height)
+    replacement = np.zeros((image.height, image.width), dtype=bool)
+    if mask is not None:
+        replacement |= ~mask
+    edge_mask = flat_map_edge_artifact_mask(image)
+    if edge_mask is not None and (mask is None or bool(mask.all())):
+        replacement |= edge_mask
+    if not bool(replacement.any()):
+        return None
+    return replacement
+
+
+def composite_flat_map_basemap(image, area: AreaDefinition, valid_mask: np.ndarray | None) -> None:
+    from PIL import Image
+
+    replacement = flat_map_basemap_replacement_mask(image, valid_mask)
+    if replacement is None:
         return
-    rgb[edge_mask] = np.asarray(FLAT_MAP_INVALID_FILL, dtype=np.uint8)
+    rgb = np.asarray(image.convert("RGB")).copy()
+    background = np.asarray(build_flat_map_basemap_image(area).convert("RGB"), dtype=np.uint8)
+    rgb[replacement] = background[replacement]
     image.paste(Image.fromarray(rgb, mode="RGB").convert(image.mode))
 
 
@@ -3140,8 +3228,7 @@ def apply_flat_map_style_to_image(
     fill_invalid_flat_map_pixels(working, valid_mask)
     if config.zoom_earth_style and true_color_product(product):
         working = apply_zoom_earth_true_color_enhancement(working)
-        fill_invalid_flat_map_pixels(working, valid_mask)
-        fill_flat_map_edge_artifacts(working)
+        composite_flat_map_basemap(working, area, valid_mask)
     try:
         direct_overlay_to_image(working, area, overlay_options)
     except Exception as exc:
