@@ -2099,6 +2099,7 @@ class ProcessorTests(unittest.TestCase):
         labels = {label.replace("\n", " ") for label, _lat, _lon, _kind in h.ZOOM_EARTH_LABEL_POINTS}
 
         self.assertIn("NEW ZEALAND", labels)
+        self.assertIn("West Pacific Ocean", labels)
 
     def test_flat_map_visual_style_requires_flat_map(self):
         config = h.default_config()

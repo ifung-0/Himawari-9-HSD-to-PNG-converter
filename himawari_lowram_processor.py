@@ -124,6 +124,7 @@ ZOOM_EARTH_LABEL_POINTS = (
     ("NEW\nZEALAND", -42.0, 172.5, "land"),
     ("INDIA", 22.0, 78.0, "land"),
     ("North Pacific\nOcean", 29.0, 173.0, "water"),
+    ("West Pacific\nOcean", 10.0, 150.0, "water"),
     ("Indian\nOcean", -27.0, 82.0, "water"),
     ("Philippine Sea", 18.0, 135.0, "water"),
 )
