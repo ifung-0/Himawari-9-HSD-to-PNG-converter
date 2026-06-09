@@ -62,6 +62,13 @@ RUNTIME_JSON_FILES = (
     "himawari_recent_runs.json",
     "himawari_custom_presets.json",
 )
+SUPPORT_FOLDERS = (
+    APP_DATA_DIR,
+    APP_DATA_DIR / "logs",
+    APP_DATA_DIR / "temp",
+    APP_DATA_DIR / "cache",
+    OVERLAY_CACHE_DIR,
+)
 CORE_ROOT_FILES = {
     ".gitignore",
     "check_environment.bat",
@@ -930,6 +937,28 @@ def check_default_path_writability() -> list[CheckResult]:
     return results
 
 
+def check_support_folders(folders: tuple[Path, ...] = SUPPORT_FOLDERS) -> CheckResult:
+    issues = []
+    for folder in folders:
+        result = check_writable_folder_target("support folder", folder)
+        if not result.ok:
+            issues.append(f"{folder}: {result.detail}")
+
+    if issues:
+        return CheckResult(
+            "support folders",
+            False,
+            "not writable or creatable: " + "; ".join(issues),
+            critical=False,
+        )
+    return CheckResult(
+        "support folders",
+        True,
+        f"{len(folders)} required app cache/log/temp folder target(s) are writable or creatable",
+        critical=False,
+    )
+
+
 def cloud_sync_marker(path: Path) -> str | None:
     for part in path.expanduser().resolve(strict=False).parts:
         normalized = part.lower()
@@ -1047,9 +1076,90 @@ def check_runtime_json_files(project_dir: Path = PROJECT_DIR) -> CheckResult:
     return CheckResult("runtime settings JSON", True, "no local settings/history JSON files found", critical=False)
 
 
+def invalid_runtime_json_paths(project_dir: Path = PROJECT_DIR) -> list[tuple[Path, str]]:
+    invalid = []
+    for path in runtime_json_paths(project_dir):
+        if not path.exists():
+            continue
+        try:
+            json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            invalid.append((path, f"{exc.__class__.__name__}: {exc}"))
+    return invalid
+
+
 def cleanup_archive_dir(project_dir: Path = PROJECT_DIR, timestamp: str | None = None) -> Path:
     timestamp = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
     return project_dir / "cleanup_archive" / timestamp
+
+
+def unique_archive_destination(folder: Path, name: str) -> Path:
+    destination = folder / name
+    if not destination.exists():
+        return destination
+    stem = destination.stem
+    suffix = destination.suffix
+    counter = 1
+    while True:
+        candidate = folder / f"{stem}_{counter}{suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def repair_runtime_json_files(project_dir: Path = PROJECT_DIR, timestamp: str | None = None) -> CheckResult:
+    invalid = invalid_runtime_json_paths(project_dir)
+    if not invalid:
+        return CheckResult(
+            "repair runtime settings JSON",
+            True,
+            "no invalid settings/history JSON files found",
+            critical=False,
+        )
+
+    archive_dir = cleanup_archive_dir(project_dir, timestamp) / "invalid_runtime_json"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    manifest: list[dict[str, object]] = []
+    failures = []
+    moved = 0
+    for source, error in invalid:
+        destination = unique_archive_destination(archive_dir, source.name)
+        try:
+            stat = source.stat()
+            shutil.move(str(source), str(destination))
+        except Exception as exc:
+            failures.append(f"{source.name}: {exc.__class__.__name__}: {exc}")
+            continue
+        moved += 1
+        manifest.append(
+            {
+                "original_path": str(source),
+                "archived_path": str(destination),
+                "size": stat.st_size,
+                "modified_time": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+                "parse_error": error,
+            }
+        )
+
+    if manifest:
+        (archive_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    if failures:
+        return CheckResult(
+            "repair runtime settings JSON",
+            False,
+            f"archived {moved} invalid file(s) to {archive_dir}; issues: " + "; ".join(failures),
+            critical=False,
+        )
+    return CheckResult(
+        "repair runtime settings JSON",
+        True,
+        f"archived {moved} invalid settings/history file(s) to {archive_dir}; app will recreate defaults",
+        critical=False,
+    )
 
 
 def safe_relative_to_project(path: Path, project_dir: Path) -> Path:
@@ -1127,6 +1237,88 @@ def archive_unused_programs(project_dir: Path = PROJECT_DIR, timestamp: str | No
         f"archived {moved} file(s) to {archive_dir}",
         critical=False,
     )
+
+
+def ensure_support_folders(folders: tuple[Path, ...] = SUPPORT_FOLDERS) -> CheckResult:
+    created = []
+    failures = []
+    for folder in folders:
+        try:
+            existed = folder.exists()
+            folder.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            failures.append(f"{folder}: {exc.__class__.__name__}: {exc}")
+            continue
+        if not existed:
+            created.append(str(folder))
+
+    if failures:
+        return CheckResult(
+            "support folders",
+            False,
+            "could not create: " + "; ".join(failures),
+            critical=False,
+        )
+    if created:
+        return CheckResult("support folders", True, "created: " + "; ".join(created), critical=False)
+    return CheckResult("support folders", True, "required app cache/log/temp folders already exist", critical=False)
+
+
+def path_is_inside(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def cleanup_stale_partial_downloads(roots: tuple[Path, ...] | None = None) -> CheckResult:
+    roots = roots or (APP_DATA_DIR / "temp", APP_DATA_DIR / "cache")
+    removed = 0
+    failures = []
+
+    for root in roots:
+        if not root.exists():
+            continue
+        try:
+            candidates = sorted(root.rglob("*.part"))
+        except Exception as exc:
+            failures.append(f"{root}: {exc.__class__.__name__}: {exc}")
+            continue
+        for candidate in candidates:
+            if not path_is_inside(candidate, root):
+                failures.append(f"{candidate}: skipped because it is outside {root}")
+                continue
+            try:
+                candidate.unlink()
+            except Exception as exc:
+                failures.append(f"{candidate}: {exc.__class__.__name__}: {exc}")
+                continue
+            removed += 1
+
+    if failures:
+        return CheckResult(
+            "stale partial downloads",
+            False,
+            f"removed {removed} stale .part file(s); issues: " + "; ".join(failures),
+            critical=False,
+        )
+    if removed:
+        return CheckResult(
+            "stale partial downloads",
+            True,
+            f"removed {removed} stale .part file(s) from app temp/cache folders",
+            critical=False,
+        )
+    return CheckResult("stale partial downloads", True, "no stale .part files found", critical=False)
+
+
+def run_local_repair_tasks(project_dir: Path = PROJECT_DIR) -> list[CheckResult]:
+    return [
+        ensure_support_folders(),
+        repair_runtime_json_files(project_dir),
+        cleanup_stale_partial_downloads(),
+    ]
 
 
 def check_satpy_version() -> CheckResult:
@@ -1391,6 +1583,7 @@ def run_checks(include_gpu: bool = False) -> list[CheckResult]:
     results.append(check_project_cleanup())
     results.append(check_runtime_json_files())
     results.append(check_launcher_helpers())
+    results.append(check_support_folders())
     results.extend(check_default_path_writability())
     results.append(check_cloud_sync_locations())
     return results
@@ -1408,7 +1601,13 @@ def result_group(result: CheckResult) -> str:
         return "GPU"
     if result.name in package_names:
         return "Packages"
-    if result.name in {"unused root programs", "runtime settings JSON", "archive unused programs"}:
+    if result.name in {
+        "unused root programs",
+        "runtime settings JSON",
+        "archive unused programs",
+        "repair runtime settings JSON",
+        "stale partial downloads",
+    }:
         return "Project Cleanup"
     if result.name.startswith("satpy") or result.name.startswith("Satpy") or "AHI" in result.name:
         return "Satpy"
@@ -1419,6 +1618,7 @@ def result_group(result: CheckResult) -> str:
         "default output folder",
         "default temp folder",
         "cloud sync location",
+        "support folders",
     }:
         return "Paths"
     return "Project"
@@ -1504,7 +1704,10 @@ def print_next_steps(results: list[CheckResult]) -> None:
         if any(result_group(result) == "GPU" for result in results if not result.ok and not result.critical):
             print("  To repair optional GPU acceleration support, run:")
             print("     " + command_text([sys.executable, str(Path(__file__).resolve()), "--gpu-fix"]))
-        print("  For border overlays, Quick Fix downloads the needed low-resolution GSHHS/WDBII shapefiles.")
+        print(
+            "  Quick Fix also repairs overlay data, archives broken settings/history JSON, "
+            "and clears stale .part downloads."
+        )
         print("  For path warnings, choose local non-synced output/temp folders such as C:\\Himawari\\outputs.")
         print("  You can also use the custom low-RAM true color fallback from the GUI or CLI.")
         return
@@ -1570,6 +1773,8 @@ def run_fix(
     result = subprocess.call(command, cwd=PROJECT_DIR)
     if result != 0:
         return result
+    for repair_result in run_local_repair_tasks(PROJECT_DIR):
+        print(f"{status_label(repair_result)}: {repair_result.name}: {repair_result.detail}")
     if install_overlays:
         overlay_result = install_overlay_data(open_folder=open_overlays, force=force_overlay_data)
         if not overlay_result.ok:
@@ -1648,7 +1853,10 @@ def main() -> int:
     parser.add_argument(
         "--fix",
         action="store_true",
-        help="Run pip install --upgrade -r requirements.txt with this Python, then re-check.",
+        help=(
+            "Run Quick Fix with this Python: upgrade requirements, repair local app state, "
+            "install overlay data, archive obsolete helpers, then re-check."
+        ),
     )
     parser.add_argument(
         "--auto",

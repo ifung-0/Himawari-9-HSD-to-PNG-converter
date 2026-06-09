@@ -56,13 +56,16 @@ The checker verifies the active Python executable, installed package versions,
 Satpy's AHI reader/composite configuration, `pyspectral`, and GeoTIFF/overlay
 helpers, including the optional `tkinterdnd2` package used by local file
 drag/drop. With `--fix`, it upgrades packages from `requirements.txt` using the
-current Python, installs the overlay data used by border lines, and archives
-confirmed obsolete root-level helper programs into `cleanup_archive/`. The
-archive is reversible and ignored by git; no cleanup path deletes files. Use
-`--archive-unused` to run only that archive step, or `--no-archive-unused` with
-`--fix`/`--auto` to skip it. With `--auto`, the checker does the same repair
-automatically and, if the active Python is unsupported, tries to create/use a
-local `.venv` with Python 3.12 or 3.13 from the Windows `py` launcher.
+current Python, creates required app cache/log/temp folders, archives broken
+GUI/history JSON into `cleanup_archive/`, clears stale `.part` downloads from
+app temp/cache folders, installs the overlay data used by border lines, and
+archives confirmed obsolete root-level helper programs into `cleanup_archive/`.
+The archives are reversible and ignored by git; no cleanup path deletes user
+outputs. Use `--archive-unused` to run only the root-file archive step, or
+`--no-archive-unused` with `--fix`/`--auto` to skip it. With `--auto`, the
+checker does the same repair automatically and, if the active Python is
+unsupported, tries to create/use a local `.venv` with Python 3.12 or 3.13 from
+the Windows `py` launcher.
 
 Experimental GPU acceleration is optional and NVIDIA/CUDA-only in this version.
 It uses CuPy for compatible custom composite math after Satpy has loaded and
@@ -590,9 +593,11 @@ python check_environment.py --fix
 ```
 
 Quick Fix installs/upgrades the overlay Python packages in the current Python,
-creates the project `overlays/` folder if needed, downloads the official GSHHG
-shapefile archive from SOEST mirrors, and extracts the low-resolution GSHHS/WDBII
-files the app needs. If every mirror is unreachable, place
+creates required app folders, backs up corrupt GUI/history JSON, clears stale
+partial downloads from app temp/cache folders, creates the project `overlays/`
+folder if needed, downloads the official GSHHG shapefile archive from SOEST
+mirrors, and extracts the low-resolution GSHHS/WDBII files the app needs. If
+every mirror is unreachable, place
 `gshhg-shp-2.3.7.zip` in the project folder, `overlays/`, `downloads/`, the app
 overlay cache, or your Windows `Downloads` folder, then run Quick Fix again. It
 will use the local archive automatically. For the default low-resolution overlay

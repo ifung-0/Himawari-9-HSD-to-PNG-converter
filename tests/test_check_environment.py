@@ -446,6 +446,75 @@ class EnvironmentCheckTests(unittest.TestCase):
         self.assertFalse(broken.critical)
         self.assertIn("himawari_recent_runs.json", broken.detail)
 
+    def test_repair_runtime_json_files_archives_invalid_json_only(self):
+        with TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            valid_path = project_dir / "himawari_gui_settings.json"
+            broken_path = project_dir / "himawari_recent_runs.json"
+            valid_path.write_text('{"ok": true}', encoding="utf-8")
+            broken_path.write_text("{broken", encoding="utf-8")
+
+            result = env.repair_runtime_json_files(project_dir, timestamp="20260102_030405")
+            archive_dir = project_dir / "cleanup_archive" / "20260102_030405" / "invalid_runtime_json"
+            manifest = json.loads((archive_dir / "manifest.json").read_text(encoding="utf-8"))
+
+            self.assertTrue(result.ok)
+            self.assertTrue(valid_path.exists())
+            self.assertFalse(broken_path.exists())
+            self.assertTrue((archive_dir / "himawari_recent_runs.json").exists())
+            self.assertEqual(Path(manifest[0]["original_path"]).name, "himawari_recent_runs.json")
+            self.assertIn("JSONDecodeError", manifest[0]["parse_error"])
+
+    def test_repair_runtime_json_files_noops_when_all_valid(self):
+        with TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            (project_dir / "himawari_gui_settings.json").write_text('{"ok": true}', encoding="utf-8")
+
+            result = env.repair_runtime_json_files(project_dir, timestamp="20260102_030405")
+
+            self.assertTrue(result.ok)
+            self.assertIn("no invalid", result.detail)
+            self.assertFalse((project_dir / "cleanup_archive").exists())
+
+    def test_ensure_support_folders_creates_missing_folders(self):
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "appdata"
+            folders = (root, root / "logs", root / "temp", root / "cache")
+
+            result = env.ensure_support_folders(folders)
+
+            self.assertTrue(result.ok)
+            for folder in folders:
+                self.assertTrue(folder.is_dir())
+
+    def test_check_support_folders_accepts_creatable_targets(self):
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "appdata"
+            folders = (root / "logs", root / "temp", root / "cache")
+
+            result = env.check_support_folders(folders)
+
+            self.assertTrue(result.ok)
+            self.assertIn("writable or creatable", result.detail)
+            self.assertFalse((root / "logs").exists())
+
+    def test_cleanup_stale_partial_downloads_removes_only_part_files(self):
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "cache"
+            nested = root / "nested"
+            nested.mkdir(parents=True)
+            stale = nested / "frame.dat.bz2.part"
+            keep = nested / "frame.dat.bz2"
+            stale.write_text("partial", encoding="utf-8")
+            keep.write_text("complete", encoding="utf-8")
+
+            result = env.cleanup_stale_partial_downloads((root,))
+
+            self.assertTrue(result.ok)
+            self.assertFalse(stale.exists())
+            self.assertTrue(keep.exists())
+            self.assertIn("removed 1", result.detail)
+
     def test_archive_unused_programs_moves_candidates_and_writes_manifest(self):
         with TemporaryDirectory() as tmp_dir:
             project_dir = Path(tmp_dir)
@@ -691,28 +760,33 @@ class EnvironmentCheckTests(unittest.TestCase):
 
     @mock.patch("check_environment.subprocess.call", return_value=0)
     @mock.patch("check_environment.check_pip_available", return_value=env.CheckResult("pip repair tool", True, "pip ok"))
+    @mock.patch("check_environment.run_local_repair_tasks")
     @mock.patch("check_environment.archive_unused_programs")
     @mock.patch("check_environment.install_overlay_data")
     def test_run_fix_invokes_pip_installs_overlay_data_and_archives_cleanup(
         self,
         mock_overlay_install,
         mock_archive,
+        mock_local_repairs,
         _mock_pip,
         mock_call,
     ):
         mock_overlay_install.return_value = env.OverlayInstallResult(True, True, "ok")
         mock_archive.return_value = env.CheckResult("archive unused programs", True, "archived", critical=False)
+        mock_local_repairs.return_value = [env.CheckResult("support folders", True, "ok", critical=False)]
 
         with mock.patch("sys.stdout", new_callable=StringIO):
             result = env.run_fix()
 
         self.assertEqual(result, 0)
         mock_call.assert_called_once_with(env.pip_install_command(upgrade=True), cwd=env.PROJECT_DIR)
+        mock_local_repairs.assert_called_once_with(env.PROJECT_DIR)
         mock_overlay_install.assert_called_once_with(open_folder=True, force=False)
         mock_archive.assert_called_once_with(env.PROJECT_DIR)
 
     @mock.patch("check_environment.subprocess.call", return_value=0)
     @mock.patch("check_environment.check_pip_available", return_value=env.CheckResult("pip repair tool", True, "pip ok"))
+    @mock.patch("check_environment.run_local_repair_tasks")
     @mock.patch("check_environment.archive_unused_programs")
     @mock.patch("check_environment.ensure_overlay_folder")
     @mock.patch("check_environment.install_overlay_data")
@@ -721,10 +795,12 @@ class EnvironmentCheckTests(unittest.TestCase):
         mock_overlay_install,
         mock_overlay_folder,
         mock_archive,
+        mock_local_repairs,
         _mock_pip,
         _mock_call,
     ):
         mock_archive.return_value = env.CheckResult("archive unused programs", True, "archived", critical=False)
+        mock_local_repairs.return_value = [env.CheckResult("support folders", True, "ok", critical=False)]
 
         with mock.patch("sys.stdout", new_callable=StringIO):
             result = env.run_fix(install_overlays=False)
@@ -732,52 +808,77 @@ class EnvironmentCheckTests(unittest.TestCase):
         self.assertEqual(result, 0)
         mock_overlay_install.assert_not_called()
         mock_overlay_folder.assert_called_once_with(open_folder=True)
+        mock_local_repairs.assert_called_once_with(env.PROJECT_DIR)
         mock_archive.assert_called_once_with(env.PROJECT_DIR)
 
     @mock.patch("check_environment.subprocess.call", return_value=0)
     @mock.patch("check_environment.check_pip_available", return_value=env.CheckResult("pip repair tool", True, "pip ok"))
+    @mock.patch("check_environment.run_local_repair_tasks")
     @mock.patch("check_environment.archive_unused_programs")
     @mock.patch("check_environment.install_overlay_data")
     def test_run_fix_returns_failure_when_overlay_install_fails(
         self,
         mock_overlay_install,
         mock_archive,
+        mock_local_repairs,
         _mock_pip,
         _mock_call,
     ):
         mock_overlay_install.return_value = env.OverlayInstallResult(False, False, "download failed")
+        mock_local_repairs.return_value = [env.CheckResult("support folders", True, "ok", critical=False)]
 
         result = env.run_fix()
 
         self.assertEqual(result, 1)
+        mock_local_repairs.assert_called_once_with(env.PROJECT_DIR)
         mock_overlay_install.assert_called_once_with(open_folder=True, force=False)
         mock_archive.assert_not_called()
 
     @mock.patch("check_environment.subprocess.call", return_value=0)
     @mock.patch("check_environment.check_pip_available", return_value=env.CheckResult("pip repair tool", True, "pip ok"))
+    @mock.patch("check_environment.run_local_repair_tasks")
     @mock.patch("check_environment.archive_unused_programs")
     @mock.patch("check_environment.install_overlay_data")
-    def test_run_fix_can_force_overlay_data_install(self, mock_overlay_install, mock_archive, _mock_pip, _mock_call):
+    def test_run_fix_can_force_overlay_data_install(
+        self,
+        mock_overlay_install,
+        mock_archive,
+        mock_local_repairs,
+        _mock_pip,
+        _mock_call,
+    ):
         mock_overlay_install.return_value = env.OverlayInstallResult(True, True, "ok")
         mock_archive.return_value = env.CheckResult("archive unused programs", True, "archived", critical=False)
+        mock_local_repairs.return_value = [env.CheckResult("support folders", True, "ok", critical=False)]
 
         with mock.patch("sys.stdout", new_callable=StringIO):
             result = env.run_fix(force_overlay_data=True)
 
         self.assertEqual(result, 0)
+        mock_local_repairs.assert_called_once_with(env.PROJECT_DIR)
         mock_overlay_install.assert_called_once_with(open_folder=True, force=True)
         mock_archive.assert_called_once_with(env.PROJECT_DIR)
 
     @mock.patch("check_environment.subprocess.call", return_value=0)
     @mock.patch("check_environment.check_pip_available", return_value=env.CheckResult("pip repair tool", True, "pip ok"))
+    @mock.patch("check_environment.run_local_repair_tasks")
     @mock.patch("check_environment.archive_unused_programs")
     @mock.patch("check_environment.install_overlay_data")
-    def test_run_fix_can_skip_archive_cleanup(self, mock_overlay_install, mock_archive, _mock_pip, _mock_call):
+    def test_run_fix_can_skip_archive_cleanup(
+        self,
+        mock_overlay_install,
+        mock_archive,
+        mock_local_repairs,
+        _mock_pip,
+        _mock_call,
+    ):
         mock_overlay_install.return_value = env.OverlayInstallResult(True, True, "ok")
+        mock_local_repairs.return_value = [env.CheckResult("support folders", True, "ok", critical=False)]
 
         result = env.run_fix(archive_unused=False)
 
         self.assertEqual(result, 0)
+        mock_local_repairs.assert_called_once_with(env.PROJECT_DIR)
         mock_archive.assert_not_called()
 
     @mock.patch("check_environment.subprocess.call", return_value=0)
@@ -790,11 +891,13 @@ class EnvironmentCheckTests(unittest.TestCase):
 
     @mock.patch("check_environment.subprocess.call")
     @mock.patch("check_environment.check_pip_available", return_value=env.CheckResult("pip repair tool", False, "missing pip"))
-    def test_run_fix_stops_when_pip_is_unavailable(self, _mock_pip, mock_call):
+    @mock.patch("check_environment.run_local_repair_tasks")
+    def test_run_fix_stops_when_pip_is_unavailable(self, mock_local_repairs, _mock_pip, mock_call):
         result = env.run_fix()
 
         self.assertEqual(result, 1)
         mock_call.assert_not_called()
+        mock_local_repairs.assert_not_called()
 
     @mock.patch("check_environment.run_fix", return_value=0)
     @mock.patch("check_environment.run_environment_check_with", return_value=0)
