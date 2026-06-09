@@ -32,6 +32,7 @@ OVERLAY_RESOLUTION = "l"
 OVERLAY_LEVEL = 1
 GSHHG_SHAPEFILE_ARCHIVE = "gshhg-shp-2.3.7.zip"
 GSHHG_ARCHIVE_URLS = (
+    "https://www.soest.hawaii.edu/wessel/gshhg/gshhg-shp-2.3.7.zip",
     "https://www.soest.hawaii.edu/pwessel/gshhg/gshhg-shp-2.3.7.zip",
     "https://ftp.soest.hawaii.edu/gshhg/gshhg-shp-2.3.7.zip",
     "http://www.soest.hawaii.edu/pwessel/gshhg/gshhg-shp-2.3.7.zip",
@@ -641,6 +642,44 @@ def download_file(urls: tuple[str, ...], destination: Path, timeout: int = 60) -
     return False, "; ".join(errors)
 
 
+def local_overlay_archive_candidates(
+    project_dir: Path = PROJECT_DIR,
+    archive_name: str = GSHHG_SHAPEFILE_ARCHIVE,
+    cache_dir: Path = OVERLAY_CACHE_DIR,
+) -> tuple[Path, ...]:
+    candidates = [
+        project_dir / archive_name,
+        project_dir / "overlays" / archive_name,
+        project_dir / "downloads" / archive_name,
+        cache_dir / archive_name,
+        Path.home() / "Downloads" / archive_name,
+    ]
+    seen: set[Path] = set()
+    unique = []
+    for candidate in candidates:
+        resolved = candidate.expanduser()
+        normalized = resolved.resolve(strict=False)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        unique.append(resolved)
+    return tuple(unique)
+
+
+def find_local_overlay_archive(
+    project_dir: Path = PROJECT_DIR,
+    archive_name: str = GSHHG_SHAPEFILE_ARCHIVE,
+    cache_dir: Path = OVERLAY_CACHE_DIR,
+) -> Path | None:
+    for candidate in local_overlay_archive_candidates(project_dir, archive_name, cache_dir):
+        try:
+            if candidate.exists() and candidate.is_file() and candidate.stat().st_size > 0:
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
 def archive_members_by_suffix(zip_file: zipfile.ZipFile, suffixes: tuple[str, ...]) -> dict[str, str]:
     normalized_suffixes = {suffix.replace("\\", "/").lower(): suffix for suffix in suffixes}
     matches: dict[str, str] = {}
@@ -697,25 +736,33 @@ def install_overlay_data(
             open_overlay_folder(project_dir)
         return OverlayInstallResult(True, False, detail)
 
-    archive_path = archive_path or (OVERLAY_CACHE_DIR / GSHHG_SHAPEFILE_ARCHIVE)
+    default_archive_path = OVERLAY_CACHE_DIR / GSHHG_SHAPEFILE_ARCHIVE
+    archive_path = archive_path or default_archive_path
     attempted_urls: tuple[str, ...] = ()
     if force or not archive_path.exists():
-        ok, detail = download_file(urls, archive_path)
-        attempted_urls = urls
-        if not ok:
-            missing = (*missing_overlay_data_paths(project_dir), *missing_overlay_sidecar_paths(project_dir))
-            message = (
-                f"Could not download required overlay data archive {GSHHG_SHAPEFILE_ARCHIVE}. "
-                "Every attempted mirror failed: "
-                + "; ".join(urls)
-                + f". Destination folder: {overlays_dir}. Missing files: "
-                + "; ".join(str(path) for path in missing)
-                + f". Manual fallback: download {GSHHG_SHAPEFILE_ARCHIVE} and extract the listed "
-                + "GSHHS/WDBII files under overlays/."
-                + f" Details: {detail}"
-            )
-            print(message, file=sys.stderr)
-            return OverlayInstallResult(False, False, message, attempted_urls, missing)
+        local_archive = find_local_overlay_archive(project_dir)
+        if local_archive is not None and not force:
+            archive_path = local_archive
+            print(f"Using local overlay archive: {archive_path}")
+        else:
+            ok, detail = download_file(urls, archive_path)
+            attempted_urls = urls
+            if not ok:
+                local_locations = "; ".join(str(path) for path in local_overlay_archive_candidates(project_dir))
+                missing = (*missing_overlay_data_paths(project_dir), *missing_overlay_sidecar_paths(project_dir))
+                message = (
+                    f"Could not download required overlay data archive {GSHHG_SHAPEFILE_ARCHIVE}. "
+                    "Every attempted mirror failed: "
+                    + "; ".join(urls)
+                    + f". Destination folder: {overlays_dir}. Missing files: "
+                    + "; ".join(str(path) for path in missing)
+                    + f". Manual fallback: place {GSHHG_SHAPEFILE_ARCHIVE} in one of these locations and run Quick Fix again: "
+                    + local_locations
+                    + ". Or extract the listed GSHHS/WDBII files under overlays/."
+                    + f" Details: {detail}"
+                )
+                print(message, file=sys.stderr)
+                return OverlayInstallResult(False, False, message, attempted_urls, missing)
     else:
         print(f"Using cached overlay archive: {archive_path}")
 

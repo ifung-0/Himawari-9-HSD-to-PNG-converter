@@ -592,9 +592,10 @@ python check_environment.py --fix
 Quick Fix installs/upgrades the overlay Python packages in the current Python,
 creates the project `overlays/` folder if needed, downloads the official GSHHG
 shapefile archive from SOEST mirrors, and extracts the low-resolution GSHHS/WDBII
-files the app needs. If every mirror is unreachable, the error prints each URL
-and the required archive name, `gshhg-shp-2.3.7.zip`, so it can be downloaded
-manually and extracted under `overlays/`. For the default low-resolution overlay
+files the app needs. If every mirror is unreachable, place
+`gshhg-shp-2.3.7.zip` in the project folder, `overlays/`, `downloads/`, the app
+overlay cache, or your Windows `Downloads` folder, then run Quick Fix again. It
+will use the local archive automatically. For the default low-resolution overlay
 setting, the app expects these files:
 
 ```text

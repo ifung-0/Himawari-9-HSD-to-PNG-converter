@@ -1037,6 +1037,7 @@ class EnvironmentCheckTests(unittest.TestCase):
             "https://www.ngdc.noaa.gov/mgg/shorelines/data/gshhs/latest/gshhg-shp-2.3.7.zip",
             env.GSHHG_ARCHIVE_URLS,
         )
+        self.assertIn("https://www.soest.hawaii.edu/wessel/gshhg/gshhg-shp-2.3.7.zip", env.GSHHG_ARCHIVE_URLS)
         self.assertIn("https://www.soest.hawaii.edu/pwessel/gshhg/gshhg-shp-2.3.7.zip", env.GSHHG_ARCHIVE_URLS)
         self.assertIn("https://ftp.soest.hawaii.edu/gshhg/gshhg-shp-2.3.7.zip", env.GSHHG_ARCHIVE_URLS)
 
@@ -1109,6 +1110,34 @@ class EnvironmentCheckTests(unittest.TestCase):
         self.assertTrue(result.installed)
         self.assertFalse(result.missing_paths)
 
+    @mock.patch("check_environment.download_file")
+    def test_install_overlay_data_uses_local_archive_when_cache_missing(self, mock_download):
+        with TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir) / "project"
+            project_dir.mkdir()
+            archive_path = project_dir / env.GSHHG_SHAPEFILE_ARCHIVE
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                for suffix in env.overlay_archive_member_suffixes():
+                    archive.writestr(f"root/{suffix}", suffix)
+            missing_cache = Path(tmp_dir) / "cache" / env.GSHHG_SHAPEFILE_ARCHIVE
+
+            with mock.patch("sys.stdout", new_callable=StringIO):
+                result = env.install_overlay_data(project_dir, open_folder=False, archive_path=missing_cache)
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.installed)
+        mock_download.assert_not_called()
+
+    def test_local_overlay_archive_candidates_include_friend_fallback_locations(self):
+        with TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir) / "project"
+            cache_dir = Path(tmp_dir) / "cache"
+            candidates = env.local_overlay_archive_candidates(project_dir, cache_dir=cache_dir)
+
+        self.assertIn(project_dir / env.GSHHG_SHAPEFILE_ARCHIVE, candidates)
+        self.assertIn(project_dir / "overlays" / env.GSHHG_SHAPEFILE_ARCHIVE, candidates)
+        self.assertIn(cache_dir / env.GSHHG_SHAPEFILE_ARCHIVE, candidates)
+
     @mock.patch("check_environment.download_file", return_value=(False, "network down"))
     def test_install_overlay_data_reports_download_failure(self, mock_download):
         with TemporaryDirectory() as tmp_dir:
@@ -1125,6 +1154,7 @@ class EnvironmentCheckTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn(env.GSHHG_SHAPEFILE_ARCHIVE, result.detail)
         self.assertIn("Every attempted mirror failed", result.detail)
+        self.assertIn("place gshhg-shp-2.3.7.zip", result.detail)
         self.assertIn("GSHHS_l_L1.shp", result.detail)
         self.assertIn("Could not download required overlay data archive", stderr.getvalue())
         mock_download.assert_called_once()
