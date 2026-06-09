@@ -1221,6 +1221,20 @@ class ProcessorTests(unittest.TestCase):
         self.assertFalse(bool((enhanced_values.sel(bands="G") == enhanced_values.sel(bands="B")).all()))
         self.assertFalse(bool((enhanced_values == old_values).all()))
 
+    def test_true_color_reproduction_fallback_repairs_missing_visible_channels(self):
+        attrs = {"area": "dummy", "sensor": "ahi", "calibration": "reflectance"}
+        b01 = xr.DataArray(da.from_array([[0.0, 25.0]], chunks=(1, 2)), dims=("y", "x"), attrs=attrs)
+        b02 = xr.DataArray(da.from_array([[h.np.nan, 35.0]], chunks=(1, 2)), dims=("y", "x"), attrs=attrs)
+        b03 = xr.DataArray(da.from_array([[60.0, 45.0]], chunks=(1, 2)), dims=("y", "x"), attrs=attrs)
+        b04 = xr.DataArray(da.from_array([[0.0, 40.0]], chunks=(1, 2)), dims=("y", "x"), attrs=attrs)
+
+        values = h.create_true_color_reproduction_fallback(b01, b02, b03, b04).compute()
+        repaired = values.isel(y=0, x=0).values.astype(int)
+
+        self.assertLessEqual(int(repaired.max() - repaired.min()), 45)
+        self.assertFalse(bool(repaired[0] > repaired[1] + 80 and repaired[0] > repaired[2] + 80))
+        self.assertFalse(bool(repaired[1] > repaired[0] + 80 and repaired[1] > repaired[2] + 80))
+
     def test_all_single_band_products_build_lazy_uint8_rgb(self):
         attrs = {"area": "dummy", "sensor": "ahi"}
         for band in h.BAND_NAMES:
@@ -2460,6 +2474,36 @@ class ProcessorTests(unittest.TestCase):
 
         center_delta = h.np.abs(styled[20:40, 25:55, :].astype(int) - basemap[20:40, 25:55, :].astype(int)).mean()
         self.assertGreater(float(center_delta), 30.0)
+
+    def test_flat_map_valid_mask_prevents_basemap_blend_over_valid_satellite_pixels(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "valid-dark-edge.png"
+            pixels = h.np.zeros((40, 60, 3), dtype=h.np.uint8)
+            pixels[:, :] = (100, 120, 140)
+            pixels[:, -10:] = (4, 6, 10)
+            Image.fromarray(pixels, mode="RGB").save(path)
+            area = AreaDefinition("flat", "flat", "flat", h.WEB_MERCATOR_PROJ4, 60, 40, h.web_mercator_extent(-20, 20, 100, 130))
+            config = h.default_config()
+            config.map_view = "flat"
+            config.zoom_earth_style = True
+            mask = h.np.ones((40, 60), dtype=bool)
+
+            h.apply_flat_map_visual_overlays(
+                path,
+                area,
+                config,
+                h.datetime(2024, 7, 25, 4, 0),
+                "True Color Reproduction Image",
+                valid_mask=mask,
+            )
+            with Image.open(path) as image:
+                styled = h.np.asarray(image.convert("RGB"))
+            basemap = h.np.asarray(h.build_flat_map_basemap_image(area).convert("RGB"))
+
+        right_delta = h.np.abs(styled[:, -1, :].astype(int) - basemap[:, -1, :].astype(int)).mean()
+        self.assertGreater(float(right_delta), 20.0)
 
     def test_flat_map_visual_overlays_replace_invalid_true_color_pixels_with_basemap(self):
         from PIL import Image

@@ -64,7 +64,7 @@ except KeyboardInterrupt:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-APP_VERSION = "2026.06.08.8"
+APP_VERSION = "2026.06.08.9"
 APP_DISPLAY_NAME = "Himawari-8/9 Low-RAM Processor"
 USER_URL = "https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/2024/07/25/0400/HS_H09_20240725_0400_B01_FLDK_R10_S0110.DAT.bz2"
 MODE = "Single Image"  # "Single Image" or "Timelapse"
@@ -924,6 +924,17 @@ def gpu_saturation_block(cp, red, green, blue, saturation: float):
     )
 
 
+def gpu_fill_visible_reflectance_gaps_block(cp, *arrays):
+    finite = [cp.isfinite(array) & (cp.abs(array) > cp.float32(FLAT_MAP_SOURCE_VALID_MIN)) for array in arrays]
+    count = cp.zeros_like(arrays[0], dtype=cp.float32)
+    total = cp.zeros_like(arrays[0], dtype=cp.float32)
+    for array, valid in zip(arrays, finite, strict=False):
+        count += valid.astype(cp.float32)
+        total += cp.where(valid, array, cp.float32(0.0))
+    fallback = cp.where(count > 0, total / cp.maximum(count, cp.float32(1.0)), cp.float32(0.0))
+    return tuple(cp.where(valid, array, fallback) for array, valid in zip(arrays, finite, strict=False))
+
+
 def gpu_true_color_reproduction_block(
     b01,
     b02,
@@ -946,22 +957,29 @@ def gpu_true_color_reproduction_block(
     b02_gpu = cp.asarray(b02, dtype=cp.float32)
     b03_gpu = cp.asarray(b03, dtype=cp.float32)
     b04_gpu = cp.asarray(b04, dtype=cp.float32)
+    b01_gpu, b02_gpu, b03_gpu, b04_gpu = gpu_fill_visible_reflectance_gaps_block(
+        cp,
+        b01_gpu,
+        b02_gpu,
+        b03_gpu,
+        b04_gpu,
+    )
 
-    red = gpu_black_point_block(cp, gpu_scale_reflectance_block(cp, b03_gpu, max_value=100.0, gamma=1.12), 0.012)
+    red = gpu_black_point_block(cp, gpu_scale_reflectance_block(cp, b03_gpu, max_value=100.0, gamma=1.08), 0.008)
     green = cp.clip(
-        gpu_black_point_block(cp, gpu_scale_reflectance_block(cp, b02_gpu, max_value=100.0, gamma=1.08), 0.010)
-        * cp.float32(0.56)
-        + red * cp.float32(0.32)
-        + gpu_black_point_block(cp, gpu_scale_reflectance_block(cp, b04_gpu, max_value=100.0, gamma=1.05), 0.008)
-        * cp.float32(0.12),
+        gpu_black_point_block(cp, gpu_scale_reflectance_block(cp, b02_gpu, max_value=100.0, gamma=1.06), 0.008)
+        * cp.float32(0.62)
+        + red * cp.float32(0.30)
+        + gpu_black_point_block(cp, gpu_scale_reflectance_block(cp, b04_gpu, max_value=100.0, gamma=1.04), 0.006)
+        * cp.float32(0.08),
         0.0,
         1.0,
     )
-    blue = gpu_black_point_block(cp, gpu_scale_reflectance_block(cp, b01_gpu, max_value=100.0, gamma=1.12), 0.004)
-    red = gpu_contrast_block(cp, cp.clip(red * cp.float32(1.12) + cp.float32(0.018), 0.0, 1.0), 1.22, 0.40)
-    green = gpu_contrast_block(cp, cp.clip(green * cp.float32(1.08) + cp.float32(0.010), 0.0, 1.0), 1.18, 0.40)
-    blue = gpu_contrast_block(cp, cp.clip(blue * cp.float32(0.98) + cp.float32(0.006), 0.0, 1.0), 1.12, 0.38)
-    red, green, blue = gpu_saturation_block(cp, red, green, blue, 1.32)
+    blue = gpu_black_point_block(cp, gpu_scale_reflectance_block(cp, b01_gpu, max_value=100.0, gamma=1.10), 0.004)
+    red = gpu_contrast_block(cp, cp.clip(red * cp.float32(1.06) + cp.float32(0.010), 0.0, 1.0), 1.12, 0.42)
+    green = gpu_contrast_block(cp, cp.clip(green * cp.float32(1.04) + cp.float32(0.008), 0.0, 1.0), 1.10, 0.42)
+    blue = gpu_contrast_block(cp, cp.clip(blue * cp.float32(1.02) + cp.float32(0.006), 0.0, 1.0), 1.08, 0.40)
+    red, green, blue = gpu_saturation_block(cp, red, green, blue, 1.14)
     rgb = cp.stack([red, green, blue], axis=0)
 
     if use_hybrid:
@@ -2179,6 +2197,15 @@ def apply_saturation(
     )
 
 
+def fill_visible_reflectance_gaps(*bands: xr.DataArray) -> tuple[xr.DataArray, ...]:
+    cleaned = [band.where(np.isfinite(band) & (abs(band) > FLAT_MAP_SOURCE_VALID_MIN)) for band in bands]
+    fallback = xr.concat(cleaned, dim="_visible_reflectance_band").mean(
+        dim="_visible_reflectance_band",
+        skipna=True,
+    ).fillna(0.0)
+    return tuple(band.fillna(fallback) for band in cleaned)
+
+
 def rgb_dataarray(
     red: xr.DataArray,
     green: xr.DataArray,
@@ -2353,19 +2380,20 @@ def create_true_color_reproduction_fallback(
     name: str | None = None,
     standard_name: str = "custom_true_color_reproduction_rgb",
 ) -> xr.DataArray:
-    red = apply_black_point(scale_reflectance(b03, max_value=100.0, gamma=1.12), black=0.012)
+    b01, b02, b03, b04 = fill_visible_reflectance_gaps(b01, b02, b03, b04)
+    red = apply_black_point(scale_reflectance(b03, max_value=100.0, gamma=1.08), black=0.008)
     green = xr_clip(
-        apply_black_point(scale_reflectance(b02, max_value=100.0, gamma=1.08), black=0.010) * 0.56
-        + red * 0.32
-        + apply_black_point(scale_reflectance(b04, max_value=100.0, gamma=1.05), black=0.008) * 0.12,
+        apply_black_point(scale_reflectance(b02, max_value=100.0, gamma=1.06), black=0.008) * 0.62
+        + red * 0.30
+        + apply_black_point(scale_reflectance(b04, max_value=100.0, gamma=1.04), black=0.006) * 0.08,
         0.0,
         1.0,
     )
-    blue = apply_black_point(scale_reflectance(b01, max_value=100.0, gamma=1.12), black=0.004)
-    red = apply_contrast(xr_clip(red * 1.12 + 0.018, 0.0, 1.0), contrast=1.22, midpoint=0.40)
-    green = apply_contrast(xr_clip(green * 1.08 + 0.010, 0.0, 1.0), contrast=1.18, midpoint=0.40)
-    blue = apply_contrast(xr_clip(blue * 0.98 + 0.006, 0.0, 1.0), contrast=1.12, midpoint=0.38)
-    red, green, blue = apply_saturation(red, green, blue, saturation=1.32)
+    blue = apply_black_point(scale_reflectance(b01, max_value=100.0, gamma=1.10), black=0.004)
+    red = apply_contrast(xr_clip(red * 1.06 + 0.010, 0.0, 1.0), contrast=1.12, midpoint=0.42)
+    green = apply_contrast(xr_clip(green * 1.04 + 0.008, 0.0, 1.0), contrast=1.10, midpoint=0.42)
+    blue = apply_contrast(xr_clip(blue * 1.02 + 0.006, 0.0, 1.0), contrast=1.08, midpoint=0.40)
+    red, green, blue = apply_saturation(red, green, blue, saturation=1.14)
     return rgb_dataarray(
         red,
         green,
@@ -3093,13 +3121,13 @@ def apply_zoom_earth_true_color_enhancement(image):
 
     alpha = image.getchannel("A") if "A" in image.getbands() else None
     working = image.convert("RGB")
-    gamma = 0.82
+    gamma = 0.88
     gamma_lut = [int(round((value / 255.0) ** gamma * 255.0)) for value in range(256)]
     working = working.point(gamma_lut * 3)
-    working = ImageEnhance.Color(working).enhance(1.24)
-    working = ImageEnhance.Contrast(working).enhance(1.08)
-    working = ImageEnhance.Brightness(working).enhance(1.10)
-    working = ImageEnhance.Sharpness(working).enhance(1.10)
+    working = ImageEnhance.Color(working).enhance(1.15)
+    working = ImageEnhance.Contrast(working).enhance(1.05)
+    working = ImageEnhance.Brightness(working).enhance(1.06)
+    working = ImageEnhance.Sharpness(working).enhance(1.06)
     if alpha is not None:
         working.putalpha(alpha)
     return working
@@ -3388,6 +3416,9 @@ def flat_map_limb_seed_mask(image, valid_mask: np.ndarray | None) -> np.ndarray 
         edge_invalid = edge_connected_mask(~mask) if not bool(mask.all()) else None
         if edge_invalid is not None:
             seed |= edge_invalid
+        if not bool(seed.any()):
+            return None
+        return seed
     edge_mask = flat_map_edge_artifact_mask(image)
     if edge_mask is not None:
         seed |= edge_mask
@@ -3429,8 +3460,9 @@ def flat_map_basemap_blend_alpha(image, valid_mask: np.ndarray | None) -> np.nda
     alpha[seed] = 1.0
     mask = normalize_validity_mask(valid_mask, image.width, image.height)
     if mask is not None:
-        interior_invalid = ~mask & ~seed
-        alpha[interior_invalid] = 0.0
+        edge_invalid = edge_connected_mask(~mask) if not bool(mask.all()) else None
+        allowed = edge_invalid if edge_invalid is not None else np.zeros(mask.shape, dtype=bool)
+        alpha[~allowed] = 0.0
     if not bool((alpha > 0.0).any()):
         return None
     return alpha
