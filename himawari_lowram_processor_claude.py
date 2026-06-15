@@ -4084,12 +4084,19 @@ def apply_flat_map_style_to_image(
     valid_mask: np.ndarray | None = None,
 ):
     working = image.convert("RGBA")
-    is_zoom_true_color = config.zoom_earth_style and true_color_product(product)
+    is_true_color = true_color_product(product)
+    is_zoom_true_color = config.zoom_earth_style and is_true_color
     fill_invalid_flat_map_pixels(working, valid_mask)
-    if is_zoom_true_color:
-        working = apply_zoom_earth_true_color_enhancement(working, hd=is_enhanced_satellite_layer(config))
+    if is_true_color:
+        # Aggressive red/magenta artifact cleanup and true-color tone enhancement are
+        # now the default for every true-color flat map, not only the Zoom Earth style.
+        # They run before any overlay so green borders, labels and the crosshair are
+        # drawn on top of the cleaned image and never removed by the speckle cleanup.
+        hd = is_enhanced_satellite_layer(config)
+        working = apply_zoom_earth_true_color_enhancement(working, hd=hd)
         cleanup_true_color_chroma_speckles(working, aggressive=True)
-        working = finish_zoom_earth_true_color_quality(working, hd=is_enhanced_satellite_layer(config))
+        working = finish_zoom_earth_true_color_quality(working, hd=hd)
+    if is_zoom_true_color:
         composite_flat_map_basemap(working, area, valid_mask)
     try:
         direct_overlay_to_image(
@@ -4214,7 +4221,9 @@ def apply_flat_map_visual_overlays(
     overlay_options: dict | None = None,
     valid_mask: np.ndarray | None = None,
 ) -> Path:
-    if not is_flat_map(config) or not flat_map_visual_style_enabled(config):
+    if not is_flat_map(config):
+        return output_path
+    if not flat_map_visual_style_enabled(config) and not true_color_product(product):
         return output_path
     if output_path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".tif", ".tiff"}:
         return output_path
@@ -5253,7 +5262,9 @@ def save_satpy_dataset_output(
         fill_value=fill_value,
         overlay=None if is_flat_map(config) else overlay_options,
     )
-    if not is_flat_map(config) or not flat_map_visual_style_enabled(config):
+    if not is_flat_map(config) or (
+        not flat_map_visual_style_enabled(config) and not true_color_product(active)
+    ):
         return saved_path
     return apply_flat_map_visual_overlays(
         saved_path,
@@ -5333,7 +5344,7 @@ def save_custom_composite_output(
         dataset = maybe_cpu_dataset_after_gpu(dataset, config)
     resampled[dataset_name] = dataset
     valid_mask = None
-    if is_flat_map(config) and flat_map_visual_style_enabled(config):
+    if is_flat_map(config) and (flat_map_visual_style_enabled(config) or true_color_product(active)):
         if use_direct_flat_map:
             valid_mask = direct_flat_map_validity_mask_from_scenes(scene, resampled, custom_bands, master_area)
         else:

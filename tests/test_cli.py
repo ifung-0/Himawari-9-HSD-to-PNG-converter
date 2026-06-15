@@ -43,6 +43,7 @@ class TestConfigFieldNames(unittest.TestCase):
             "user_url",
             "mode",
             "composite_choice",
+            "satellite_layer_mode",
             "hours_back",
             "interval_minutes",
             "fps",
@@ -61,6 +62,7 @@ class TestConfigFieldNames(unittest.TestCase):
             "border_line_color",
             "border_line_width",
             "add_map_labels",
+            "map_label_size",
             "add_night_boundary",
             "add_crosshair",
             "crosshair_type",
@@ -131,6 +133,7 @@ class TestBuildParser(unittest.TestCase):
             "user_url",
             "mode",
             "composite_choice",
+            "satellite_layer_mode",
             "hours_back",
             "interval_minutes",
             "fps",
@@ -158,6 +161,7 @@ class TestBuildParser(unittest.TestCase):
             "border_line_color",
             "border_line_width",
             "add_map_labels",
+            "map_label_size",
             "add_night_boundary",
             "add_crosshair",
             "zoom_earth_style",
@@ -171,6 +175,7 @@ class TestBuildParser(unittest.TestCase):
         self.assertIsNone(args.user_url)
         self.assertIsNone(args.mode)
         self.assertIsNone(args.composite_choice)
+        self.assertIsNone(args.satellite_layer_mode)
         self.assertIsNone(args.hours_back)
         self.assertIsNone(args.interval_minutes)
         self.assertIsNone(args.fps)
@@ -189,6 +194,7 @@ class TestBuildParser(unittest.TestCase):
         self.assertIsNone(args.border_line_color)
         self.assertIsNone(args.border_line_width)
         self.assertIsNone(args.add_map_labels)
+        self.assertIsNone(args.map_label_size)
         self.assertIsNone(args.add_night_boundary)
         self.assertIsNone(args.add_crosshair)
         self.assertIsNone(args.zoom_earth_style)
@@ -227,6 +233,11 @@ class TestBuildParser(unittest.TestCase):
         args = parser.parse_args(["--chunk-size", "16MiB"])
         self.assertEqual(args.dask_chunk_size, "16MiB")
 
+    def test_parser_parses_satellite_layer(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--satellite-layer", "hd"])
+        self.assertEqual(args.satellite_layer_mode, "hd")
+
     def test_parser_rejects_invalid_chunk_size(self):
         parser = cli.build_parser()
         with self.assertRaises(SystemExit):
@@ -247,6 +258,7 @@ class TestBuildParser(unittest.TestCase):
             "--flat-max-lon", "180.0",
             "--flat-resolution-deg", "0.01",
             "--border-width", "1.5",
+            "--map-label-size", "18",
         ])
         self.assertEqual(args.hours_back, 12)
         self.assertEqual(args.interval_minutes, 10)
@@ -260,6 +272,7 @@ class TestBuildParser(unittest.TestCase):
         self.assertEqual(args.flat_max_lon, 180.0)
         self.assertEqual(args.flat_resolution_deg, 0.01)
         self.assertEqual(args.border_line_width, 1.5)
+        self.assertEqual(args.map_label_size, 18)
 
 
 class TestConfigFromArgs(unittest.TestCase):
@@ -275,6 +288,7 @@ class TestConfigFromArgs(unittest.TestCase):
             "--url", "http://example.com/test.dat",
             "--mode", "Timelapse",
             "--composite", "True Color Reproduction Image",
+            "--satellite-layer", "standard",
             "--hours-back", "6",
             "--interval-minutes", "30",
             "--fps", "10",
@@ -291,6 +305,7 @@ class TestConfigFromArgs(unittest.TestCase):
             "--border-color", "#ff0000",
             "--border-width", "2.0",
             "--map-labels", "yes",
+            "--map-label-size", "22",
             "--night-boundary", "yes",
             "--crosshair", "yes",
             "--zoom-earth-style", "yes",
@@ -308,6 +323,7 @@ class TestConfigFromArgs(unittest.TestCase):
         self.assertEqual(config.user_url, "http://example.com/test.dat")
         self.assertEqual(config.mode, "Timelapse")
         self.assertEqual(config.composite_choice, "True Color Reproduction Image")
+        self.assertEqual(config.satellite_layer_mode, "standard")
         self.assertEqual(config.hours_back, 6)
         self.assertEqual(config.interval_minutes, 30)
         self.assertEqual(config.fps, 10)
@@ -324,6 +340,7 @@ class TestConfigFromArgs(unittest.TestCase):
         self.assertEqual(config.border_line_color, "#ff0000")
         self.assertEqual(config.border_line_width, 2.0)
         self.assertTrue(config.add_map_labels)
+        self.assertEqual(config.map_label_size, 22)
         self.assertTrue(config.add_night_boundary)
         self.assertTrue(config.add_crosshair)
         self.assertTrue(config.zoom_earth_style)
@@ -336,6 +353,35 @@ class TestConfigFromArgs(unittest.TestCase):
         self.assertEqual(config.ram_limit_gb, 8.0)
         self.assertEqual(config.dask_chunk_size, "128MiB")
         self.assertEqual(config.dask_num_workers, 2)
+
+    def test_satellite_layer_hd_applies_flat_true_color_defaults(self):
+        namespace = cli.build_parser().parse_args([
+            "--satellite-layer", "hd",
+            "--composite", "B13 (Infrared Window)",
+            "--map-view", "native",
+            "--zoom-earth-style", "no",
+            "--night-fallback", "no",
+            "--map-labels", "no",
+            "--map-label-size", "24",
+            "--crosshair", "yes",
+            "--border-color", "green",
+            "--border-width", "2.5",
+        ])
+
+        config = cli.config_from_args(namespace)
+
+        self.assertEqual(config.satellite_layer_mode, "hd")
+        self.assertEqual(config.composite_choice, "True Color Reproduction Image")
+        self.assertEqual(config.map_view, "flat")
+        self.assertTrue(config.zoom_earth_style)
+        self.assertTrue(config.use_night_fallback)
+        self.assertEqual(config.night_fallback_mode, "hybrid")
+        self.assertTrue(config.add_border_lines)
+        self.assertTrue(config.add_map_labels)
+        self.assertEqual(config.map_label_size, 24)
+        self.assertFalse(config.add_crosshair)
+        self.assertEqual(config.border_line_color, "#00ff00")
+        self.assertEqual(config.border_line_width, 1.0)
 
     @mock.patch("himawari_cli.processor.validate_configuration")
     def test_raises_on_invalid_config(self, mock_validate):
@@ -367,6 +413,7 @@ class TestPrintConfig(unittest.TestCase):
         self.assertIn("URL:", output)
         self.assertIn("Mode:", output)
         self.assertIn("Composite/Band:", output)
+        self.assertIn("Satellite layer:", output)
         self.assertIn("Hours back:", output)
         self.assertIn("Interval minutes:", output)
         self.assertIn("FPS:", output)
@@ -383,6 +430,7 @@ class TestPrintConfig(unittest.TestCase):
         self.assertIn("Border lines:", output)
         self.assertIn("Border color/width:", output)
         self.assertIn("Map labels:", output)
+        self.assertIn("Map label size:", output)
         self.assertIn("Night boundary:", output)
         self.assertIn("Crosshair:", output)
         self.assertIn("Zoom Earth style:", output)
@@ -533,6 +581,7 @@ class TestEditBasicSettings(unittest.TestCase):
     @mock.patch("himawari_cli.prompt_choice", side_effect=[
         "Single Image",
         "B13 (Infrared Window)",
+        "standard",
         "png",
         "hybrid",
     ])
@@ -549,6 +598,7 @@ class TestEditBasicSettings(unittest.TestCase):
     @mock.patch("himawari_cli.prompt_choice", side_effect=[
         "Timelapse",
         "True Color Reproduction Image",
+        "standard",
         "png",
         "gif",
         "hybrid",
@@ -566,7 +616,7 @@ class TestEditBasicSettings(unittest.TestCase):
 
 
 class TestEditAdvancedSettings(unittest.TestCase):
-    @mock.patch("himawari_cli.prompt_int", side_effect=[2, 1])
+    @mock.patch("himawari_cli.prompt_int", side_effect=[2, 1, 20])
     @mock.patch("himawari_cli.prompt_choice", side_effect=[
         "64MiB",
         "native",
@@ -595,6 +645,7 @@ class TestEditAdvancedSettings(unittest.TestCase):
         self.assertTrue(result.add_border_lines)
         self.assertEqual(result.border_line_color, "#00ff00")
         self.assertEqual(result.border_line_width, 1.0)
+        self.assertEqual(result.map_label_size, 20)
         self.assertEqual(result.crosshair_type, "plus")
         self.assertEqual(result.crosshair_color, "#ff0077")
 
@@ -628,6 +679,24 @@ class TestRunProcessor(unittest.TestCase):
         config = h.default_config()
         outputs = cli.run_processor(config)
         self.assertEqual(outputs, [])
+
+    @mock.patch("himawari_cli.processor.time.monotonic", side_effect=[100.0, 110.0])
+    @mock.patch("himawari_cli.processor.validate_configuration")
+    def test_run_processor_prints_eta_for_numeric_progress(self, mock_validate, mock_monotonic):
+        config = h.default_config()
+
+        def run_side_effect(_config, progress=None, **_kwargs):
+            progress("Downloading B01", 0, 10)
+            progress("Downloaded B01", 2, 10)
+            return [Path("output.png")]
+
+        captured = io.StringIO()
+        with mock.patch("himawari_cli.processor.run", side_effect=run_side_effect), mock.patch("sys.stdout", captured):
+            outputs = cli.run_processor(config)
+
+        self.assertEqual(outputs, [Path("output.png")])
+        self.assertIn("[2/10] Downloaded B01 (ETA 40s)", captured.getvalue())
+        mock_validate.assert_called_once_with(config)
 
 
 class TestInteractiveMenu(unittest.TestCase):

@@ -65,6 +65,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help='Composite or band name, for example "True Color Reproduction Image" or "B13 (Infrared Window)".',
     )
+    parser.add_argument(
+        "--satellite-layer",
+        dest="satellite_layer_mode",
+        choices=processor.SATELLITE_LAYER_MODES,
+        default=None,
+        help="Satellite layer mode: standard keeps the configured URL, live resolves the latest NOAA scan, hd applies local Zoom Earth-style flat-map rendering.",
+    )
     parser.add_argument("--hours-back", type=int, default=None)
     parser.add_argument("--interval-minutes", type=int, default=None)
     parser.add_argument("--fps", type=int, default=None)
@@ -97,6 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--border-color", dest="border_line_color", default=None)
     parser.add_argument("--border-width", dest="border_line_width", type=float, default=None)
     parser.add_argument("--map-labels", dest="add_map_labels", type=parse_bool, default=None)
+    parser.add_argument("--map-label-size", type=int, default=None)
     parser.add_argument("--night-boundary", dest="add_night_boundary", type=parse_bool, default=None)
     parser.add_argument("--crosshair", dest="add_crosshair", type=parse_bool, default=None)
     parser.add_argument("--crosshair-type", choices=processor.CROSSHAIR_TYPES, default=None)
@@ -125,7 +133,7 @@ def config_from_args(args: argparse.Namespace) -> processor.ProcessorConfig:
         value = getattr(args, name, None)
         if value is not None:
             values[name] = value
-    config = processor.ProcessorConfig(**values)
+    config = processor.layer_defaults_config(processor.ProcessorConfig(**values))
     try:
         processor.validate_configuration(config)
         setup_errors = processor.setup_configuration_errors(config)
@@ -143,6 +151,7 @@ def print_config(config: processor.ProcessorConfig) -> None:
     print(f"URL:                {config.user_url}")
     print(f"Mode:               {config.mode}")
     print(f"Composite/Band:     {config.composite_choice}")
+    print(f"Satellite layer:    {config.satellite_layer_mode}")
     print(f"Hours back:         {config.hours_back}")
     print(f"Interval minutes:   {config.interval_minutes}")
     print(f"FPS:                {config.fps}")
@@ -166,6 +175,7 @@ def print_config(config: processor.ProcessorConfig) -> None:
     print(f"Border lines:       {yes_no(config.add_border_lines)}")
     print(f"Border color/width: {config.border_line_color} / {config.border_line_width}")
     print(f"Map labels:         {yes_no(config.add_map_labels)}")
+    print(f"Map label size:     {config.map_label_size}")
     print(f"Night boundary:     {yes_no(config.add_night_boundary)}")
     print(f"Crosshair:          {yes_no(config.add_crosshair)}")
     print(f"Crosshair style:    {config.crosshair_type} / {config.crosshair_color}")
@@ -251,6 +261,7 @@ def edit_basic_settings(config: processor.ProcessorConfig) -> processor.Processo
     values["user_url"] = prompt_text("Himawari URL", config.user_url)
     values["mode"] = prompt_choice("Output mode", config.mode, ("Single Image", "Timelapse"))
     values["composite_choice"] = prompt_choice("Composite / band", config.composite_choice, sorted(processor.COMPOSITE_BANDS))
+    values["satellite_layer_mode"] = prompt_choice("Satellite layer", config.satellite_layer_mode, processor.SATELLITE_LAYER_MODES)
     values["image_format"] = prompt_choice("Image format", config.image_format, ("png", "tif"))
     if values["mode"] == "Timelapse":
         values["hours_back"] = prompt_int("Hours back", config.hours_back, 1, 240)
@@ -289,6 +300,12 @@ def edit_advanced_settings(config: processor.ProcessorConfig) -> processor.Proce
     values["border_line_color"] = prompt_text("Border line color", config.border_line_color)
     values["border_line_width"] = prompt_float("Border line width", config.border_line_width, 0.25)
     values["add_map_labels"] = prompt_bool("Flat map labels", config.add_map_labels)
+    values["map_label_size"] = prompt_int(
+        "Flat map label size",
+        config.map_label_size,
+        processor.MAP_LABEL_SIZE_MIN,
+        processor.MAP_LABEL_SIZE_MAX,
+    )
     values["add_night_boundary"] = prompt_bool("Flat map night boundary", config.add_night_boundary)
     values["add_crosshair"] = prompt_bool("Flat map crosshair", config.add_crosshair)
     values["crosshair_type"] = prompt_choice("Crosshair type", config.crosshair_type, processor.CROSSHAIR_TYPES)
@@ -308,10 +325,13 @@ def run_environment_check() -> int:
 
 def run_processor(config: processor.ProcessorConfig) -> list[Path]:
     processor.validate_configuration(config)
+    eta_estimator = processor.ProgressEtaEstimator()
 
     def progress(message: str, current: int | None, total: int | None) -> None:
+        eta_text = eta_estimator.update(message, current, total)
         if current is not None and total:
-            print(f"[{current}/{total}] {message}")
+            suffix = f" ({eta_text})" if eta_text else ""
+            print(f"[{current}/{total}] {message}{suffix}")
         else:
             print(message)
 

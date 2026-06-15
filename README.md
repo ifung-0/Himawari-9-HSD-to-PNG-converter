@@ -93,7 +93,7 @@ python check_environment.py --auto
 checkenv.bat
 ```
 
-Expected current version: `2026.06.08.9`. If `--version` shows an older value,
+Expected current version: `2026.06.08.10`. If `--version` shows an older value,
 the machine is not running the latest update. If `--plain` reports a different
 Python than the one used to launch the GUI, use `run_gui.bat`, `run_cli.bat`,
 `runcli.bat`, `check_environment.bat`, or `checkenv.bat` so the same Python
@@ -123,9 +123,31 @@ available for a balanced true-color
 image, a quick B13 infrared check, and a lower-RAM B13 timelapse. Custom presets
 can save and reload your current settings without changing the locked safe
 presets.
+The `Satellite Layer` selector controls how the source scan and flat-map styling
+are chosen:
+
+- `standard` keeps the configured URL and rendering settings. Use it for manual
+  workflows, native round-disk output, single-band checks, or custom advanced
+  settings.
+- `live` resolves the latest available NOAA Himawari FLDK scan when processing
+  starts, then applies the flat-map true-color defaults. It is latest-at-run-start
+  satellite imagery, not continuous streaming.
+- `hd` keeps the selected/current scan URL and applies the stronger local
+  Zoom Earth-style flat-map rendering: brighter true color, chroma-speckle
+  cleanup, invalid limb/disk fill replacement, green borders, labels on, and
+  crosshair off.
+
+`live` and `hd` use Himawari satellite data only. They do not download external
+Zoom Earth, Google, OpenStreetMap, commercial map, radar, wind, or fire tiles.
 It also has optional coastline/country border overlays with a user-selected
 line color. The default border color is green, and the selected color is used
 for native and Zoom Earth-style flat maps.
+Flat map label text size is configurable in the GUI beside the `Labels` toggle
+and from the CLI with `--map-label-size`.
+In timelapse mode, `Image Format` controls the individual frame files
+(`.png` or `.tif`) and `Timelapse Format` controls the assembled animation
+(`.gif` or `.mp4`). If only one frame finishes successfully, the app now keeps
+that single frame image instead of creating a one-frame GIF/MP4.
 Overlay rendering uses Satpy/pycoast, so install requirements first and place
 pycoast-compatible coastline/border shapefiles under the project `overlays/`
 folder if your environment does not already provide them. `Check Overlay Setup`
@@ -134,7 +156,9 @@ processing is blocked when border lines are enabled but those files are missing.
 
 The progress bar advances while segment downloads and timelapse frame assembly
 run, the phase/status strip summarizes the current stage, and the live log panel
-shows memory checkpoints and processing details.
+shows memory checkpoints and processing details. During phases with numeric
+progress, the GUI and CLI also show an estimated time remaining so you can leave
+long downloads or timelapse builds running and come back later.
 In Advanced > Performance, `Safe Mode` and `Best Performance` inspect current
 CPU/RAM headroom and update worker, chunk-size, and RAM-limit settings without
 starting a run.
@@ -153,9 +177,10 @@ pixels as the image and blend the low-confidence geostationary limb into a
 generated rectangular ocean/land basemap, using the local GSHHS overlay data
 for land fill when it is available. They can also add user-colored border
 lines, static country/ocean labels, a high-contrast approximate night boundary,
-and a configurable center crosshair, then apply a brighter true-color contrast/saturation lift so
-true-color flat maps do not look washed out. Single-band products keep their
-normal band rendering.
+and a configurable center crosshair. True-color flat maps use a direct low-RAM
+night check, richer contrast/saturation, chroma-speckle cleanup, and subtler
+selected-color overlays so borders and crosshairs do not look like data noise.
+Single-band products keep their normal band rendering.
 Radar, wind animation, heat spots, active fires, tropical systems, and
 temperatures are shown as unavailable because this app does not include those
 external data feeds. Native disk output remains the low-RAM default.
@@ -194,10 +219,15 @@ flags for repeatable commands:
 ```powershell
 python himawari_cli.py --run --composite "B13 (Infrared Window)" --mode "Single Image"
 python himawari_cli.py --run --composite "True Color Reproduction Image" --night-fallback-mode hybrid
+python himawari_cli.py --run --satellite-layer live
+python himawari_cli.py --run --satellite-layer hd
 python himawari_cli.py --run --map-view flat --flat-min-lat -60 --flat-max-lat 60 --flat-min-lon 80 --flat-max-lon 200 --flat-resolution-deg 0.05
-python himawari_cli.py --run --map-view flat --zoom-earth-style yes --map-labels yes --night-boundary yes --crosshair yes --crosshair-type plus --crosshair-color "#ff0077"
+python himawari_cli.py --run --map-view flat --zoom-earth-style yes --map-labels yes --map-label-size 20 --night-boundary yes --crosshair yes --crosshair-type plus --crosshair-color "#ff0077"
 python himawari_cli.py --run --gpu-acceleration yes --composite "True Color Reproduction Image"
 ```
+
+Use `--satellite-layer standard`, `--satellite-layer live`, or
+`--satellite-layer hd` from the CLI for the same layer modes shown in the GUI.
 
 If you enable GPU acceleration from the CLI, choose one of the two supported
 true-color products. For B13, B11/SO2, and other single-band or specialty RGB
@@ -213,10 +243,10 @@ python himawari_cli.py --version
 python check_environment.py --plain
 ```
 
-Current fixed build: `2026.06.08.9`. Processing logs should include:
+Current fixed build: `2026.06.08.10`. Processing logs should include:
 
 ```text
-App version: 2026.06.08.9
+App version: 2026.06.08.10
 ```
 
 This build accepts Himawari-8 and Himawari-9 raw HSD file names and NOAA S3 URLs.
@@ -224,8 +254,13 @@ It also avoids the high-memory KD-tree path for custom true-color flat maps.
 Flat true-color outputs now force the direct low-RAM RGB writer instead of Satpy's
 normal composite PNG writer.
 It samples the Himawari source grid into Web Mercator tiles directly, then
-keeps the existing Zoom Earth-style enhancement, basemap blend, borders, labels,
-night boundary, and crosshair overlays.
+keeps the existing Zoom Earth-style basemap blend, borders, labels, night
+boundary, and crosshair overlays. The direct flat-map night check avoids the
+old high-memory visible-band reprojection path before hybrid IR blending.
+For direct true-color flat maps, invalid pixels now require both valid
+geostationary geometry and real sampled-band signal before they remain satellite
+data, which prevents disk/limb fill pixels from becoming random red or green
+artifacts in the rectangular map.
 
 For official-looking true color and true color reproduction, keep the
 lower-quality fallback checkbox off and make sure `pyspectral` is installed in
@@ -247,8 +282,10 @@ GUI settings are saved in `himawari_gui_settings.json` and loaded on startup.
 Recent run history is saved in `himawari_recent_runs.json`, and custom presets
 are saved in `himawari_custom_presets.json`; all three files are ignored by git
 because they contain local paths and preferences. Persistent processing logs
-are written under `%LOCALAPPDATA%\Himawari9LowRamProcessor\logs`. Outputs are
-written to `outputs/`. Downloaded `.DAT` files are cached under `temp/` for retry reuse.
+are written under `%LOCALAPPDATA%\Himawari9LowRamProcessor\logs`; use the GUI
+`Copy Log` button to copy the latest saved run log, or the visible log panel
+when a saved run log is not available yet. Outputs are written to `outputs/`.
+Downloaded `.DAT` files are cached under `temp/` for retry reuse.
 Incomplete `.part` files are cleaned after each frame. Timelapse frame images
 are written under `outputs/frames/<run_id>/`, with a manifest under
 `outputs/manifests/`. Retrying the same timelapse automatically reuses completed
@@ -297,7 +334,7 @@ by the checker when installing or launching the app.
 Symptom: a friend says the fix is installed, but logs do not show:
 
 ```text
-App version: 2026.06.08.9
+App version: 2026.06.08.10
 ```
 
 Likely cause: their folder is still on an old commit, or they downloaded a ZIP
@@ -514,9 +551,14 @@ lives in OneDrive.
 
 Symptom: processing ends but no GIF/MP4 is created.
 
-Likely cause: all frames failed or were unavailable. Common causes are invalid
-timestamps, missing NOAA segments, or unsupported composites in the active
-Satpy environment.
+Likely cause: all frames failed or only one frame finished. Common causes are
+invalid timestamps, missing NOAA segments, network/DNS failures, or unsupported
+composites in the active Satpy environment.
+
+If one frame succeeds, the output is intentionally the frame image
+(`Image Format`, usually PNG) instead of a one-frame animation
+(`Timelapse Format`, GIF/MP4). Increase `Hours Back`, reduce `Interval`, or
+rerun after network errors if you need an actual animation.
 
 Full-disk 500 m true-color timelapses are intentionally rejected when the app
 would need GeoTIFF frame output. GIF/MP4 assembly has to read every finished

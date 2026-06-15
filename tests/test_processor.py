@@ -1021,6 +1021,33 @@ class ProcessorTests(unittest.TestCase):
         self.assertTrue(result)
         self.assertTrue(any("using night fallback" in message for message in captured.output))
 
+    def test_flat_map_night_check_uses_direct_sampling_without_resample(self):
+        scene = mock.MagicMock()
+        band_data = mock.Mock()
+        scene.__getitem__.return_value = band_data
+        area = mock.Mock(width=4096, height=4096, area_extent=(0, 0, 1, 1), crs={"proj": "longlat"})
+        sample = xr.DataArray(da.ones((10, 10), chunks=(5, 5)) * 20.0, dims=("y", "x"))
+
+        with mock.patch("himawari_lowram_processor.direct_flat_map_sample_band", return_value=sample) as sampler:
+            result = h.is_visible_dark(scene, area, direct_flat_map=True)
+
+        self.assertFalse(result)
+        sampler.assert_called_once()
+        self.assertIs(sampler.call_args.args[0], band_data)
+        scene.resample.assert_not_called()
+
+    def test_flat_map_night_check_failure_does_not_force_whole_frame_night(self):
+        scene = mock.MagicMock()
+        scene.__getitem__.return_value = mock.Mock()
+        area = mock.Mock(width=4096, height=4096, area_extent=(0, 0, 1, 1), crs={"proj": "longlat"})
+
+        with mock.patch("himawari_lowram_processor.direct_flat_map_sample_band", side_effect=MemoryError("low ram")):
+            with self.assertLogs(h.LOG, level="WARNING") as captured:
+                result = h.is_visible_dark(scene, area, direct_flat_map=True)
+
+        self.assertFalse(result)
+        self.assertTrue(any("pixel-level hybrid" in message for message in captured.output))
+
     def test_output_filename(self):
         info = h.parse_url(h.USER_URL)
         dt = h.datetime.strptime(info.timestamp, "%Y%m%d_%H%M")
@@ -1120,6 +1147,48 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(h.phase_from_progress_message("Downloading B13"), "Downloading")
         self.assertEqual(h.phase_from_progress_message("Resampling"), "Resampling")
         self.assertIn("2/10", h.format_phase_status("Added frame 2/10", 2, 10))
+        self.assertIn("ETA 40s", h.format_phase_status("Added frame 2/10", 2, 10, eta_text="ETA 40s"))
+
+    def test_eta_duration_formats_compactly(self):
+        self.assertEqual(h.format_eta_duration(45), "45s")
+        self.assertEqual(h.format_eta_duration(125), "2m 05s")
+        self.assertEqual(h.format_eta_duration(3661), "1h 01m")
+        self.assertEqual(h.format_eta_duration(90000), "1d 1h")
+
+    def test_progress_eta_estimator_predicts_remaining_time(self):
+        ticks = iter([100.0, 110.0])
+        estimator = h.ProgressEtaEstimator(clock=lambda: next(ticks), min_elapsed_seconds=0.0)
+
+        self.assertIsNone(estimator.update("Downloading B01", 0, 10))
+        self.assertEqual(estimator.update("Downloaded B01", 2, 10), "ETA 40s")
+
+    def test_progress_eta_estimator_resets_when_progress_restarts(self):
+        ticks = iter([100.0, 110.0, 120.0, 130.0])
+        estimator = h.ProgressEtaEstimator(clock=lambda: next(ticks), min_elapsed_seconds=0.0)
+
+        self.assertIsNone(estimator.update("Downloading B01", 0, 10))
+        self.assertEqual(estimator.update("Downloaded B01", 2, 10), "ETA 40s")
+        self.assertIsNone(estimator.update("Downloading B01", 1, 10))
+        self.assertEqual(estimator.update("Downloaded B01", 2, 10), "ETA 40s")
+
+    def test_gui_progress_polling_shows_eta(self):
+        ticks = iter([100.0, 110.0])
+        app = object.__new__(h.HimawariProcessorApp)
+        app.root = FakeScheduledRoot()
+        app.messages = h.queue.Queue()
+        app.status_var = FakeVar("")
+        app.phase_var = FakeVar("")
+        app.progress_var = FakeVar(0)
+        app.progress_eta_estimator = h.ProgressEtaEstimator(clock=lambda: next(ticks), min_elapsed_seconds=0.0)
+
+        app.messages.put(("progress", ("Downloading B01", 0, 10)))
+        app.messages.put(("progress", ("Downloaded B01", 2, 10)))
+
+        h.HimawariProcessorApp._poll_messages(app)
+
+        self.assertEqual(app.status_var.get(), "Downloaded B01")
+        self.assertIn("ETA 40s", app.phase_var.get())
+        self.assertEqual(app.progress_var.get(), 20.0)
 
     def test_custom_composites_stay_lazy(self):
         y = [0, 1, 2, 3]
@@ -1253,6 +1322,7 @@ class ProcessorTests(unittest.TestCase):
     def test_config_validation(self):
         config = h.default_config()
         h.validate_configuration(config)
+        self.assertEqual(config.satellite_layer_mode, "standard")
 
         config.download_workers = 0
         with self.assertRaises(ValueError):
@@ -1284,6 +1354,7 @@ class ProcessorTests(unittest.TestCase):
             ("user_url", "   ", "Himawari URL"),
             ("mode", "Movie", "MODE"),
             ("composite_choice", "Not a product", "Unsupported"),
+            ("satellite_layer_mode", "cinematic", "Satellite layer"),
             ("interval_minutes", 0, "INTERVAL_MINUTES"),
             ("hours_back", 0, "HOURS_BACK"),
             ("fps", 0, "FPS"),
@@ -1295,6 +1366,7 @@ class ProcessorTests(unittest.TestCase):
             ("resampler", "bilinear", "RESAMPLER"),
             ("ram_limit_gb", float("nan"), "RAM limit"),
             ("max_safe_png_pixels", 0, "Max safe PNG pixels"),
+            ("map_label_size", 0, "Map label size"),
         ]
         for field, value, message in bad_values:
             with self.subTest(field=field):
@@ -1302,6 +1374,37 @@ class ProcessorTests(unittest.TestCase):
                 setattr(config, field, value)
                 with self.assertRaisesRegex(ValueError, message):
                     h.validate_configuration(config)
+
+    def test_layer_defaults_config_applies_live_hd_flat_true_color_defaults(self):
+        for mode in ("live", "hd"):
+            with self.subTest(mode=mode):
+                config = h.default_config()
+                config.satellite_layer_mode = mode
+                config.composite_choice = "B13 (Infrared Window)"
+                config.map_view = "native"
+                config.zoom_earth_style = False
+                config.use_night_fallback = False
+                config.night_fallback_mode = "whole_frame_ir"
+                config.add_map_labels = False
+                config.map_label_size = 24
+                config.add_crosshair = True
+                config.border_line_color = "green"
+                config.border_line_width = 2.5
+
+                effective = h.layer_defaults_config(config)
+
+                self.assertEqual(effective.satellite_layer_mode, mode)
+                self.assertEqual(effective.composite_choice, "True Color Reproduction Image")
+                self.assertEqual(effective.map_view, "flat")
+                self.assertTrue(effective.zoom_earth_style)
+                self.assertTrue(effective.use_night_fallback)
+                self.assertEqual(effective.night_fallback_mode, "hybrid")
+                self.assertTrue(effective.add_border_lines)
+                self.assertTrue(effective.add_map_labels)
+                self.assertEqual(effective.map_label_size, 24)
+                self.assertFalse(effective.add_crosshair)
+                self.assertEqual(effective.border_line_color, "#00ff00")
+                self.assertEqual(effective.border_line_width, 1.0)
 
     def test_setup_status_reports_non_numeric_values_without_crashing(self):
         config = h.default_config()
@@ -1716,6 +1819,31 @@ class ProcessorTests(unittest.TestCase):
         self.assertTrue(h.np.array_equal(result, expected))
         self.assertEqual(sampled.attrs["area"], target_area)
 
+    def test_flat_map_geometry_validity_mask_uses_source_coverage_without_band_reads(self):
+        source_area = AreaDefinition(
+            "source",
+            "source",
+            "latlon",
+            {"proj": "longlat", "datum": "WGS84"},
+            4,
+            4,
+            (100.0, -10.0, 104.0, -6.0),
+        )
+        target_area = AreaDefinition(
+            "target",
+            "target",
+            "latlon",
+            {"proj": "longlat", "datum": "WGS84"},
+            4,
+            2,
+            (100.0, -9.0, 108.0, -7.0),
+        )
+
+        mask = h.flat_map_geometry_validity_mask(source_area, target_area, chunk_size=2)
+
+        expected = h.np.asarray([[True, True, False, False], [True, True, False, False]], dtype=bool)
+        self.assertTrue(h.np.array_equal(mask, expected))
+
     def test_timelapse_frame_size_guard_blocks_large_targets(self):
         config = h.default_config()
         config.mode = "Timelapse"
@@ -1882,6 +2010,7 @@ class ProcessorTests(unittest.TestCase):
             "flat_min_lon",
             "flat_max_lon",
             "flat_resolution_deg",
+            "satellite_layer_mode",
             "crosshair_type",
             "crosshair_color",
         ):
@@ -1901,6 +2030,7 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(loaded_config.flat_min_lon, h.FLAT_MIN_LON)
         self.assertEqual(loaded_config.flat_max_lon, h.FLAT_MAX_LON)
         self.assertEqual(loaded_config.flat_resolution_deg, h.FLAT_RESOLUTION_DEG)
+        self.assertEqual(loaded_config.satellite_layer_mode, h.SATELLITE_LAYER_MODE)
         self.assertEqual(loaded_config.crosshair_type, h.CROSSHAIR_TYPE)
         self.assertEqual(loaded_config.crosshair_color, h.CROSSHAIR_COLOR)
 
@@ -2259,6 +2389,7 @@ class ProcessorTests(unittest.TestCase):
     def test_new_map_overlay_defaults_are_off_and_old_settings_load(self):
         config = h.default_config()
         self.assertFalse(config.add_map_labels)
+        self.assertEqual(config.map_label_size, h.MAP_LABEL_SIZE)
         self.assertFalse(config.add_night_boundary)
         self.assertFalse(config.add_crosshair)
         self.assertEqual(config.crosshair_type, h.CROSSHAIR_TYPE)
@@ -2270,6 +2401,7 @@ class ProcessorTests(unittest.TestCase):
             data = h.serialize_gui_settings(h.default_config(), h.Path(tmp_dir) / "out", h.Path(tmp_dir) / "temp")
             for key in (
                 "add_map_labels",
+                "map_label_size",
                 "add_night_boundary",
                 "add_crosshair",
                 "crosshair_type",
@@ -2284,6 +2416,7 @@ class ProcessorTests(unittest.TestCase):
         self.assertIsNotNone(loaded)
         loaded_config = loaded[0]
         self.assertFalse(loaded_config.add_map_labels)
+        self.assertEqual(loaded_config.map_label_size, h.MAP_LABEL_SIZE)
         self.assertFalse(loaded_config.add_night_boundary)
         self.assertFalse(loaded_config.add_crosshair)
         self.assertEqual(loaded_config.crosshair_type, h.CROSSHAIR_TYPE)
@@ -2295,6 +2428,21 @@ class ProcessorTests(unittest.TestCase):
 
         self.assertIn("NEW ZEALAND", labels)
         self.assertIn("West Pacific Ocean", labels)
+
+    def test_zoom_earth_labels_scale_with_configured_size(self):
+        from PIL import Image
+
+        area = AreaDefinition("flat", "flat", "flat", h.WEB_MERCATOR_PROJ4, 180, 120, h.web_mercator_extent(-55, 55, 80, 200))
+        background = h.np.asarray((12, 18, 26), dtype=h.np.uint8)
+
+        def changed_pixels(label_size):
+            image = Image.new("RGB", (180, 120), tuple(int(value) for value in background))
+            h.draw_zoom_earth_labels(image, area, label_size)
+            pixels = h.np.asarray(image.convert("RGB"))
+            changed = h.np.any(pixels != background[None, None, :], axis=2)
+            return int(changed.sum())
+
+        self.assertGreater(changed_pixels(24), changed_pixels(8) * 1.8)
 
     def test_flat_map_visual_style_requires_flat_map(self):
         config = h.default_config()
@@ -2360,9 +2508,135 @@ class ProcessorTests(unittest.TestCase):
 
         before_luminance, before_saturation = luminance_and_saturation(before)
         after_luminance, after_saturation = luminance_and_saturation(after)
+        before_values = h.np.asarray(before, dtype=h.np.float32)
+        after_values = h.np.asarray(after, dtype=h.np.float32)
+        before_blue_excess = h.np.maximum(
+            0.0,
+            before_values[:, :, 2] - h.np.maximum(before_values[:, :, 0], before_values[:, :, 1]),
+        ).mean()
+        after_blue_excess = h.np.maximum(
+            0.0,
+            after_values[:, :, 2] - h.np.maximum(after_values[:, :, 0], after_values[:, :, 1]),
+        ).mean()
 
         self.assertGreater(after_luminance, before_luminance + 0.05)
         self.assertGreater(after_saturation, before_saturation + 0.03)
+        self.assertLess(float(after_blue_excess), float(before_blue_excess))
+
+    def test_hd_zoom_earth_enhancement_brightens_pale_image_without_clipping_clouds(self):
+        from PIL import Image
+
+        pixels = h.np.zeros((36, 36, 3), dtype=h.np.uint8)
+        pixels[:, :] = (62, 72, 86)
+        pixels[8:28, 8:28] = (112, 100, 76)
+        pixels[2:10, 24:34] = (228, 232, 236)
+        before = Image.fromarray(pixels, mode="RGB")
+
+        after = h.apply_zoom_earth_true_color_enhancement(before, hd=True).convert("RGB")
+
+        before_values = h.np.asarray(before, dtype=h.np.float32)
+        after_values = h.np.asarray(after, dtype=h.np.float32)
+        before_luminance = (0.2126 * before_values[:, :, 0] + 0.7152 * before_values[:, :, 1] + 0.0722 * before_values[:, :, 2]).mean()
+        after_luminance = (0.2126 * after_values[:, :, 0] + 0.7152 * after_values[:, :, 1] + 0.0722 * after_values[:, :, 2]).mean()
+
+        self.assertGreater(float(after_luminance), float(before_luminance) + 18.0)
+        self.assertLessEqual(int(after_values[2:10, 24:34].max()), 254)
+
+    def test_true_color_chroma_speckle_cleanup_removes_isolated_pixels(self):
+        from PIL import Image
+
+        pixels = h.np.zeros((16, 16, 3), dtype=h.np.uint8)
+        pixels[:, :] = (70, 82, 96)
+        pixels[3, 3] = (245, 10, 12)
+        pixels[4, 10] = (5, 240, 30)
+        pixels[9:14, 9:14] = (35, 172, 55)
+        image = Image.fromarray(pixels, mode="RGB")
+
+        h.cleanup_true_color_chroma_speckles(image)
+        cleaned = h.np.asarray(image.convert("RGB"))
+
+        self.assertFalse(h.np.array_equal(cleaned[3, 3], pixels[3, 3]))
+        self.assertFalse(h.np.array_equal(cleaned[4, 10], pixels[4, 10]))
+        preserved_green = (cleaned[9:14, 9:14, 1] > 145) & (cleaned[9:14, 9:14, 1] > cleaned[9:14, 9:14, 0] + 50)
+        self.assertGreaterEqual(int(preserved_green.sum()), 20)
+
+    def test_true_color_chroma_speckle_cleanup_removes_impossible_green_patch(self):
+        from PIL import Image
+
+        pixels = h.np.zeros((20, 20, 3), dtype=h.np.uint8)
+        pixels[:, :] = (0, 0, 28)
+        pixels[5:11, 5:11] = (0, 255, 0)
+        image = Image.fromarray(pixels, mode="RGB")
+
+        h.cleanup_true_color_chroma_speckles(image)
+        cleaned = h.np.asarray(image.convert("RGB"))
+
+        exact_green = h.np.all(cleaned == h.np.asarray((0, 255, 0), dtype=h.np.uint8), axis=2)
+        self.assertEqual(int(exact_green.sum()), 0)
+        self.assertTrue(h.np.all(cleaned[5:11, 5:11, 2] >= 28))
+
+    def test_aggressive_true_color_cleanup_removes_red_clusters_on_ocean(self):
+        from PIL import Image
+
+        pixels = h.np.zeros((36, 36, 3), dtype=h.np.uint8)
+        pixels[:, :] = (42, 68, 102)
+        pixels[8:13, 8:13] = (172, 18, 42)
+        pixels[22, 26] = (240, 8, 10)
+        image = Image.fromarray(pixels, mode="RGB")
+
+        h.cleanup_true_color_chroma_speckles(image, aggressive=True)
+        cleaned = h.np.asarray(image.convert("RGB"))
+
+        red_artifacts = h.aggressive_true_color_artifact_mask(cleaned)
+        self.assertEqual(int(red_artifacts.sum()), 0)
+        self.assertLess(int(cleaned[10, 10, 0]), 120)
+        self.assertLess(int(cleaned[22, 26, 0]), 120)
+
+    def test_aggressive_true_color_cleanup_preserves_reddish_land(self):
+        from PIL import Image
+
+        pixels = h.np.zeros((40, 40, 3), dtype=h.np.uint8)
+        pixels[:, :] = (52, 72, 96)
+        pixels[8:32, 8:32] = (138, 88, 48)
+        image = Image.fromarray(pixels, mode="RGB")
+
+        h.cleanup_true_color_chroma_speckles(image, aggressive=True)
+        cleaned = h.np.asarray(image.convert("RGB"))
+
+        self.assertTrue(h.np.allclose(cleaned[8:32, 8:32], pixels[8:32, 8:32], atol=2))
+
+    def test_flat_map_true_color_cleanup_preserves_overlays_drawn_after_cleanup(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "styled.png"
+            pixels = h.np.zeros((80, 100, 3), dtype=h.np.uint8)
+            pixels[:, :] = (55, 78, 105)
+            pixels[20:25, 20:25] = (178, 15, 34)
+            Image.fromarray(pixels, mode="RGB").save(path)
+            area = AreaDefinition("flat", "flat", "flat", h.WEB_MERCATOR_PROJ4, 100, 80, h.web_mercator_extent(-30, 30, 100, 150))
+            config = h.default_config()
+            config.map_view = "flat"
+            config.zoom_earth_style = True
+            config.add_crosshair = True
+            config.crosshair_color = "#00ff00"
+            config.crosshair_type = "plus"
+
+            h.apply_flat_map_visual_overlays(
+                path,
+                area,
+                config,
+                h.datetime(2024, 7, 25, 4, 0),
+                "True Color Reproduction Image",
+                valid_mask=h.np.ones((80, 100), dtype=bool),
+            )
+            with Image.open(path) as image:
+                cleaned = h.np.asarray(image.convert("RGB"))
+
+        red_artifacts = h.aggressive_true_color_artifact_mask(cleaned)
+        green_overlay = (cleaned[:, :, 1] > 160) & (cleaned[:, :, 0] < 120) & (cleaned[:, :, 2] < 120)
+        self.assertLess(int(red_artifacts.sum()), 5)
+        self.assertGreater(int(green_overlay.sum()), 0)
 
     def test_flat_map_validity_mask_rejects_zero_source_fill(self):
         area = AreaDefinition("flat", "flat", "flat", h.WEB_MERCATOR_PROJ4, 3, 2, h.web_mercator_extent(-10, 10, 100, 103))
@@ -2383,6 +2657,15 @@ class ProcessorTests(unittest.TestCase):
         mask = h.flat_map_validity_mask_from_scene(scene, ("B01", "B13"), area)
 
         expected = h.np.asarray([[True, False, False], [True, True, False]], dtype=bool)
+        self.assertTrue(h.np.array_equal(mask, expected))
+
+    def test_combined_validity_mask_requires_geometry_and_sampled_signal(self):
+        geometry = h.np.asarray([[True, True, False], [True, True, True]], dtype=bool)
+        sampled = h.np.asarray([[True, False, True], [True, False, True]], dtype=bool)
+
+        mask = h.combine_validity_masks(geometry, sampled)
+
+        expected = h.np.asarray([[True, False, False], [True, False, True]], dtype=bool)
         self.assertTrue(h.np.array_equal(mask, expected))
 
     def test_flat_map_visual_overlays_replace_edge_limb_with_rectangular_basemap(self):
@@ -2475,7 +2758,7 @@ class ProcessorTests(unittest.TestCase):
         center_delta = h.np.abs(styled[20:40, 25:55, :].astype(int) - basemap[20:40, 25:55, :].astype(int)).mean()
         self.assertGreater(float(center_delta), 30.0)
 
-    def test_flat_map_valid_mask_prevents_basemap_blend_over_valid_satellite_pixels(self):
+    def test_flat_map_valid_mask_still_removes_edge_connected_limb_artifacts(self):
         from PIL import Image
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2503,7 +2786,74 @@ class ProcessorTests(unittest.TestCase):
             basemap = h.np.asarray(h.build_flat_map_basemap_image(area).convert("RGB"))
 
         right_delta = h.np.abs(styled[:, -1, :].astype(int) - basemap[:, -1, :].astype(int)).mean()
-        self.assertGreater(float(right_delta), 20.0)
+        self.assertLessEqual(float(right_delta), 1.0)
+
+    def test_flat_map_visual_overlays_replace_blue_washed_limb_with_basemap(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "blue-washed-limb.png"
+            pixels = h.np.zeros((80, 100, 3), dtype=h.np.uint8)
+            pixels[:, :] = (88, 105, 126)
+            pixels[:, -14:] = (178, 181, 184)
+            pixels[:, -1:] = (28, 46, 118)
+            pixels[30:44, 36:54] = (224, 226, 230)
+            Image.fromarray(pixels, mode="RGB").save(path)
+            area = AreaDefinition("flat", "flat", "flat", h.WEB_MERCATOR_PROJ4, 100, 80, h.web_mercator_extent(-30, 30, 100, 150))
+            config = h.default_config()
+            config.map_view = "flat"
+            config.zoom_earth_style = True
+            mask = h.np.ones((80, 100), dtype=bool)
+
+            h.apply_flat_map_visual_overlays(
+                path,
+                area,
+                config,
+                h.datetime(2024, 7, 25, 4, 0),
+                "True Color Reproduction Image",
+                valid_mask=mask,
+            )
+            with Image.open(path) as image:
+                styled = h.np.asarray(image.convert("RGB"))
+            basemap = h.np.asarray(h.build_flat_map_basemap_image(area).convert("RGB"))
+
+        right_delta = h.np.abs(styled[:, -1, :].astype(int) - basemap[:, -1, :].astype(int)).mean()
+        center_delta = h.np.abs(styled[30:44, 36:54, :].astype(int) - basemap[30:44, 36:54, :].astype(int)).mean()
+        self.assertLessEqual(float(right_delta), 1.0)
+        self.assertGreater(float(center_delta), 50.0)
+
+    def test_flat_map_visual_overlays_replace_gray_limb_without_wiping_central_cloud(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = h.Path(tmp_dir) / "gray-limb.png"
+            pixels = h.np.zeros((80, 100, 3), dtype=h.np.uint8)
+            pixels[:, :] = (88, 108, 128)
+            pixels[:, -16:] = (128, 130, 132)
+            pixels[30:44, 36:54] = (224, 226, 230)
+            Image.fromarray(pixels, mode="RGB").save(path)
+            area = AreaDefinition("flat", "flat", "flat", h.WEB_MERCATOR_PROJ4, 100, 80, h.web_mercator_extent(-30, 30, 100, 150))
+            config = h.default_config()
+            config.map_view = "flat"
+            config.zoom_earth_style = True
+            mask = h.np.ones((80, 100), dtype=bool)
+
+            h.apply_flat_map_visual_overlays(
+                path,
+                area,
+                config,
+                h.datetime(2024, 7, 25, 4, 0),
+                "True Color Reproduction Image",
+                valid_mask=mask,
+            )
+            with Image.open(path) as image:
+                styled = h.np.asarray(image.convert("RGB"))
+            basemap = h.np.asarray(h.build_flat_map_basemap_image(area).convert("RGB"))
+
+        edge_delta = h.np.abs(styled[:, -1, :].astype(int) - basemap[:, -1, :].astype(int)).mean()
+        center_delta = h.np.abs(styled[30:44, 36:54, :].astype(int) - basemap[30:44, 36:54, :].astype(int)).mean()
+        self.assertLessEqual(float(edge_delta), 1.0)
+        self.assertGreater(float(center_delta), 50.0)
 
     def test_flat_map_visual_overlays_replace_invalid_true_color_pixels_with_basemap(self):
         from PIL import Image
@@ -2766,6 +3116,44 @@ class ProcessorTests(unittest.TestCase):
 
         mock_overlay.assert_called_once()
         self.assertEqual(mock_overlay.call_args.args[2]["color"], (0, 255, 0))
+        self.assertEqual(mock_overlay.call_args.kwargs["opacity"], h.FLAT_MAP_ZOOM_OVERLAY_OPACITY)
+
+    @mock.patch("himawari_lowram_processor.direct_overlay_writer")
+    def test_zoom_earth_flat_border_uses_subtle_selected_color_layer(self, mock_writer_class):
+        from PIL import Image, ImageDraw
+
+        image = Image.new("RGBA", (10, 10), (20, 20, 20, 255))
+        area = AreaDefinition("flat", "flat", "flat", h.WEB_MERCATOR_PROJ4, 10, 10, h.web_mercator_extent(-10, 10, 100, 110))
+        overlay = {
+            "coast_dir": str(h.PROJECT_DIR / "overlays"),
+            "color": (217, 38, 38),
+            "width": 1.0,
+            "level_coast": 1,
+            "level_borders": 1,
+            "resolution": "l",
+        }
+        valid_mask = h.np.ones((10, 10), dtype=bool)
+        valid_mask[0, 0] = False
+        writer = mock.Mock()
+
+        def draw_line(target, *_args, outline=None, **_kwargs):
+            ImageDraw.Draw(target, "RGBA").line((0, 0, 9, 0), fill=outline, width=1)
+
+        writer.add_coastlines.side_effect = draw_line
+        mock_writer_class.return_value = writer
+
+        h.direct_overlay_to_image(
+            image,
+            area,
+            overlay,
+            opacity=h.FLAT_MAP_ZOOM_OVERLAY_OPACITY,
+            valid_mask=valid_mask,
+        )
+        pixels = h.np.asarray(image.convert("RGB"))
+
+        self.assertTrue(h.np.array_equal(pixels[0, 0], h.np.asarray((20, 20, 20), dtype=h.np.uint8)))
+        self.assertGreater(int(pixels[0, 1, 0]), 20)
+        self.assertLess(int(pixels[0, 1, 0]), 217)
 
     def test_flat_map_visual_style_draws_configured_crosshair(self):
         from PIL import Image
@@ -3198,8 +3586,14 @@ class ProcessorTests(unittest.TestCase):
     @mock.patch("himawari_lowram_processor.build_gpu_custom_composite")
     @mock.patch("himawari_lowram_processor.resample_scene_low_ram")
     @mock.patch("himawari_lowram_processor.direct_flat_map_sample_scene")
+    @mock.patch("himawari_lowram_processor.flat_map_geometry_validity_mask_from_scene")
+    @mock.patch("himawari_lowram_processor.flat_map_validity_mask_from_scene")
+    @mock.patch("himawari_lowram_processor.apply_flat_map_visual_overlays")
     def test_gpu_flat_true_color_png_uses_direct_sampler_and_direct_writer(
         self,
+        mock_style,
+        mock_data_mask,
+        mock_geometry_mask,
         mock_direct_sample,
         mock_resample,
         mock_build_gpu,
@@ -3224,11 +3618,15 @@ class ProcessorTests(unittest.TestCase):
         scene = mock.MagicMock()
         sampled = mock.MagicMock()
         mock_direct_sample.return_value = sampled
+        mock_geometry_mask.return_value = h.np.ones((2, 2), dtype=bool)
+        mock_data_mask.return_value = h.np.asarray([[True, False], [True, True]], dtype=bool)
         with mock.patch("himawari_lowram_processor.build_custom_composite", return_value=("gpu_rgb", rgb)) as mock_build_cpu:
             output = h.Path("out.png")
             mock_write_png.return_value = output
+            mock_style.return_value = output
             config = h.default_config()
             config.map_view = "flat"
+            config.zoom_earth_style = True
             config.gpu_acceleration = True
             config.use_night_fallback = False
 
@@ -3249,6 +3647,9 @@ class ProcessorTests(unittest.TestCase):
         mock_build_gpu.assert_not_called()
         mock_build_cpu.assert_called_once_with(sampled, "True Color Reproduction Image", False, config)
         mock_write_png.assert_called_once()
+        mock_geometry_mask.assert_called_once_with(scene, ("B01", "B02", "B03", "B04"), area)
+        mock_data_mask.assert_called_once_with(sampled, ("B01", "B02", "B03", "B04"), area)
+        self.assertTrue(h.np.array_equal(mock_style.call_args.kwargs["valid_mask"], mock_data_mask.return_value))
         self.assertTrue(h.is_rgb_dataarray(mock_write_png.call_args.args[0]))
         self.assertEqual(mock_write_png.call_args.args[0].attrs["name"], "gpu_rgb")
         self.assertEqual(mock_write_png.call_args.args[1], output)
@@ -4061,6 +4462,45 @@ class ProcessorTests(unittest.TestCase):
     @mock.patch("himawari_lowram_processor.process_frame")
     @mock.patch("himawari_lowram_processor.validate_runtime_dependencies")
     @mock.patch("himawari_lowram_processor.common_area_from_frames")
+    @mock.patch("himawari_lowram_processor.find_latest_fldk_url")
+    def test_run_live_layer_resolves_latest_himawari8_before_processing(
+        self,
+        mock_latest,
+        mock_common_area,
+        _mock_validate,
+        mock_process,
+    ):
+        original_url = (
+            "https://noaa-himawari8.s3.amazonaws.com/AHI-L1b-FLDK/2022/12/13/0400/"
+            "HS_H08_20221213_0400_B01_FLDK_R10_S0110.DAT.bz2"
+        )
+        resolved_url = (
+            "https://noaa-himawari8.s3.amazonaws.com/AHI-L1b-FLDK/2022/12/14/0520/"
+            "HS_H08_20221214_0520_B01_FLDK_R10_S0110.DAT.bz2"
+        )
+        mock_latest.return_value = resolved_url
+        mock_process.return_value = h.Path("live.png")
+        config = h.default_config()
+        config.user_url = original_url
+        config.satellite_layer_mode = "live"
+        config.composite_choice = "B13 (Infrared Window)"
+
+        result = h.run(config)
+
+        self.assertEqual(result, [h.Path("live.png")])
+        mock_latest.assert_called_once_with(sat_id="HS_H08")
+        mock_common_area.assert_not_called()
+        self.assertEqual(mock_process.call_args.args[1].timestamp, "20221214_0520")
+        runtime_config = mock_process.call_args.kwargs["config"]
+        self.assertEqual(runtime_config.user_url, resolved_url)
+        self.assertEqual(runtime_config.satellite_layer_mode, "live")
+        self.assertEqual(runtime_config.composite_choice, "True Color Reproduction Image")
+        self.assertEqual(getattr(h.run, "last_config").user_url, resolved_url)
+        self.assertEqual(config.user_url, original_url)
+
+    @mock.patch("himawari_lowram_processor.process_frame")
+    @mock.patch("himawari_lowram_processor.validate_runtime_dependencies")
+    @mock.patch("himawari_lowram_processor.common_area_from_frames")
     def test_run_logs_app_version(self, mock_common_area, _mock_validate, mock_process):
         config = h.default_config()
         mock_common_area.return_value = mock.Mock(width=10, height=10)
@@ -4155,7 +4595,7 @@ class ProcessorTests(unittest.TestCase):
         config = h.default_config()
         config.mode = "Timelapse"
         config.hours_back = 1
-        config.interval_minutes = 30
+        config.interval_minutes = 20
         mock_common_area.return_value = mock.Mock(width=10, height=10)
         mock_process.side_effect = [h.Path("frame_0000.png"), None, h.Path("frame_0002.png")]
 
@@ -4169,12 +4609,40 @@ class ProcessorTests(unittest.TestCase):
     @mock.patch("himawari_lowram_processor.process_frame")
     @mock.patch("himawari_lowram_processor.validate_runtime_dependencies")
     @mock.patch("himawari_lowram_processor.common_area_from_frames")
+    def test_timelapse_keeps_png_frame_when_only_one_frame_succeeds(
+        self,
+        mock_common_area,
+        _mock_validate,
+        mock_process,
+        mock_assemble,
+    ):
+        events = []
+        config = h.default_config()
+        config.mode = "Timelapse"
+        config.hours_back = 2
+        config.interval_minutes = 20
+        config.image_format = "png"
+        config.timelapse_format = "gif"
+        mock_common_area.return_value = mock.Mock(width=10, height=10)
+        frame = h.Path("frame_0005.png")
+        mock_process.side_effect = [None, None, None, None, None, frame, None]
+
+        result = h.run(config, progress=lambda message, current, total: events.append((message, current, total)))
+
+        self.assertEqual(result, [frame])
+        mock_assemble.assert_not_called()
+        self.assertTrue(any("produced one frame" in message for message, _current, _total in events))
+
+    @mock.patch("himawari_lowram_processor.assemble_timelapse", return_value=h.Path("movie.gif"))
+    @mock.patch("himawari_lowram_processor.process_frame")
+    @mock.patch("himawari_lowram_processor.validate_runtime_dependencies")
+    @mock.patch("himawari_lowram_processor.common_area_from_frames")
     def test_run_reuses_existing_manifest_frame(
         self,
         mock_common_area,
         _mock_validate,
         mock_process,
-        _mock_assemble,
+        mock_assemble,
     ):
         config = h.default_config()
         config.mode = "Timelapse"
@@ -4197,8 +4665,9 @@ class ProcessorTests(unittest.TestCase):
 
                 result = h.run(config)
 
-            self.assertEqual(result, [h.Path("movie.gif")])
+            self.assertEqual(result, [frame])
             mock_process.assert_not_called()
+            mock_assemble.assert_not_called()
         finally:
             h.OUTPUT_DIR = original_output
 
@@ -4251,6 +4720,52 @@ class ProcessorTests(unittest.TestCase):
 
         self.assertEqual(app.root.clipboard, "out.png\nrun.log")
         app._append_log.assert_called_once()
+
+    def test_gui_copy_current_log_prefers_saved_run_log(self):
+        app = object.__new__(h.HimawariProcessorApp)
+        app.root = FakeRoot()
+        app._append_log = mock.Mock()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            log_path = h.Path(tmp_dir) / "run.log"
+            log_path.write_text("line 1\nline 2\n", encoding="utf-8")
+            app.last_log_path = log_path
+
+            h.HimawariProcessorApp._copy_current_log(app)
+
+        self.assertIn("Log file:", app.root.clipboard)
+        self.assertIn("line 1\nline 2", app.root.clipboard)
+        app._append_log.assert_called_once_with("Run log copied to clipboard.")
+
+    def test_gui_copy_current_log_falls_back_to_visible_log(self):
+        app = object.__new__(h.HimawariProcessorApp)
+        app.root = FakeRoot()
+        app.last_log_path = h.Path("missing.log")
+        app.log_text = mock.Mock()
+        app.log_text.get.return_value = "visible log\n"
+        app._append_log = mock.Mock()
+
+        h.HimawariProcessorApp._copy_current_log(app)
+
+        self.assertIn("Visible log panel", app.root.clipboard)
+        self.assertIn("visible log", app.root.clipboard)
+        self.assertTrue(any("Saved run log is unavailable" in call.args[0] for call in app._append_log.call_args_list))
+        self.assertTrue(any("Visible log copied" in call.args[0] for call in app._append_log.call_args_list))
+
+    @mock.patch("himawari_lowram_processor.messagebox.showinfo")
+    def test_gui_copy_current_log_reports_when_no_log_exists(self, mock_info):
+        app = object.__new__(h.HimawariProcessorApp)
+        app.root = FakeRoot()
+        app.last_log_path = None
+        app.pending_log_messages = []
+        app.log_text = mock.Mock()
+        app.log_text.get.return_value = "   "
+        app._append_log = mock.Mock()
+
+        h.HimawariProcessorApp._copy_current_log(app)
+
+        self.assertEqual(app.root.clipboard, "")
+        mock_info.assert_called_once()
 
     def test_gui_copy_error_report_generates_report(self):
         app = object.__new__(h.HimawariProcessorApp)
@@ -4377,6 +4892,7 @@ class ProcessorTests(unittest.TestCase):
         app.open_last_button = FakeWidget()
         app.copy_paths_button = FakeWidget()
         app.copy_error_button = FakeWidget()
+        app.copy_log_button = FakeWidget()
         app.custom_preset_box = FakeWidget()
         app._path_controls = (
             app.choose_output_button,
@@ -4402,6 +4918,7 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(app.best_perf_button.configured["state"], "disabled")
         self.assertEqual(app.overlay_check_button.configured["state"], "disabled")
         self.assertEqual(app.copy_error_button.configured["state"], "disabled")
+        self.assertNotIn("state", app.copy_log_button.configured)
         self.assertEqual(app.custom_preset_box.configured["state"], "disabled")
 
         h.HimawariProcessorApp._set_running(app, False)
@@ -4547,6 +5064,7 @@ class ProcessorTests(unittest.TestCase):
         app.url_var = FakeVar(config.user_url)
         app.mode_var = FakeVar(config.mode)
         app.composite_var = FakeVar(config.composite_choice)
+        app.satellite_layer_var = FakeVar(config.satellite_layer_mode)
         app.hours_var = FakeVar(str(config.hours_back))
         app.interval_var = FakeVar(str(config.interval_minutes))
         app.fps_var = FakeVar(str(config.fps))
@@ -4565,6 +5083,7 @@ class ProcessorTests(unittest.TestCase):
         app.border_color_var = FakeVar(config.border_line_color)
         app.border_width_var = FakeVar(str(config.border_line_width))
         app.map_labels_var = FakeVar(config.add_map_labels)
+        app.map_label_size_var = FakeVar(str(config.map_label_size))
         app.night_boundary_var = FakeVar(config.add_night_boundary)
         app.crosshair_var = FakeVar(config.add_crosshair)
         app.crosshair_type_var = FakeVar(config.crosshair_type)
@@ -4644,6 +5163,60 @@ class ProcessorTests(unittest.TestCase):
         messages = [call.args[0] for call in app._append_log.call_args_list]
         self.assertTrue(any("GPU acceleration enabled: ready" in message for message in messages))
         self.assertTrue(any("custom true-color math only" in message for message in messages))
+
+    def test_gui_satellite_layer_hd_applies_defaults_without_changing_url(self):
+        app = object.__new__(h.HimawariProcessorApp)
+        app.url_var = FakeVar("https://example.test/original.dat")
+        app.satellite_layer_var = FakeVar("hd")
+        app.composite_var = FakeVar("B13 (Infrared Window)")
+        app.map_view_var = FakeVar("native")
+        app.zoom_earth_style_var = FakeVar(False)
+        app.night_fallback_var = FakeVar(False)
+        app.night_fallback_mode_var = FakeVar("whole_frame_ir")
+        app.border_lines_var = FakeVar(False)
+        app.map_labels_var = FakeVar(False)
+        app.crosshair_var = FakeVar(True)
+        app.border_color_var = FakeVar("green")
+        app.border_width_var = FakeVar("2.5")
+        app._append_log = mock.Mock()
+        app._update_setup_status = mock.Mock()
+        app._write_current_settings = mock.Mock()
+
+        h.HimawariProcessorApp._apply_satellite_layer_defaults(app)
+
+        self.assertEqual(app.url_var.get(), "https://example.test/original.dat")
+        self.assertEqual(app.composite_var.get(), "True Color Reproduction Image")
+        self.assertEqual(app.map_view_var.get(), "flat")
+        self.assertTrue(app.zoom_earth_style_var.get())
+        self.assertTrue(app.night_fallback_var.get())
+        self.assertEqual(app.night_fallback_mode_var.get(), "hybrid")
+        self.assertTrue(app.border_lines_var.get())
+        self.assertTrue(app.map_labels_var.get())
+        self.assertFalse(app.crosshair_var.get())
+        self.assertEqual(app.border_color_var.get(), "#00ff00")
+        self.assertEqual(app.border_width_var.get(), "1.0")
+        app._write_current_settings.assert_called_once()
+
+    def test_gui_sync_runtime_run_state_uses_resolved_live_config_and_log_path(self):
+        app = object.__new__(h.HimawariProcessorApp)
+        app.last_config = None
+        app.last_log_path = None
+        config = h.default_config()
+        config.satellite_layer_mode = "live"
+        config.user_url = "https://example.test/resolved.dat"
+        previous_config = getattr(h.run, "last_config", None)
+        previous_log_path = getattr(h.run, "last_log_path", None)
+        try:
+            setattr(h.run, "last_config", config)
+            setattr(h.run, "last_log_path", h.Path("resolved.log"))
+
+            h.HimawariProcessorApp._sync_runtime_run_state(app)
+
+            self.assertIs(app.last_config, config)
+            self.assertEqual(app.last_log_path, h.Path("resolved.log"))
+        finally:
+            setattr(h.run, "last_config", previous_config)
+            setattr(h.run, "last_log_path", previous_log_path)
 
     @mock.patch("himawari_lowram_processor.messagebox.showinfo")
     @mock.patch("himawari_lowram_processor.import_local_hsd_segments")
