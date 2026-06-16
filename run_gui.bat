@@ -1,10 +1,10 @@
 @echo off
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 
 set "PROJECT_DIR=%~dp0"
-set "SCRIPT=%PROJECT_DIR%himawari_lowram_processor.py"
 set "PYTHON313=%LOCALAPPDATA%\Programs\Python\Python313\python.exe"
 set "PYTHON_CMD="
+set "SCRIPT="
 
 cd /d "%PROJECT_DIR%" || (
     echo ERROR: Could not switch to project folder:
@@ -13,8 +13,15 @@ cd /d "%PROJECT_DIR%" || (
     exit /b 1
 )
 
-if not exist "%SCRIPT%" (
-    echo ERROR: himawari_lowram_processor.py was not found in:
+rem Detect the main script. Prefer the canonical name, then the _claude working
+rem copy. An explicit HIMAWARI_SCRIPT override always wins if it exists.
+if defined HIMAWARI_SCRIPT if exist "%HIMAWARI_SCRIPT%" set "SCRIPT=%HIMAWARI_SCRIPT%"
+if not defined SCRIPT if exist "%PROJECT_DIR%himawari_lowram_processor.py" set "SCRIPT=%PROJECT_DIR%himawari_lowram_processor.py"
+if not defined SCRIPT if exist "%PROJECT_DIR%himawari_lowram_processor_claude.py" set "SCRIPT=%PROJECT_DIR%himawari_lowram_processor_claude.py"
+
+if not defined SCRIPT (
+    echo ERROR: Could not find himawari_lowram_processor.py
+    echo        or himawari_lowram_processor_claude.py in:
     echo %PROJECT_DIR%
     pause
     exit /b 1
@@ -61,13 +68,14 @@ if not errorlevel 1 (
 )
 
 echo ERROR: No Python executable found.
-echo Install Python 3.13, or run check_environment.bat for repair help.
+echo Install Python 3.13 (or 3.12), or run check_environment.bat for repair help.
 pause
 exit /b 1
 
 :launch
-echo Launching Himawari-9 Low-RAM Processor...
+echo Launching Himawari-8/9 Low-RAM Processor...
 echo Project: %PROJECT_DIR%
+echo Script:  %SCRIPT%
 echo Python:  %PYTHON_CMD%
 echo.
 

@@ -17,3 +17,8 @@ himawari_custom_presets.json
 .mypy_cache/
 .ruff_cache/
 .cache/
+out.png
+out.tif
+*.gif
+*.png
+*.tif

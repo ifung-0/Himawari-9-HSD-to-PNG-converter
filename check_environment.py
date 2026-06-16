@@ -27,6 +27,32 @@ VENV_DIR = PROJECT_DIR / ".venv"
 LOCAL_APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
 APP_DATA_DIR = LOCAL_APP_DATA_DIR / "Himawari9LowRamProcessor"
 APP_IMPORT_NAME = "himawari_lowram_processor"
+
+
+class _ProjectModuleAliasFinder:
+    """Allow ``import himawari_lowram_processor`` to resolve a renamed local copy.
+
+    Some installs run a renamed working copy (e.g. ``himawari_lowram_processor_claude.py``).
+    When the canonical file is absent but a known alternate exists, load the
+    alternate under the canonical name. This is lazy: it only triggers on an
+    actual import of that module, so ``--help`` and unrelated work are unaffected.
+    """
+
+    _ALTERNATES = ("himawari_lowram_processor_claude.py",)
+
+    def find_spec(self, name, path=None, target=None):
+        if name != APP_IMPORT_NAME:
+            return None
+        if (PROJECT_DIR / f"{APP_IMPORT_NAME}.py").exists():
+            return None  # canonical file present: use the normal import machinery
+        for alternate in self._ALTERNATES:
+            candidate = PROJECT_DIR / alternate
+            if candidate.exists():
+                return importlib.util.spec_from_file_location(name, candidate)
+        return None
+
+
+sys.meta_path.append(_ProjectModuleAliasFinder())
 MIN_SATPY_VERSION = (0, 60)
 OVERLAY_RESOLUTION = "l"
 OVERLAY_LEVEL = 1
@@ -76,6 +102,7 @@ CORE_ROOT_FILES = {
     "checkenv.bat",
     "himawari_cli.py",
     "himawari_lowram_processor.py",
+    "himawari_lowram_processor_claude.py",
     "install_requirements.py",
     "LICENSE",
     "README.md",

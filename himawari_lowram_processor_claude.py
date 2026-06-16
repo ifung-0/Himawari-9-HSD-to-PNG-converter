@@ -65,7 +65,7 @@ except KeyboardInterrupt:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-APP_VERSION = "2026.06.08.10"
+APP_VERSION = "2026.06.16.01"
 APP_DISPLAY_NAME = "Himawari-8/9 Low-RAM Processor"
 USER_URL = "https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/2024/07/25/0400/HS_H09_20240725_0400_B01_FLDK_R10_S0110.DAT.bz2"
 MODE = "Single Image"  # "Single Image" or "Timelapse"
@@ -82,6 +82,8 @@ USE_NIGHT_FALLBACK = True
 NIGHT_FALLBACK_MODE = "hybrid"
 DOWNLOAD_WORKERS = 2
 DOWNLOAD_STREAM_CHUNK_BYTES = 256 * 1024
+DOWNLOAD_MAX_RETRIES = 3  # extra passes over still-missing segments before giving up
+DOWNLOAD_RETRY_BACKOFF_SECONDS = 6.0  # pause between retry passes (transient DNS/network)
 TIMELAPSE_FORMAT = "gif"  # "gif" or "mp4"
 DELETE_TIMELAPSE_FRAMES = True
 IMAGE_FORMAT = "png"  # Use "tif" for chunked GeoTIFF writes on very large outputs.
@@ -99,17 +101,17 @@ ADD_CROSSHAIR = False
 CROSSHAIR_TYPE = "target"
 CROSSHAIR_COLOR = "#7c3cff"
 ZOOM_EARTH_STYLE = False
-FLAT_MAP_INVALID_FILL = (4, 15, 28)
+FLAT_MAP_INVALID_FILL = (12, 26, 44)
 FLAT_MAP_SOURCE_VALID_MIN = 1.0e-6
-FLAT_MAP_BASEMAP_OCEAN = (5, 18, 32)
-FLAT_MAP_BASEMAP_LAND = (58, 68, 58)
+FLAT_MAP_BASEMAP_OCEAN = (15, 32, 52)
+FLAT_MAP_BASEMAP_LAND = (60, 72, 60)
 FLAT_MAP_BASEMAP_COAST = (122, 134, 126)
-FLAT_MAP_LIMB_FADE_FRACTION = 0.075
+FLAT_MAP_LIMB_FADE_FRACTION = 0.05
 FLAT_MAP_LIMB_FADE_MIN_PX = 8
 FLAT_MAP_LIMB_FADE_MAX_PX = 240
 FLAT_MAP_ZOOM_OVERLAY_OPACITY = 200
 FLAT_MAP_ZOOM_CROSSHAIR_OPACITY_SCALE = 0.78
-SATELLITE_LAYER_BORDER_COLOR = "#00ff00"
+SATELLITE_LAYER_BORDER_COLOR = "#d8dee8"
 FLAT_MAP_DIRECT_SAMPLE_CHUNK = 256
 GPU_CUSTOM_COMPOSITE_MAX_CHUNK_EDGE = 512
 GPU_CUSTOM_COMPOSITE_MAX_CHUNK_PIXELS = 262_144
@@ -155,6 +157,61 @@ WEB_MERCATOR_PROJ4 = (
     "+x_0=0 +y_0=0 +units=m +over +no_defs"
 )
 WEB_MERCATOR_METERS_PER_DEGREE = (2.0 * math.pi * 6378137.0) / 360.0
+
+# ---------------------------------------------------------------------------
+# Output-area presets (lat/lon bounding boxes inside the Himawari-8/9 view).
+# Each regional preset switches the app to the flat (Web Mercator) map and
+# fills the four bounds. "Custom" leaves the bounds untouched; "Full Disk"
+# selects the native full-disk view (the whole round Earth).
+# Bounds are (min_lat, max_lat, min_lon, max_lon) in degrees.
+# Coverage note: Himawari-9 sits at 140.7 deg E, so areas near 80 deg E
+# (Central/South Asia) sit close to the western limb and can show edge falloff.
+# ---------------------------------------------------------------------------
+AREA_PRESET_CUSTOM = "Custom (manual bounds)"
+AREA_PRESET_FULL_DISK = "Full Disk (native)"
+AREA_PRESET_FULL_DISK_FLAT = "Full Disk (flat map)"
+AREA_PRESETS: dict[str, tuple[float, float, float, float]] = {
+    AREA_PRESET_FULL_DISK_FLAT: (-60.0, 60.0, 80.0, 200.0),
+    "Australia": (-45.0, -9.0, 110.0, 156.0),
+    "Central Asia": (33.0, 53.0, 80.0, 112.0),
+    "New Zealand": (-48.0, -33.0, 165.0, 179.5),
+    "Pacific Islands 1": (-10.0, 10.0, 150.0, 175.0),
+    "Pacific Islands 2": (-10.0, 10.0, 175.0, 200.0),
+    "Pacific Islands 3": (0.0, 20.0, 145.0, 170.0),
+    "Pacific Islands 4": (0.0, 20.0, 170.0, 195.0),
+    "Pacific Islands 5": (-25.0, -5.0, 150.0, 175.0),
+    "Pacific Islands 6": (-25.0, -5.0, 175.0, 200.0),
+    "Pacific Islands 7": (5.0, 25.0, 130.0, 155.0),
+    "Pacific Islands 8": (-20.0, 0.0, 130.0, 155.0),
+    "Pacific Islands 9": (-35.0, -15.0, 165.0, 190.0),
+    "Pacific Islands 10": (10.0, 30.0, 130.0, 155.0),
+    "Southeast Asia 1": (-12.0, 8.0, 95.0, 120.0),
+    "Southeast Asia 2": (5.0, 25.0, 95.0, 115.0),
+    "Southeast Asia 3": (0.0, 20.0, 115.0, 130.0),
+    "South Asia": (5.0, 32.0, 80.0, 100.0),
+}
+# Order shown in the GUI dropdown.
+AREA_PRESET_ORDER = (
+    AREA_PRESET_CUSTOM,
+    AREA_PRESET_FULL_DISK_FLAT,
+    AREA_PRESET_FULL_DISK,
+    *[name for name in AREA_PRESETS if name != AREA_PRESET_FULL_DISK_FLAT],
+)
+
+# ---------------------------------------------------------------------------
+# In-app updater. Pulls the default branch of the public GitHub repository,
+# verifies the download, backs up the current files, then replaces them.
+# ---------------------------------------------------------------------------
+GITHUB_REPO = "ifung-0/Himawari-9-HSD-to-PNG-converter"
+GITHUB_API_BASE = "https://api.github.com"
+GITHUB_UPDATE_TIMEOUT_SECONDS = 60
+# Files the updater is allowed to replace if they exist in the downloaded branch.
+SELF_UPDATE_FILES = (
+    "himawari_lowram_processor.py",
+    "check_environment.py",
+    "run_gui.bat",
+    "README.md",
+)
 
 RAM_LIMIT_GB = 10.0
 DASK_CHUNK_CHOICES = ("16MiB", "32MiB", "64MiB", "128MiB")
@@ -2031,61 +2088,105 @@ def stream_download_and_extract(
         return None
 
 
+def interruptible_sleep(seconds: float, cancel_event: threading.Event | None = None) -> None:
+    """Sleep in small slices so a cancel request is honored promptly."""
+    deadline = time.monotonic() + max(0.0, float(seconds))
+    while time.monotonic() < deadline:
+        check_cancel(cancel_event)
+        time.sleep(min(0.25, deadline - time.monotonic()))
+
+
+def _download_segment_pass(
+    pass_tasks: list[DownloadTask],
+    worker_count: int,
+    progress: ProgressCallback | None,
+    cancel_event: threading.Event | None,
+    grand_total: int,
+    already_done: int,
+) -> None:
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=worker_count)
+    future_map: dict[concurrent.futures.Future[Path | None], DownloadTask] = {}
+    completed = already_done
+
+    def download_one(task: DownloadTask) -> Path | None:
+        emit_progress(progress, f"Downloading {download_task_label(task)}", completed, grand_total)
+        return stream_download_and_extract(task, cancel_event=cancel_event)
+
+    try:
+        for task in pass_tasks:
+            check_cancel(cancel_event)
+            future = pool.submit(download_one, task)
+            future_map[future] = task
+        pending = set(future_map)
+        while pending:
+            check_cancel(cancel_event)
+            done, pending = concurrent.futures.wait(
+                pending, timeout=0.2, return_when=concurrent.futures.FIRST_COMPLETED
+            )
+            for future in done:
+                completed += 1
+                future.result()
+                label = download_task_label(future_map[future])
+                emit_progress(progress, f"Downloaded {label} ({completed}/{grand_total})", completed, grand_total)
+    except ProcessingCancelled:
+        for future in future_map:
+            future.cancel()
+        emit_progress(progress, "Download canceled", completed, grand_total)
+        raise
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
 def download_segments(
     tasks: list[DownloadTask],
     workers: int,
     auto_download: bool = AUTO_DOWNLOAD,
     progress: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
+    max_retries: int = DOWNLOAD_MAX_RETRIES,
+    retry_backoff: float = DOWNLOAD_RETRY_BACKOFF_SECONDS,
 ) -> list[Path]:
     check_cancel(cancel_event)
     total = len(tasks)
-    completed = 0
     if not auto_download:
         existing = [task.destination for task in tasks if task.destination.exists() and task.destination.stat().st_size > 0]
         emit_progress(progress, f"Found {len(existing)}/{total} existing files", len(existing), total)
         return existing
 
+    def have(task: DownloadTask) -> bool:
+        return task.destination.exists() and task.destination.stat().st_size > 0
+
     worker_count = clamp_download_workers(workers)
-    LOG.info("Downloading %s segments with %s worker(s)", len(tasks), worker_count)
+    LOG.info("Downloading %s segments with %s worker(s)", total, worker_count)
     emit_progress(progress, download_workload_summary(tasks, worker_count), 0, total)
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=worker_count)
-    future_map: dict[concurrent.futures.Future[Path | None], DownloadTask] = {}
-    results = []
 
-    def download_one(task: DownloadTask) -> Path | None:
-        emit_progress(progress, f"Downloading {download_task_label(task)}", completed, total)
-        return stream_download_and_extract(task, cancel_event=cancel_event)
+    attempt = 0
+    while True:
+        check_cancel(cancel_event)
+        pending_tasks = [task for task in tasks if not have(task)]
+        if not pending_tasks:
+            break
+        done_count = total - len(pending_tasks)
+        _download_segment_pass(pending_tasks, worker_count, progress, cancel_event, total, done_count)
+        remaining = [task for task in tasks if not have(task)]
+        if not remaining or attempt >= max_retries:
+            break
+        attempt += 1
+        LOG.warning(
+            "Retrying %s missing segment(s): attempt %s/%s after %.0fs "
+            "(usually a transient DNS/network blip).",
+            len(remaining), attempt, max_retries, retry_backoff,
+        )
+        emit_progress(
+            progress,
+            f"Retry {attempt}/{max_retries}: {len(remaining)} segment(s) still missing",
+            total - len(remaining), total,
+        )
+        interruptible_sleep(retry_backoff, cancel_event)
 
-    try:
-        for task in tasks:
-            check_cancel(cancel_event)
-            future = pool.submit(download_one, task)
-            future_map[future] = task
-
-        pending = set(future_map)
-        while pending:
-            check_cancel(cancel_event)
-            done, pending = concurrent.futures.wait(
-                pending,
-                timeout=0.2,
-                return_when=concurrent.futures.FIRST_COMPLETED,
-            )
-            for future in done:
-                completed += 1
-                result = future.result()
-                if result is not None:
-                    results.append(result)
-                label = download_task_label(future_map[future])
-                emit_progress(progress, f"Downloaded {label} ({completed}/{total})", completed, total)
-    except ProcessingCancelled:
-        for future in future_map:
-            future.cancel()
-        emit_progress(progress, "Download canceled", completed, total)
-        raise
-    finally:
-        pool.shutdown(wait=True, cancel_futures=True)
-    return results
+    downloaded = [task.destination for task in tasks if have(task)]
+    emit_progress(progress, f"Downloaded {len(downloaded)}/{total} segments", len(downloaded), total)
+    return downloaded
 
 
 def missing_cached_segments(
@@ -2883,6 +2984,42 @@ def runtime_config(config: ProcessorConfig) -> ProcessorConfig:
     return resolve_live_satellite_url(layer_defaults_config(config))
 
 
+def area_preset_names() -> tuple[str, ...]:
+    """Ordered names shown in the GUI area-preset dropdown."""
+    return AREA_PRESET_ORDER
+
+
+def area_preset_bounds(name: str) -> tuple[float, float, float, float] | None:
+    """Return (min_lat, max_lat, min_lon, max_lon) for a regional preset, else None."""
+    return AREA_PRESETS.get(str(name).strip())
+
+
+def apply_area_preset_to_config(config: ProcessorConfig, name: str) -> ProcessorConfig:
+    """Apply an output-area preset to a config.
+
+    "Full Disk (native)" switches to the native full-disk view. A regional
+    preset switches to the flat map and fills the four bounds. "Custom" or any
+    unknown name leaves the config unchanged so the user keeps manual control.
+    """
+    cleaned = str(name).strip()
+    if cleaned == AREA_PRESET_FULL_DISK:
+        # Native full disk cannot use Zoom Earth flat styling; turn it off so the run
+        # is valid. Labels/borders/night boundary/crosshair still render on native.
+        return replace(config, map_view="native", zoom_earth_style=False)
+    bounds = area_preset_bounds(cleaned)
+    if bounds is None:
+        return config
+    min_lat, max_lat, min_lon, max_lon = bounds
+    return replace(
+        config,
+        map_view="flat",
+        flat_min_lat=float(min_lat),
+        flat_max_lat=float(max_lat),
+        flat_min_lon=float(min_lon),
+        flat_max_lon=float(max_lon),
+    )
+
+
 def is_flat_map(config: ProcessorConfig) -> bool:
     return normalized_map_view(config.map_view) == "flat"
 
@@ -3233,6 +3370,19 @@ def flat_map_visual_style_enabled(config: ProcessorConfig) -> bool:
     return bool(config.zoom_earth_style or functional_map_overlay_enabled(config))
 
 
+def should_style_output(config: ProcessorConfig, product: str) -> bool:
+    """Whether the saved image should be post-processed with overlays/styling.
+
+    Flat maps get true-color styling and/or overlays. Native (full-disk) output
+    is left as the raw satellite product, but now still receives any requested
+    map overlays (labels, crosshair, night boundary, coastlines) so labels are
+    no longer flat-map-only.
+    """
+    if is_flat_map(config):
+        return flat_map_visual_style_enabled(config) or true_color_product(product)
+    return functional_map_overlay_enabled(config)
+
+
 def true_color_product(composite_choice: str) -> bool:
     return composite_choice in {"True Color RGB (Enhanced)", "True Color Reproduction Image"}
 
@@ -3487,7 +3637,33 @@ def draw_crosshair(
             line((x, y + gap, x, y + length), fill, width)
 
 
-def robust_true_color_stretch(image, lower_percentile: float = 0.6, upper_percentile: float = 99.7, blend: float = 0.82):
+def lift_true_color_shadows(image, strength: float = 0.55):
+    """Highlight-preserving shadow/midtone lift for true-color imagery.
+
+    Himawari True Color Reproduction is genuinely dark over ocean, which made
+    flat maps look almost entirely dark blue. This raises shadows and midtones
+    (so ocean reads as a brighter, legible blue and faint cloud/land detail
+    becomes visible) while leaving near-black and near-white essentially
+    untouched, so cloud highlights are not blown out. RGB is scaled by a single
+    per-pixel luminance ratio, which preserves hue.
+    """
+    from PIL import Image
+
+    if strength <= 0:
+        return image
+    rgb = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+    lum = 0.2126 * rgb[:, :, 0] + 0.7152 * rgb[:, :, 1] + 0.0722 * rgb[:, :, 2]
+    # Concave boost: zero at black and white, peaks across shadows/midtones.
+    boost = float(strength) * np.clip(1.0 - lum, 0.0, 1.0) * np.sqrt(np.clip(lum, 0.0, 1.0))
+    target = np.clip(lum + boost, 0.0, 1.0)
+    scale = np.ones_like(lum)
+    valid = lum > 1.0e-4
+    scale[valid] = np.minimum(target[valid] / lum[valid], 3.0)
+    lifted = np.clip(rgb * scale[:, :, None], 0.0, 1.0)
+    return Image.fromarray((lifted * 255.0 + 0.5).astype(np.uint8), mode="RGB")
+
+
+def robust_true_color_stretch(image, lower_percentile: float = 0.6, upper_percentile: float = 99.7, blend: float = 0.70):
     from PIL import Image
 
     original = np.asarray(image.convert("RGB"), dtype=np.float32)
@@ -3507,21 +3683,53 @@ def robust_true_color_stretch(image, lower_percentile: float = 0.6, upper_percen
     return Image.fromarray(output, mode="RGB")
 
 
+def compress_true_color_highlights(image, knee: float = 206.0, ceiling: float = 246.0):
+    """Soft highlight roll-off so bright clouds keep texture instead of clipping.
+
+    Luminance at or below ``knee`` is untouched; above it a smooth, monotonic
+    Reinhard-style shoulder maps the range toward ``ceiling`` (< 255) so the
+    brightest cloud tops stop slamming into flat white. RGB is scaled by the
+    per-pixel luminance ratio, preserving hue.
+    """
+    from PIL import Image
+
+    knee = float(max(0.0, min(254.0, knee)))
+    ceiling = float(max(knee + 1.0, min(255.0, ceiling)))
+    rgb = np.asarray(image.convert("RGB"), dtype=np.float32)
+    lum = 0.2126 * rgb[:, :, 0] + 0.7152 * rgb[:, :, 1] + 0.0722 * rgb[:, :, 2]
+    span = 255.0 - knee
+    over = np.clip((lum - knee) / span, 0.0, 1.0)
+    # Reinhard-style shoulder calibrated so lum=255 maps exactly to `ceiling`.
+    k = span / max(1.0e-3, (ceiling - knee))
+    compressed = knee + span * (over / (1.0 + (k - 1.0) * over))
+    target = np.where(lum > knee, compressed, lum)
+    scale = np.ones_like(lum)
+    valid = lum > 1.0e-4
+    scale[valid] = np.minimum(target[valid] / lum[valid], 1.0)
+    out = np.clip(rgb * scale[:, :, None], 0.0, 255.0)
+    return Image.fromarray((out + 0.5).astype(np.uint8), mode="RGB")
+
+
 def apply_zoom_earth_true_color_enhancement(image, hd: bool = False):
     from PIL import Image, ImageEnhance
 
     alpha = image.getchannel("A") if "A" in image.getbands() else None
     original_rgb = np.asarray(image.convert("RGB"), dtype=np.float32)
     working = image.convert("RGB")
+    # Lift dark ocean/midtones first so the image is legible. HD also runs a
+    # percentile stretch below, so it needs a smaller lift to avoid washing out.
+    working = lift_true_color_shadows(working, strength=0.30 if hd else 0.55)
     if hd:
         working = robust_true_color_stretch(working)
-    gamma = 0.72 if hd else 0.84
+    gamma = 0.76 if hd else 0.84
     gamma_lut = [int(round((value / 255.0) ** gamma * 255.0)) for value in range(256)]
     working = working.point(gamma_lut * 3)
-    working = ImageEnhance.Color(working).enhance(1.48 if hd else 1.20)
-    working = ImageEnhance.Contrast(working).enhance(1.18 if hd else 1.07)
-    working = ImageEnhance.Brightness(working).enhance(1.12 if hd else 1.09)
-    working = ImageEnhance.Sharpness(working).enhance(1.14 if hd else 1.08)
+    # HD saturation/contrast were too punchy (this is what made live/hd look
+    # "weird"); these are dialled back to a natural-but-crisp look.
+    working = ImageEnhance.Color(working).enhance(1.30 if hd else 1.20)
+    working = ImageEnhance.Contrast(working).enhance(1.10 if hd else 1.06)
+    working = ImageEnhance.Brightness(working).enhance(1.06 if hd else 1.05)
+    working = ImageEnhance.Sharpness(working).enhance(1.12 if hd else 1.08)
     if hd:
         enhanced = np.asarray(working.convert("RGB"), dtype=np.float32)
         luminance = 0.2126 * original_rgb[:, :, 0] + 0.7152 * original_rgb[:, :, 1] + 0.0722 * original_rgb[:, :, 2]
@@ -3536,14 +3744,14 @@ def apply_zoom_earth_true_color_enhancement(image, hd: bool = False):
     cloud_protect = np.clip((luminance - 196.0) / 58.0, 0.0, 0.55) * np.clip(1.0 - chroma / 92.0, 0.0, 1.0)
     warm_mix = 1.0 - cloud_protect
     warm = balanced.copy()
-    warm[:, :, 0] *= 1.08 if hd else 1.05
+    warm[:, :, 0] *= 1.07 if hd else 1.05
     warm[:, :, 1] *= 1.03 if hd else 1.02
-    warm[:, :, 2] *= 0.86 if hd else 0.91
+    warm[:, :, 2] *= 0.88 if hd else 0.91
     blue_excess = np.maximum(0.0, warm[:, :, 2] - np.maximum(warm[:, :, 0], warm[:, :, 1]))
-    warm[:, :, 2] -= blue_excess * (0.34 if hd else 0.24)
+    warm[:, :, 2] -= blue_excess * (0.30 if hd else 0.24)
     balanced = np.clip((balanced * (1.0 - warm_mix[:, :, None])) + (warm * warm_mix[:, :, None]), 0, 255)
     working = Image.fromarray(balanced.astype(np.uint8), mode="RGB")
-    working = ImageEnhance.Color(working).enhance(1.18 if hd else 1.22)
+    working = ImageEnhance.Color(working).enhance(1.12 if hd else 1.22)
     if alpha is not None:
         working.putalpha(alpha)
     return working
@@ -3584,6 +3792,11 @@ def aggressive_true_color_artifact_mask(rgb: np.ndarray) -> np.ndarray:
     saturated_red = (red > 118) & (red > green + 38) & (red > blue + 28) & (chroma > 48)
     dark_red_fleck = (red > 72) & (red > green + 42) & (red > blue + 34) & (green < 76) & (blue < 92)
     magenta_fleck = (red > 112) & (blue > 82) & (red > green + 34) & (blue > green + 22) & (chroma > 46)
+    # Vivid green specks are a true-color-reproduction artifact (real vegetation is
+    # a muted olive where red is not far below green). Require green to clearly
+    # dominate both other channels with high chroma so genuine land is spared.
+    saturated_green = (green > 116) & (green > red + 40) & (green > blue + 38) & (chroma > 50)
+    dark_green_fleck = (green > 70) & (green > red + 44) & (green > blue + 38) & (red < 96) & (blue < 104)
 
     natural_brown = (
         (red > green)
@@ -3594,7 +3807,16 @@ def aggressive_true_color_artifact_mask(rgb: np.ndarray) -> np.ndarray:
         & (chroma < 125)
     )
     natural_warm_cloud = (luminance > 188.0) & (green > 115) & (blue > 92) & (chroma < 92)
-    return (saturated_red | dark_red_fleck | magenta_fleck) & ~natural_brown & ~natural_warm_cloud
+    # Muted vegetation: green leads but red is substantial (not a vivid artifact green).
+    natural_vegetation = (
+        (green > red)
+        & (green > blue)
+        & (red >= (green * 0.52))
+        & (luminance > 38.0)
+        & (chroma < 118)
+    )
+    artifacts = saturated_red | dark_red_fleck | magenta_fleck | saturated_green | dark_green_fleck
+    return artifacts & ~natural_brown & ~natural_warm_cloud & ~natural_vegetation
 
 
 def cleanup_true_color_chroma_speckles(
@@ -3663,6 +3885,9 @@ def finish_zoom_earth_true_color_quality(image, hd: bool = False):
     working = ImageEnhance.Contrast(working).enhance(1.045 if hd else 1.035)
     working = ImageEnhance.Color(working).enhance(1.055 if hd else 1.04)
     working = ImageEnhance.Sharpness(working).enhance(1.14 if hd else 1.10)
+    # Final highlight roll-off: pull the brightest cloud tops just below pure
+    # white so they read as bright clouds with shape instead of blown-out white.
+    working = compress_true_color_highlights(working, knee=204.0, ceiling=240.0)
     if alpha is not None:
         working = working.convert("RGBA")
         working.putalpha(alpha)
@@ -4082,22 +4307,26 @@ def apply_flat_map_style_to_image(
     product: str,
     overlay_options: dict | None = None,
     valid_mask: np.ndarray | None = None,
+    native: bool = False,
 ):
     working = image.convert("RGBA")
     is_true_color = true_color_product(product)
-    is_zoom_true_color = config.zoom_earth_style and is_true_color
-    fill_invalid_flat_map_pixels(working, valid_mask)
-    if is_true_color:
-        # Aggressive red/magenta artifact cleanup and true-color tone enhancement are
-        # now the default for every true-color flat map, not only the Zoom Earth style.
-        # They run before any overlay so green borders, labels and the crosshair are
-        # drawn on top of the cleaned image and never removed by the speckle cleanup.
-        hd = is_enhanced_satellite_layer(config)
-        working = apply_zoom_earth_true_color_enhancement(working, hd=hd)
-        cleanup_true_color_chroma_speckles(working, aggressive=True)
-        working = finish_zoom_earth_true_color_quality(working, hd=hd)
-    if is_zoom_true_color:
-        composite_flat_map_basemap(working, area, valid_mask)
+    # Zoom Earth styling (synthetic basemap, translucent overlays) is a flat-map
+    # concept only; native output is the raw product with overlays drawn on top.
+    is_zoom_true_color = (not native) and config.zoom_earth_style and is_true_color
+    if not native:
+        fill_invalid_flat_map_pixels(working, valid_mask)
+        if is_true_color:
+            # Aggressive red/magenta artifact cleanup and true-color tone enhancement
+            # are the default for every true-color flat map, not only Zoom Earth style.
+            # They run before any overlay so green borders, labels and the crosshair
+            # are drawn on top of the cleaned image and never removed by the cleanup.
+            hd = is_enhanced_satellite_layer(config)
+            working = apply_zoom_earth_true_color_enhancement(working, hd=hd)
+            cleanup_true_color_chroma_speckles(working, aggressive=True)
+            working = finish_zoom_earth_true_color_quality(working, hd=hd)
+        if is_zoom_true_color:
+            composite_flat_map_basemap(working, area, valid_mask)
     try:
         direct_overlay_to_image(
             working,
@@ -4107,7 +4336,7 @@ def apply_flat_map_style_to_image(
             valid_mask=valid_mask if is_zoom_true_color else None,
         )
     except Exception as exc:
-        LOG.warning("Flat-map border overlay failed (%s). Continuing without border lines.", exc)
+        LOG.warning("Map border overlay failed (%s). Continuing without border lines.", exc)
     if config.add_night_boundary:
         draw_night_boundary(working, area, scan_time)
     if config.add_map_labels:
@@ -4131,6 +4360,7 @@ def style_flat_map_raster_file(
     product: str,
     overlay_options: dict | None = None,
     valid_mask: np.ndarray | None = None,
+    native: bool = False,
 ) -> Path:
     suffix = output_path.suffix.lower()
     if suffix in {".png", ".jpg", ".jpeg"}:
@@ -4150,6 +4380,7 @@ def style_flat_map_raster_file(
                     product,
                     overlay_options=overlay_options,
                     valid_mask=image_valid_mask,
+                    native=native,
                 )
                 if original_mode != "RGBA":
                     working = working.convert(original_mode)
@@ -4184,6 +4415,7 @@ def style_flat_map_raster_file(
                     product,
                     overlay_options=overlay_options,
                     valid_mask=geotiff_valid_mask,
+                    native=native,
                 ).convert("RGB")
                 styled = np.moveaxis(np.asarray(working, dtype=np.uint8), -1, 0)
             profile.update(
@@ -4221,13 +4453,12 @@ def apply_flat_map_visual_overlays(
     overlay_options: dict | None = None,
     valid_mask: np.ndarray | None = None,
 ) -> Path:
-    if not is_flat_map(config):
-        return output_path
-    if not flat_map_visual_style_enabled(config) and not true_color_product(product):
+    if not should_style_output(config, product):
         return output_path
     if output_path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".tif", ".tiff"}:
         return output_path
 
+    native = not is_flat_map(config)
     try:
         return style_flat_map_raster_file(
             output_path,
@@ -4235,11 +4466,15 @@ def apply_flat_map_visual_overlays(
             config,
             scan_time,
             product,
+            # Borders/labels/night boundary/crosshair are all drawn here for both
+            # flat and native output; the dataset writer is told not to draw the
+            # coastline overlay (see save_satpy_dataset_output) so it is not doubled.
             overlay_options=overlay_options,
             valid_mask=valid_mask,
+            native=native,
         )
     except Exception as exc:
-        LOG.warning("Flat-map visual overlay styling failed (%s). Keeping unstyled image.", exc)
+        LOG.warning("Map overlay styling failed (%s). Keeping unstyled image.", exc)
     return output_path
 
 
@@ -5260,11 +5495,9 @@ def save_satpy_dataset_output(
         writer_for_output(output_path),
         enhance=enhance,
         fill_value=fill_value,
-        overlay=None if is_flat_map(config) else overlay_options,
+        overlay=None,
     )
-    if not is_flat_map(config) or (
-        not flat_map_visual_style_enabled(config) and not true_color_product(active)
-    ):
+    if not should_style_output(config, active):
         return saved_path
     return apply_flat_map_visual_overlays(
         saved_path,
@@ -5507,8 +5740,22 @@ def process_frame(
         log_memory("after download", config)
         check_cancel(cancel_event)
         if len(local_files) != len(tasks):
-            LOG.warning("Skipping frame; got %s/%s segments", len(local_files), len(tasks))
-            return None
+            missing = len(tasks) - len(local_files)
+            if config.allow_quality_fallback and local_files:
+                LOG.warning(
+                    "Proceeding with %s/%s segments (%s missing after retries); the image may "
+                    "have empty stripes where segments are missing. Turn off 'Allow lower-quality "
+                    "fallback' to require every segment instead.",
+                    len(local_files), len(tasks), missing,
+                )
+            else:
+                LOG.warning(
+                    "Skipping frame; got %s/%s segments after retries. This is almost always a "
+                    "network/DNS problem reaching the data host, not the imagery. Enable 'Allow "
+                    "lower-quality fallback' to render with the segments that did download.",
+                    len(local_files), len(tasks),
+                )
+                return None
 
         is_night = False
         if (
@@ -5805,8 +6052,11 @@ def validate_configuration(config: ProcessorConfig | None = None) -> None:
         parse_rgb_color(config.crosshair_color)
     except ValueError as exc:
         raise ValueError("Crosshair color must be a name, #RRGGBB, or R,G,B values.") from exc
-    if (config.add_map_labels or config.add_night_boundary or config.add_crosshair or config.zoom_earth_style) and not is_flat_map(config):
-        raise ValueError("Zoom Earth-style labels, night boundary, crosshair, and styling require flat map output.")
+    if config.zoom_earth_style and not is_flat_map(config):
+        raise ValueError(
+            "Zoom Earth-style flat-map styling requires flat map output. Turn it off to render the "
+            "native full-disk view (labels, borders, night boundary and crosshair still work on native)."
+        )
 
 
 def validate_overlay_ready_for_run(config: ProcessorConfig, project_dir: Path = PROJECT_DIR) -> None:
@@ -5879,6 +6129,8 @@ def build_run_summary(config: ProcessorConfig) -> RunSummary:
             warnings.append("Zoom Earth-style flat maps keep the selected satellite product; no map tiles are added.")
         if config.add_map_labels or config.add_night_boundary or config.add_crosshair:
             warnings.append("Labels, night boundary, and crosshair are burned into PNG and GeoTIFF flat-map outputs.")
+    elif config.add_map_labels or config.add_night_boundary or config.add_crosshair:
+        warnings.append("Labels, night boundary, and crosshair are burned into the native full-disk output.")
     if config.gpu_acceleration:
         warnings.append("GPU acceleration is experimental and only applies to compatible custom composite math.")
     if config.download_workers > 4:
@@ -6787,8 +7039,11 @@ def setup_configuration_errors(config: ProcessorConfig) -> list[str]:
         parse_rgb_color(config.crosshair_color)
     except ValueError:
         errors.append("Crosshair color must be a name, #RRGGBB, or R,G,B values.")
-    if (config.add_map_labels or config.add_night_boundary or config.add_crosshair or config.zoom_earth_style) and not is_flat_map(config):
-        errors.append("Zoom Earth-style labels, night boundary, crosshair, and styling require flat map output.")
+    if config.zoom_earth_style and not is_flat_map(config):
+        errors.append(
+            "Zoom Earth-style flat-map styling requires flat map output. Turn it off to use the native "
+            "full-disk view (labels/borders/night boundary/crosshair still work on native)."
+        )
     if config.gpu_acceleration:
         status = gpu_support_status()
         if not status.ok:
@@ -6938,6 +7193,205 @@ def build_setup_status(
     )
 
 
+# ---------------------------------------------------------------------------
+# In-app self-update (download latest default branch from GitHub and replace
+# the local files). Designed to be SAFE: HTTPS only, archive path-traversal
+# guard, the downloaded code is compile-checked before anything is replaced,
+# and every replaced file is backed up first so a bad update can be undone.
+# ---------------------------------------------------------------------------
+def github_api_request(url: str, timeout: int = GITHUB_UPDATE_TIMEOUT_SECONDS):
+    import urllib.request
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": f"{APP_DISPLAY_NAME}/{APP_VERSION}",
+            "Accept": "application/vnd.github+json",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def github_default_branch(repo: str = GITHUB_REPO, timeout: int = GITHUB_UPDATE_TIMEOUT_SECONDS) -> str:
+    data = github_api_request(f"{GITHUB_API_BASE}/repos/{repo}", timeout=timeout)
+    branch = data.get("default_branch") if isinstance(data, dict) else None
+    if not branch:
+        raise RuntimeError("Could not determine the repository's default branch.")
+    return str(branch)
+
+
+def download_github_branch_zip(
+    repo: str,
+    branch: str,
+    dest_path: Path,
+    timeout: int = GITHUB_UPDATE_TIMEOUT_SECONDS,
+) -> Path:
+    import urllib.request
+
+    url = f"{GITHUB_API_BASE}/repos/{repo}/zipball/{branch}"
+    request = urllib.request.Request(url, headers={"User-Agent": f"{APP_DISPLAY_NAME}/{APP_VERSION}"})
+    with urllib.request.urlopen(request, timeout=timeout) as response, open(dest_path, "wb") as handle:
+        shutil.copyfileobj(response, handle)
+    return dest_path
+
+
+def safe_extract_zip(zip_path: Path, extract_dir: Path) -> None:
+    """Extract a zip while refusing any member that would escape extract_dir."""
+    import zipfile
+
+    extract_root = extract_dir.resolve()
+    with zipfile.ZipFile(zip_path) as archive:
+        for member in archive.namelist():
+            target = (extract_dir / member).resolve()
+            if target != extract_root and extract_root not in target.parents:
+                raise RuntimeError(f"Refusing unsafe path in update archive: {member}")
+        archive.extractall(extract_dir)
+
+
+def find_repo_file(extract_dir: Path, filename: str) -> Path | None:
+    matches = sorted(extract_dir.rglob(filename))
+    return matches[0] if matches else None
+
+
+def perform_self_update(
+    project_dir: Path,
+    log: Callable[[str], None] | None = None,
+    repo: str = GITHUB_REPO,
+) -> dict:
+    """Download the latest default branch and replace local files in place.
+
+    Returns a summary dict. Raises on any failure (with nothing replaced unless
+    the compile-check already passed). Every replaced file is backed up under
+    project_dir/backups/pre_update_<timestamp>/ first.
+    """
+    import py_compile
+    import tempfile
+
+    def emit(message: str) -> None:
+        LOG.info(message)
+        if log is not None:
+            try:
+                log(message)
+            except Exception:
+                pass
+
+    emit(f"Checking github.com/{repo} for the latest version...")
+    branch = github_default_branch(repo)
+    emit(f"Default branch is '{branch}'. Downloading...")
+
+    with tempfile.TemporaryDirectory(prefix="himawari_update_") as temp_name:
+        temp_dir = Path(temp_name)
+        zip_path = temp_dir / "update.zip"
+        download_github_branch_zip(repo, branch, zip_path)
+        emit(f"Downloaded {zip_path.stat().st_size:,} bytes. Extracting...")
+
+        extract_dir = temp_dir / "extracted"
+        extract_dir.mkdir()
+        safe_extract_zip(zip_path, extract_dir)
+
+        new_main = find_repo_file(extract_dir, "himawari_lowram_processor.py")
+        if new_main is None:
+            raise RuntimeError("Downloaded branch does not contain himawari_lowram_processor.py; update aborted.")
+
+        # Verify the freshly downloaded code at least compiles before replacing anything.
+        try:
+            py_compile.compile(str(new_main), doraise=True)
+        except py_compile.PyCompileError as exc:
+            raise RuntimeError(f"Downloaded code failed to compile; update aborted. {exc.msg}") from exc
+
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        backup_dir = project_dir / "backups" / f"pre_update_{timestamp}"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        running_file = Path(__file__).resolve()
+
+        updated: list[str] = []
+        for filename in SELF_UPDATE_FILES:
+            source = find_repo_file(extract_dir, filename)
+            if source is None:
+                continue
+            # The main script overwrites the actually-running file (handles a
+            # locally renamed copy); auxiliary files land beside it.
+            destination = running_file if filename == "himawari_lowram_processor.py" else (project_dir / filename)
+            if destination.exists():
+                shutil.copy2(destination, backup_dir / destination.name)
+            shutil.copy2(source, destination)
+            updated.append(destination.name)
+            emit(f"Updated {destination.name}")
+
+        if not updated:
+            raise RuntimeError("No updatable files were found in the downloaded branch.")
+
+        emit(f"Backed up replaced files to {backup_dir}")
+        return {
+            "branch": branch,
+            "updated": updated,
+            "backup_dir": str(backup_dir),
+            "running_file": str(running_file),
+        }
+
+
+class _Tooltip:
+    """Lightweight hover tooltip for any Tk widget (beginner help on hover)."""
+
+    def __init__(self, widget, text: str, delay_ms: int = 450, wrap: int = 360):
+        self.widget = widget
+        self.text = text
+        self.delay_ms = delay_ms
+        self.wrap = wrap
+        self._after_id = None
+        self._tip = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _event=None):
+        self._cancel()
+        self._after_id = self.widget.after(self.delay_ms, self._show)
+
+    def _cancel(self):
+        if self._after_id is not None:
+            try:
+                self.widget.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+
+    def _show(self):
+        if self._tip is not None or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 18
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+            self._tip = tk.Toplevel(self.widget)
+            self._tip.wm_overrideredirect(True)
+            self._tip.wm_geometry(f"+{x}+{y}")
+            label = tk.Label(
+                self._tip,
+                text=self.text,
+                justify="left",
+                background="#fffbe6",
+                foreground="#1d1d1f",
+                relief="solid",
+                borderwidth=1,
+                wraplength=self.wrap,
+                padx=8,
+                pady=5,
+            )
+            label.pack()
+        except Exception:
+            self._tip = None
+
+    def _hide(self, _event=None):
+        self._cancel()
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except Exception:
+                pass
+            self._tip = None
+
+
 class HimawariProcessorApp:
     def __init__(self, root: tk.Tk) -> None:
         loaded_settings = load_gui_settings()
@@ -6965,7 +7419,7 @@ class HimawariProcessorApp:
         self.custom_presets = load_custom_presets()
         self.preview_image: object | None = None
 
-        self.ui_mode_var = tk.StringVar(value="Simple")
+        self.ui_mode_var = tk.StringVar(value="Advanced")
         self.url_var = tk.StringVar(value=initial_config.user_url)
         self.mode_var = tk.StringVar(value=initial_config.mode)
         self.composite_var = tk.StringVar(value=initial_config.composite_choice)
@@ -6982,6 +7436,7 @@ class HimawariProcessorApp:
         self.resampler_var = tk.StringVar(value=initial_config.resampler)
         self.night_fallback_mode_var = tk.StringVar(value=initial_config.night_fallback_mode)
         self.map_view_var = tk.StringVar(value=initial_config.map_view)
+        self.area_preset_var = tk.StringVar(value=AREA_PRESET_CUSTOM)
         self.flat_min_lat_var = tk.StringVar(value=str(initial_config.flat_min_lat))
         self.flat_max_lat_var = tk.StringVar(value=str(initial_config.flat_max_lat))
         self.flat_min_lon_var = tk.StringVar(value=str(initial_config.flat_min_lon))
@@ -7279,6 +7734,7 @@ class HimawariProcessorApp:
             options_frame,
             text="Zoom Earth-style flat map",
             variable=self.zoom_earth_style_var,
+            command=self._on_zoom_earth_toggle,
         ).grid(row=3, column=0, sticky="w", pady=(4, 4))
         labels_row = ttk.Frame(options_frame)
         labels_row.grid(row=3, column=1, sticky="ew", pady=(4, 4))
@@ -7509,7 +7965,7 @@ class HimawariProcessorApp:
         self.open_temp_button.grid(row=13, column=0, columnspan=2, sticky="ew", pady=(2, 0))
 
         preset_frame = ttk.LabelFrame(advanced, text="Custom Presets", style="Section.TLabelframe")
-        preset_frame.grid(row=1, column=0, columnspan=2, sticky="ew")
+        preset_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         preset_frame.columnconfigure(0, weight=1)
         self.custom_preset_var = tk.StringVar(value="")
         self.custom_preset_box = ttk.Combobox(
@@ -7523,6 +7979,28 @@ class HimawariProcessorApp:
             row=0, column=2, padx=(0, 8)
         )
         ttk.Button(preset_frame, text="Delete", command=self._delete_custom_preset).grid(row=0, column=3)
+
+        area_frame = ttk.LabelFrame(advanced, text="Output Region (Area Preset)", style="Section.TLabelframe")
+        area_frame.grid(row=1, column=0, columnspan=2, sticky="ew")
+        area_frame.columnconfigure(0, weight=1)
+        ttk.Label(
+            area_frame,
+            text="Pick a region to frame the output. Regional presets and 'Full Disk (flat map)' "
+            "switch to the flat map and fill the bounds; 'Full Disk (native)' uses the round-Earth "
+            "view (and turns off Zoom Earth styling, which is flat-only).",
+            style="Status.TLabel",
+            wraplength=520,
+            justify="left",
+        ).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        self.area_preset_box = ttk.Combobox(
+            area_frame,
+            textvariable=self.area_preset_var,
+            values=area_preset_names(),
+            state="readonly",
+        )
+        self.area_preset_box.grid(row=1, column=0, sticky="ew", padx=(0, 8))
+        self.area_preset_box.bind("<<ComboboxSelected>>", lambda _event: self._apply_area_preset())
+        ttk.Button(area_frame, text="Apply Region", command=self._apply_area_preset).grid(row=1, column=1)
         self._refresh_path_fields()
         self._path_controls = (
             self.choose_output_button,
@@ -7534,6 +8012,7 @@ class HimawariProcessorApp:
         self._refresh_custom_preset_box()
         self._refresh_recent_runs()
         self._refresh_ui_mode()
+        self.notebook.select(0)
 
         self.log_frame = ttk.Frame(self.main_pane, padding=(0, 4, 0, 0))
         self.log_frame.columnconfigure(0, weight=1)
@@ -7588,6 +8067,13 @@ class HimawariProcessorApp:
         self.copy_log_button = ttk.Button(buttons, text="Copy Log", command=self._copy_current_log)
         self.copy_log_button.grid(row=0, column=7, padx=(0, 8))
         ttk.Button(buttons, text="Close", command=self._terminate_app).grid(row=0, column=9)
+        self.copy_settings_button = ttk.Button(buttons, text="Copy Settings", command=self._copy_last_settings)
+        self.copy_settings_button.grid(row=1, column=4, padx=(0, 8), pady=(8, 0))
+        self.update_app_button = ttk.Button(buttons, text="Update App", command=self._update_from_github)
+        self.update_app_button.grid(row=1, column=5, padx=(0, 8), pady=(8, 0))
+        self.help_button = ttk.Button(buttons, text="Help (?)", command=self._open_help_window)
+        self.help_button.grid(row=1, column=6, padx=(0, 8), pady=(8, 0))
+        self._install_tooltips()
         self._refresh_mode_state()
         self._configure_main_split()
 
@@ -8106,6 +8592,216 @@ class HimawariProcessorApp:
             self._append_log(f"Satellite layer set to {mode}; flat-map true-color defaults applied.")
         self._update_setup_status()
         self._write_current_settings()
+
+    def _apply_area_preset(self) -> None:
+        name = self.area_preset_var.get().strip()
+        if name == AREA_PRESET_CUSTOM:
+            self._append_log("Area preset: Custom (manual bounds kept).")
+            return
+        if name == AREA_PRESET_FULL_DISK:
+            self.map_view_var.set("native")
+            if self.zoom_earth_style_var.get():
+                self.zoom_earth_style_var.set(False)
+                self._append_log("Full Disk (native): turned off Zoom Earth style (it is flat-map only).")
+            self._append_log("Area preset: Full Disk (native full-disk view); labels/borders still render.")
+        else:
+            bounds = area_preset_bounds(name)
+            if bounds is None:
+                self._append_log(f"Area preset '{name}' is not recognized; bounds unchanged.")
+                return
+            min_lat, max_lat, min_lon, max_lon = bounds
+            self.map_view_var.set("flat")
+            self.flat_min_lat_var.set(str(min_lat))
+            self.flat_max_lat_var.set(str(max_lat))
+            self.flat_min_lon_var.set(str(min_lon))
+            self.flat_max_lon_var.set(str(max_lon))
+            self._append_log(
+                f"Area preset '{name}' applied: flat map lat {min_lat}..{max_lat}, lon {min_lon}..{max_lon}."
+            )
+        self._update_setup_status()
+        self._write_current_settings()
+
+    def _on_zoom_earth_toggle(self) -> None:
+        if self.zoom_earth_style_var.get() and normalized_map_view(self.map_view_var.get()) != "flat":
+            self.map_view_var.set("flat")
+            self._append_log("Zoom Earth style enabled; switched map view to flat (it requires a flat map).")
+        self._update_setup_status()
+        self._write_current_settings()
+
+    def _add_tooltip(self, widget, text: str) -> None:
+        if widget is None:
+            return
+        if not hasattr(self, "_tooltips"):
+            self._tooltips = []
+        try:
+            self._tooltips.append(_Tooltip(widget, text))
+        except Exception:
+            pass
+
+    def _button_help_texts(self) -> dict[str, str]:
+        return {
+            "start_button": "Start Processing: download the satellite data and create the image or timelapse with the current settings.",
+            "stop_button": "Stop: cancel the run that is currently in progress.",
+            "open_output_button": "Open Outputs: open the folder where finished images and timelapses are saved.",
+            "open_last_button": "Open Last: open the most recently created output file.",
+            "copy_paths_button": "Copy Paths: copy the file paths of the last run's outputs to the clipboard.",
+            "copy_error_button": "Copy Error: copy the last error report to the clipboard (useful for bug reports).",
+            "copy_log_button": "Copy Log: copy the on-screen run log to the clipboard.",
+            "copy_settings_button": "Copy Settings: copy the last run's settings as JSON, handy for sharing your exact setup with an AI agent or in a bug report.",
+            "update_app_button": "Update App: download the latest version from GitHub and replace the local files (a backup is made first; restart afterwards).",
+            "help_button": "Help: open a window explaining what every button does.",
+            "check_env_button": "Check Env: run the environment checker to confirm Python and packages are installed correctly.",
+            "quick_fix_button": "Quick Fix: try to repair the Python environment (upgrade packages, install overlay data).",
+            "auto_fix_button": "Auto Fix: automatically repair the environment, creating a dedicated Python if needed.",
+            "latest_url_button": "Latest FLDK: fill the URL with the most recent full-disk scan available.",
+            "scan_browser_button": "Choose Scan: browse and pick a specific scan time to process.",
+            "local_files_button": "Local Files: import already-downloaded .DAT/.DAT.bz2 segment files instead of downloading.",
+            "simple_output_button": "Choose Output Folder: pick where finished images are saved.",
+            "choose_output_button": "Choose Output Folder: pick where finished images are saved.",
+            "choose_temp_button": "Choose Temp Folder: pick where temporary download files are stored.",
+            "open_temp_button": "Open Temp Folder: open the temporary working folder.",
+            "overlay_check_button": "Check Overlay Setup: verify the coastline/border overlay data is installed.",
+            "area_preset_box": "Output Region: pick a region to frame the image. Regional presets and 'Full Disk (flat map)' switch to the flat map and fill the bounds; 'Full Disk (native)' uses the round-Earth view.",
+            "satellite_layer_box": "Satellite Layer: 'standard' is normal; 'live' grabs the latest scan; 'hd' applies stronger enhancement. live/hd also turn on flat-map true-color styling.",
+            "map_view_box": "Map View: 'native' is the round full-disk Earth; 'flat' is a rectangular Web Mercator map you can crop with the bounds.",
+        }
+
+    def _install_tooltips(self) -> None:
+        for attr, text in self._button_help_texts().items():
+            self._add_tooltip(getattr(self, attr, None), text)
+
+    def _open_help_window(self) -> None:
+        window = tk.Toplevel(self.root)
+        window.title("Help — what each button does")
+        window.geometry("620x560")
+        window.transient(self.root)
+        container = ttk.Frame(window, padding=12)
+        container.pack(fill="both", expand=True)
+        ttk.Label(
+            container,
+            text="Hover any button in the main window to see this same help as a tooltip.",
+            style="Status.TLabel",
+            wraplength=580,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 8))
+        text_widget = tk.Text(container, wrap="word", height=24, borderwidth=1, relief="solid")
+        scroll = ttk.Scrollbar(container, orient="vertical", command=text_widget.yview)
+        text_widget.configure(yscrollcommand=scroll.set)
+        text_widget.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        sections = [
+            ("Run", ["start_button", "stop_button", "open_output_button", "open_last_button"]),
+            ("Clipboard", ["copy_paths_button", "copy_error_button", "copy_log_button", "copy_settings_button"]),
+            ("Maintenance", ["update_app_button", "check_env_button", "quick_fix_button", "auto_fix_button", "help_button"]),
+            ("Source", ["latest_url_button", "scan_browser_button", "local_files_button"]),
+            ("Choices", ["satellite_layer_box", "map_view_box", "area_preset_box"]),
+        ]
+        helps = self._button_help_texts()
+        for title, keys in sections:
+            text_widget.insert("end", f"{title}\n", ("h",))
+            for key in keys:
+                if key in helps:
+                    label = helps[key].split(":", 1)
+                    name = label[0]
+                    desc = label[1].strip() if len(label) > 1 else ""
+                    text_widget.insert("end", f"  • {name}: ", ("b",))
+                    text_widget.insert("end", f"{desc}\n")
+            text_widget.insert("end", "\n")
+        text_widget.tag_configure("h", font=("Segoe UI", 11, "bold"), spacing1=6, spacing3=2)
+        text_widget.tag_configure("b", font=("Segoe UI", 9, "bold"))
+        text_widget.configure(state="disabled")
+        ttk.Button(window, text="Close", command=window.destroy).pack(pady=(0, 10))
+
+    def _copy_last_settings(self) -> None:
+        """Copy the last run's settings (or current settings) as JSON for an AI agent."""
+        payload: dict[str, object] = {
+            "app": APP_DISPLAY_NAME,
+            "app_version": APP_VERSION,
+            "exported_at_utc": utc_timestamp(),
+        }
+        source_label = "current settings (no run recorded yet)"
+        config_dict: dict[str, object] | None = None
+        if getattr(self, "last_config", None) is not None:
+            config_dict = self.last_config.__dict__.copy()
+            source_label = "last started run (this session)"
+        elif self.recent_runs:
+            record = self.recent_runs[0]
+            config_dict = dict(record.config)
+            payload["last_run"] = {
+                "run_id": record.run_id,
+                "status": record.status,
+                "started_at_utc": record.started_at_utc,
+                "completed_at_utc": record.completed_at_utc,
+                "product": record.product,
+                "source": record.source,
+                "main_output": record.main_output,
+            }
+            source_label = "most recent recorded run"
+        else:
+            try:
+                config_dict = self._read_config().__dict__.copy()
+            except Exception as exc:
+                self._append_log(f"Could not read current settings to copy: {exc}")
+                messagebox.showerror("Copy settings failed", str(exc))
+                return
+        payload["settings_source"] = source_label
+        payload["config"] = config_dict
+        try:
+            payload["output_dir"] = self.output_dir_var.get()
+            payload["temp_dir"] = self.temp_dir_var.get()
+        except Exception:
+            pass
+        text = json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True)
+        self._copy_to_clipboard(text)
+        self._append_log(f"Copied settings to clipboard ({source_label}).")
+
+    def _update_from_github(self) -> None:
+        if self.is_running:
+            messagebox.showinfo("Update App", "Please wait until the current run finishes before updating.")
+            return
+        message = (
+            f"Download the latest version from github.com/{GITHUB_REPO} and replace the local "
+            "program files?\n\n"
+            "A backup of every replaced file is saved under the 'backups' folder first, and the "
+            "downloaded code is checked before anything is replaced.\n\n"
+            "You will need to restart the app afterwards."
+        )
+        if not messagebox.askokcancel("Update App", message):
+            self._append_log("Update canceled.")
+            return
+        self.update_app_button.configure(state="disabled")
+        self._append_log("Starting update from GitHub...")
+
+        def log_from_thread(text: str) -> None:
+            self.root.after(0, lambda: self._append_log(text))
+
+        def worker() -> None:
+            try:
+                result = perform_self_update(PROJECT_DIR, log=log_from_thread)
+            except Exception as exc:
+                self.root.after(0, lambda: self._update_finished(False, str(exc)))
+            else:
+                self.root.after(0, lambda: self._update_finished(True, result))
+
+        threading.Thread(target=worker, name="himawari-self-update", daemon=True).start()
+
+    def _update_finished(self, ok: bool, result: object) -> None:
+        self.update_app_button.configure(state="normal")
+        if not ok:
+            self._append_log(f"Update failed: {result}")
+            messagebox.showerror("Update failed", str(result))
+            return
+        summary = result if isinstance(result, dict) else {}
+        updated = ", ".join(summary.get("updated", []) or []) or "(none)"
+        backup_dir = summary.get("backup_dir", "")
+        self._append_log(f"Update complete. Updated: {updated}. Backup: {backup_dir}")
+        messagebox.showinfo(
+            "Update complete",
+            "The latest version was installed.\n\n"
+            f"Updated files: {updated}\n"
+            f"Backup saved to:\n{backup_dir}\n\n"
+            "Please close and relaunch the app to use the new version.",
+        )
 
     def _apply_preset(self, name: str) -> None:
         try:

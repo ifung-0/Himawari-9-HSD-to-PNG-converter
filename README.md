@@ -297,6 +297,63 @@ Cancellation is cooperative. Downloads stop at the next streamed chunk or
 request timeout, while Satpy load/resample/save calls finish their current call
 before the processor observes the stop request.
 
+## What's New In This Build (2026.06.15.00)
+
+### Brighter, more natural true color
+True-color flat maps previously looked almost entirely dark over ocean. A
+highlight-preserving shadow/midtone lift now raises dark water and faint
+cloud/land detail into a legible range while protecting cloud highlights, so the
+ocean reads as a brighter blue instead of near-black. The **live** and **hd**
+satellite layers were also dialled back from an over-saturated, garish look to a
+crisp-but-natural rendering, and their default coastline/border colour changed
+from bright green to a subtle light grey-blue. If you want to fine-tune the look,
+the relevant functions are `lift_true_color_shadows` and
+`apply_zoom_earth_true_color_enhancement`.
+
+### Output region presets
+The **Advanced** tab has an **Output Region (Area Preset)** selector. Pick a
+region to frame the output image:
+
+- **Full Disk (native)** switches to the native full-disk view (the whole round
+  Earth as the satellite sees it).
+- A regional preset (Australia, Central Asia, New Zealand, Pacific Islands 1-10,
+  Southeast Asia 1-3, South Asia) switches to the flat Web-Mercator map and fills
+  in the latitude/longitude bounds for you.
+- **Custom (manual bounds)** leaves the bounds exactly as you set them.
+
+Because Himawari-9 sits at 140.7&deg;E, regions near the western limb (Central
+Asia, South Asia) can show some edge falloff. You can always tweak the bounds by
+hand after applying a preset.
+
+### Labels on the native view
+Map labels (and the night boundary, crosshair, and coastline/border overlays)
+now also draw on the **native** full-disk view, not only on flat maps. Turn on
+**Labels** in Options and they will be burned into native PNG/GeoTIFF output too.
+Native output otherwise stays the raw satellite product (no flat-map tone
+styling is applied to it).
+
+### Copy Settings button
+The new **Copy Settings** button (bottom button row) copies the settings of your
+last run as formatted JSON to the clipboard. If no run has happened yet it copies
+the current settings. This is handy for sharing the exact configuration with an
+AI agent or in a bug report.
+
+### Update App button
+The new **Update App** button downloads the latest default branch of
+`github.com/ifung-0/Himawari-9-HSD-to-PNG-converter` and replaces the local
+program files. It is intentionally cautious:
+
+- It asks for confirmation first.
+- It refuses any archive entry that would write outside the project folder.
+- It checks that the downloaded code compiles **before** replacing anything.
+- It backs up every replaced file to a timestamped folder under `backups/`
+  first, so a bad update can be undone by restoring those files.
+- It updates the actually-running script file in place (so a renamed working
+  copy such as `himawari_lowram_processor_claude.py` is updated correctly).
+
+After it finishes, close and relaunch the app. If anything looks wrong, restore
+the files from the newest folder under `backups/`.
+
 ## Supported Choices
 
 All standalone bands are supported from `B01` through `B16`.
