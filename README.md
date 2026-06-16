@@ -246,7 +246,7 @@ python check_environment.py --plain
 Current fixed build: `2026.06.08.10`. Processing logs should include:
 
 ```text
-App version: 2026.06.08.10
+App version: 2026.06.16.01
 ```
 
 This build accepts Himawari-8 and Himawari-9 raw HSD file names and NOAA S3 URLs.
