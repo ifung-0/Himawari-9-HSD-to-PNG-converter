@@ -5,7 +5,7 @@ AWS S3, processes them with Satpy, and writes either a single PNG or a GIF/MP4
 timelapse. The pipeline is designed for a conservative 10 GiB memory budget,
 with defaults that favor lower peak RAM over speed.
 
-> **Current build:** `2026.06.17.06` — see [What's New](#whats-new) at the
+> **Current build:** `2026.06.17.07` — see [What's New](#whats-new) at the
 > bottom of this file for the latest changes.
 
 ---
@@ -28,6 +28,58 @@ with defaults that favor lower peak RAM over speed.
 > throughout this README; if you are using the single-file distribution, those
 > helpers are not included and the relevant commands only apply to the full
 > multi-file release.
+
+---
+
+## Simple Version (`himawari_lowram_simple.py`)
+
+For people who just want a picture and don't want to think about satellite
+layers, resamplers, or metadata sidecars, there is a stripped-down front-end to
+the same low-RAM engine:
+
+```powershell
+python himawari_lowram_simple.py
+```
+
+It opens a smaller window with only the essentials:
+
+**Run Setup tab:**
+- **Source** — URL, **Latest FLDK**, **Choose Scan**, **Local Files...**
+- **Product** — the same band/composite list as the full GUI.
+- **Output** — Single Image / Timelapse, hours back, interval, FPS, animation
+  format (gif/mp4).
+- **Options** — just three things:
+  - **Map style**: *Native flat map* or *Zoom Earth style flat map* (radio
+    buttons — no native-round-disk option, no live/hd layer switching).
+  - **Labels** toggle with a colour chooser and a size spinner.
+  - **Coastline & borders** toggle with a colour chooser.
+- **Flat-map region** — the four latitude/longitude bound fields plus a
+  **Pick Region (map)** button.
+- **Status** + **Start Processing** / **Stop**.
+
+**Advanced tab — Performance only:**
+- Download workers, Dask workers + chunk size, RAM limit, **Max PNG Pixels**,
+  **Safe Mode** / **Best Performance** buttons, and the experimental **Use GPU**
+  toggle. The output/temp folder fields and the resampler selector are hidden —
+  they use the safe low-RAM defaults.
+
+**Bottom button row (all kept):** Quick Look, Pick Region, Test Data Host,
+Check Env, Quick Fix, Auto Fix, Check Overlays, Open Outputs, Open Last, Copy
+Paths/Error/Log/Settings, Update App, Help.
+
+**What's locked (forced, not shown):**
+- Satellite layer = `standard` (no live/hd auto-switching).
+- Auto-download missing satellite files = **on** (always).
+- Write metadata sidecar = **off** (always).
+- Resampler = `native` (the low-RAM default).
+- Night fallback = `hybrid`, crosshair/night-boundary off, segment-aware
+  downloads on, image format PNG — all sensible defaults, not exposed.
+
+The simple GUI saves its own settings file (`himawari_simple_settings.json`) so
+it never clobbers the full GUI's saved settings. Everything heavy — downloads,
+Satpy, true-color enhancement, basemap blend, timelapse assembly, progress
+polling, cancellation — is inherited unchanged from the full processor, so an
+image looks exactly the same either way.
 
 ---
 
@@ -778,6 +830,14 @@ reader dependencies.
 ---
 
 ## What's New
+
+### 2026.06.17.07 — Simple version (`himawari_lowram_simple.py`)
+
+A new stripped-down front-end for users who just want a picture. It exposes
+only Source, Product, Output mode/timing, and three Options (map style, labels,
+coastline/borders), keeps all the bottom helper buttons, and locks everything
+else to safe defaults (standard satellite layer, auto-download on, no metadata
+sidecar, native resampler). See the **Simple Version** section above.
 
 ### 2026.06.17.06 — No more red spots, blue top edge, or black corners
 
