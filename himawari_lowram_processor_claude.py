@@ -65,7 +65,7 @@ except KeyboardInterrupt:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-APP_VERSION = "2026.06.17.01"
+APP_VERSION = "2026.06.17.06"
 APP_DISPLAY_NAME = "Himawari-8/9 Low-RAM Processor"
 USER_URL = "https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/2024/07/25/0400/HS_H09_20240725_0400_B01_FLDK_R10_S0110.DAT.bz2"
 MODE = "Single Image"  # "Single Image" or "Timelapse"
@@ -101,9 +101,9 @@ ADD_CROSSHAIR = False
 CROSSHAIR_TYPE = "target"
 CROSSHAIR_COLOR = "#7c3cff"
 ZOOM_EARTH_STYLE = False
-FLAT_MAP_INVALID_FILL = (12, 26, 44)
+FLAT_MAP_INVALID_FILL = (18, 24, 32)  # neutral dark blue-gray: visible (not near-black) so off-disk corners don't look black
 FLAT_MAP_SOURCE_VALID_MIN = 1.0e-6
-FLAT_MAP_BASEMAP_OCEAN = (15, 32, 52)
+FLAT_MAP_BASEMAP_OCEAN = (18, 24, 32)  # neutral dark blue-gray basemap: dark enough to recede, light enough to not look black
 FLAT_MAP_BASEMAP_LAND = (60, 72, 60)
 FLAT_MAP_BASEMAP_COAST = (122, 134, 126)
 FLAT_MAP_LIMB_FADE_FRACTION = 0.05
@@ -4227,37 +4227,43 @@ def apply_zoom_earth_true_color_enhancement(image, hd: bool = False):
     working = lift_true_color_shadows(working, strength=0.30 if hd else 0.55)
     if hd:
         working = robust_true_color_stretch(working)
-    gamma = 0.76 if hd else 0.84
+    # Gentle gamma keeps the disk bright and neutral. The old 0.76/0.84 lifted
+    # shadows so aggressively that midtones turned hazy and over-saturated.
+    gamma = 0.86 if hd else 0.92
     gamma_lut = [int(round((value / 255.0) ** gamma * 255.0)) for value in range(256)]
     working = working.point(gamma_lut * 3)
-    # HD saturation/contrast were too punchy (this is what made live/hd look
-    # "weird"); these are dialled back to a natural-but-crisp look.
-    working = ImageEnhance.Color(working).enhance(1.30 if hd else 1.20)
-    working = ImageEnhance.Contrast(working).enhance(1.10 if hd else 1.06)
-    working = ImageEnhance.Brightness(working).enhance(1.06 if hd else 1.05)
-    working = ImageEnhance.Sharpness(working).enhance(1.12 if hd else 1.08)
+    # Subtle saturation/contrast: enough to look crisp, not enough to push the
+    # disk off neutral. The old 1.30/1.20 Color push over-saturated everything.
+    working = ImageEnhance.Color(working).enhance(1.10)
+    working = ImageEnhance.Contrast(working).enhance(1.05 if hd else 1.03)
+    working = ImageEnhance.Brightness(working).enhance(1.04 if hd else 1.03)
+    working = ImageEnhance.Sharpness(working).enhance(1.08 if hd else 1.06)
     if hd:
         enhanced = np.asarray(working.convert("RGB"), dtype=np.float32)
         luminance = 0.2126 * original_rgb[:, :, 0] + 0.7152 * original_rgb[:, :, 1] + 0.0722 * original_rgb[:, :, 2]
-        protect = np.clip((luminance - 198.0) / 57.0, 0.0, 0.38)
+        protect = np.clip((luminance - 200.0) / 55.0, 0.0, 0.30)
         protected = np.clip((enhanced * (1.0 - protect[:, :, None])) + (original_rgb * protect[:, :, None]), 0, 255)
         working = Image.fromarray(protected.astype(np.uint8), mode="RGB")
+    # Targeted white balance. The old code applied a warm "blue cut" (B *= 0.88)
+    # to the *entire* disk, which turned ocean and land yellow/brown (disk B/R
+    # dropped to ~0.79 vs the reference ~0.95). Now the blue correction only
+    # touches genuinely bright, low-chroma cloud pixels, and instead of blindly
+    # subtracting blue it pulls blue toward the neutral target
+    # (B ~= 0.95 * max(R, G)) so clouds stay clean white while the rest of the
+    # Earth keeps its natural colour. No second re-saturation pass is applied.
     balanced = np.asarray(working.convert("RGB"), dtype=np.float32)
     luminance = 0.2126 * balanced[:, :, 0] + 0.7152 * balanced[:, :, 1] + 0.0722 * balanced[:, :, 2]
     maximum = balanced.max(axis=2)
     minimum = balanced.min(axis=2)
     chroma = maximum - minimum
-    cloud_protect = np.clip((luminance - 196.0) / 58.0, 0.0, 0.55) * np.clip(1.0 - chroma / 92.0, 0.0, 1.0)
-    warm_mix = 1.0 - cloud_protect
-    warm = balanced.copy()
-    warm[:, :, 0] *= 1.07 if hd else 1.05
-    warm[:, :, 1] *= 1.03 if hd else 1.02
-    warm[:, :, 2] *= 0.88 if hd else 0.91
-    blue_excess = np.maximum(0.0, warm[:, :, 2] - np.maximum(warm[:, :, 0], warm[:, :, 1]))
-    warm[:, :, 2] -= blue_excess * (0.30 if hd else 0.24)
-    balanced = np.clip((balanced * (1.0 - warm_mix[:, :, None])) + (warm * warm_mix[:, :, None]), 0, 255)
+    cloud_mask = np.clip((luminance - 170.0) / 50.0, 0.0, 1.0) * np.clip(1.0 - chroma / 70.0, 0.0, 1.0)
+    red = balanced[:, :, 0]
+    green = balanced[:, :, 1]
+    blue = balanced[:, :, 2]
+    neutral_blue = 0.95 * np.maximum(red, green)
+    blue_excess = np.maximum(0.0, blue - neutral_blue)
+    balanced[:, :, 2] = np.clip(blue - blue_excess * cloud_mask * 0.65, 0, 255)
     working = Image.fromarray(balanced.astype(np.uint8), mode="RGB")
-    working = ImageEnhance.Color(working).enhance(1.12 if hd else 1.22)
     if alpha is not None:
         working.putalpha(alpha)
     return working
@@ -4665,16 +4671,16 @@ def generated_flat_map_ocean_image(area: AreaDefinition):
     height = int(area.height)
     lon, lat = flat_map_lonlat_vectors(area)
     lat_norm = (1.0 - np.clip(np.abs(lat) / WEB_MERCATOR_MAX_LAT, 0.0, 1.0))[:, None]
-    y_grad = np.linspace(0.0, 1.0, height, dtype=np.float32)[:, None]
     lon_wave = ((np.sin(np.deg2rad(lon * 1.7)) + 1.0) * 0.5)[None, :]
     rgb = np.empty((height, width, 3), dtype=np.uint8)
-    rgb[:, :, 0] = np.clip(FLAT_MAP_BASEMAP_OCEAN[0] + 5.0 * lat_norm + 2.0 * lon_wave, 0, 255).astype(np.uint8)
-    rgb[:, :, 1] = np.clip(FLAT_MAP_BASEMAP_OCEAN[1] + 18.0 * lat_norm + 5.0 * lon_wave, 0, 255).astype(np.uint8)
-    rgb[:, :, 2] = np.clip(
-        FLAT_MAP_BASEMAP_OCEAN[2] + 34.0 * lat_norm + 9.0 * lon_wave + 8.0 * y_grad,
-        0,
-        255,
-    ).astype(np.uint8)
+    # Neutral, even background: the ocean basemap is now a dark gray-blue and the
+    # per-latitude/per-longitude gradients are small and balanced across all
+    # three channels. The previous version added up to +34 to blue by latitude
+    # (and +8 by row), which produced a saturated blue gradient that showed
+    # through invalid pixels as a blue veil / "blue spot at the top".
+    rgb[:, :, 0] = np.clip(FLAT_MAP_BASEMAP_OCEAN[0] + 4.0 * lat_norm + 2.0 * lon_wave, 0, 255).astype(np.uint8)
+    rgb[:, :, 1] = np.clip(FLAT_MAP_BASEMAP_OCEAN[1] + 5.0 * lat_norm + 3.0 * lon_wave, 0, 255).astype(np.uint8)
+    rgb[:, :, 2] = np.clip(FLAT_MAP_BASEMAP_OCEAN[2] + 6.0 * lat_norm + 4.0 * lon_wave, 0, 255).astype(np.uint8)
     return Image.fromarray(rgb, mode="RGB").convert("RGBA")
 
 
@@ -4756,11 +4762,26 @@ def flat_map_edge_artifact_mask(image) -> np.ndarray | None:
     large_enough_for_limb_cleanup = min(width, height) >= 32
     washed_limb = large_enough_for_limb_cleanup & (luminance > 132.0) & (chroma < 78) & near_edge
     gray_limb = large_enough_for_limb_cleanup & (luminance > 92.0) & (luminance < 210.0) & (chroma < 36) & near_edge
-    seed = edge_connected_mask(dark_fill | blue_limb | purple_limb | washed_limb | gray_limb)
+    # Subtle blue limb: the gentler enhancement leaves a mild blue tint along
+    # the top/side edges that is too faint for the strong blue_limb detector
+    # (which needs blue > red + 60). Catch near-edge pixels with a milder blue
+    # excess so they get neutralised by the basemap blend instead of leaving a
+    # blue band at the top of the image.
+    subtle_blue_limb = (
+        large_enough_for_limb_cleanup
+        & near_edge
+        & (blue > red + 22)
+        & (blue > green + 16)
+        & (chroma > 18)
+        & (chroma < 80)
+        & (luminance > 28.0)
+        & (luminance < 205.0)
+    )
+    seed = edge_connected_mask(dark_fill | blue_limb | purple_limb | washed_limb | gray_limb | subtle_blue_limb)
     if seed is None:
         return None
     connected = np.zeros(dark_fill.shape, dtype=bool)
-    candidate = blue_limb | purple_limb | washed_limb | gray_limb
+    candidate = blue_limb | purple_limb | washed_limb | gray_limb | subtle_blue_limb
     try:
         from scipy import ndimage
 
@@ -4821,6 +4842,14 @@ def flat_map_basemap_blend_alpha(image, valid_mask: np.ndarray | None) -> np.nda
 
     alpha = np.clip(1.0 - (distance_from_seed / float(max(fade_width, 1))), 0.0, 1.0).astype(np.float32)
     alpha[seed] = 1.0
+    # Force every off-disk (invalid) pixel to fully show the basemap, not just
+    # the limb-fade band. Without this the far corners (beyond the fade width)
+    # keep the raw invalid fill and look black against the brighter disk.
+    normalized_invalid = None
+    if valid_mask is not None:
+        normalized_invalid = ~normalize_validity_mask(valid_mask, image.width, image.height)
+    if normalized_invalid is not None and bool(normalized_invalid.any()):
+        alpha[normalized_invalid] = 1.0
     if not bool((alpha > 0.0).any()):
         return None
     return alpha
@@ -4871,8 +4900,11 @@ def apply_flat_map_style_to_image(
             cosmetic_true_color = config.zoom_earth_style or hd
             if cosmetic_true_color:
                 working = apply_zoom_earth_true_color_enhancement(working, hd=hd)
-                cleanup_true_color_chroma_speckles(working, aggressive=True)
                 working = finish_zoom_earth_true_color_quality(working, hd=hd)
+                # Chroma speckle cleanup runs LAST so it also catches any red/
+                # magenta specks re-emphasised by the final saturation + sharpen
+                # pass in finish_zoom_earth_true_color_quality.
+                cleanup_true_color_chroma_speckles(working, aggressive=True)
             else:
                 working = apply_faithful_true_color_enhancement(working)
                 cleanup_true_color_chroma_speckles(working, aggressive=True)
@@ -7073,6 +7105,20 @@ def save_gui_settings(
     write_json_file(settings_path, serialize_gui_settings(config, output_dir, temp_dir))
 
 
+def _gpu_related_error(error: str) -> bool:
+    return error.startswith("GPU acceleration is enabled")
+
+
+def _config_after_disabling_gpu(values: dict) -> ProcessorConfig | None:
+    """Build a config with gpu_acceleration=False. Returns None on hard failure."""
+    safe_values = dict(values)
+    safe_values["gpu_acceleration"] = False
+    try:
+        return ProcessorConfig(**safe_values)
+    except Exception:
+        return None
+
+
 def load_gui_settings(settings_path: Path = GUI_SETTINGS_FILE) -> tuple[ProcessorConfig, Path, Path] | None:
     data = load_json_file(settings_path)
     if not data or data.get("schema_version") != GUI_SETTINGS_SCHEMA_VERSION:
@@ -7086,8 +7132,26 @@ def load_gui_settings(settings_path: Path = GUI_SETTINGS_FILE) -> tuple[Processo
             values[key] = value
     try:
         config = ProcessorConfig(**values)
-        if setup_configuration_errors(config):
-            return None
+        errors = setup_configuration_errors(config)
+        if errors:
+            # Be forgiving about a single, common failure mode: the user saved
+            # with GPU acceleration enabled, then launched on a machine where
+            # GPU/CuPy support is not ready (or it broke). Previously this
+            # discarded ALL saved settings and silently reverted to defaults.
+            # Now, when the *only* errors are GPU-readiness errors, we auto-
+            # disable GPU, retry once, and keep every other setting intact.
+            if all(_gpu_related_error(err) for err in errors):
+                retried = _config_after_disabling_gpu(values)
+                if retried is not None and not setup_configuration_errors(retried):
+                    LOG.warning(
+                        "GPU acceleration was enabled in saved settings but GPU support is not ready; "
+                        "GPU acceleration has been disabled and all other settings were preserved."
+                    )
+                    config = retried
+                else:
+                    return None
+            else:
+                return None
     except Exception:
         return None
     output_dir = Path(str(data.get("output_dir") or OUTPUT_DIR)).expanduser().resolve()
@@ -8171,14 +8235,137 @@ class _Tooltip:
             self._tip = None
 
 
-class RegionPickerDialog:
-    """A simple clickable equirectangular mini-map for choosing flat-map bounds.
+# Simplified world landmass outlines for the Pick Region mini-map.
+#
+# Each entry is a closed polygon as a list of (longitude_east, latitude) points.
+# The coordinates are deliberately simplified (a few dozen vertices per
+# landmass) so the dataset is small enough to ship inline yet still clearly
+# recognisable: users can see the continents, India, Indonesia, Japan,
+# Australia and New Zealand while dragging a selection box. Longitudes use the
+# normal -180..180 convention; the picker's 60E..140E..140W window clips the
+# off-screen western parts (Europe/Africa) automatically.
+SIMPLIFIED_LANDMASSES: tuple[tuple[tuple[float, float], ...], ...] = (
+    # Eurasia mainland (clockwise: Iberia -> Arctic -> Bering -> SE Asia -> Arabia -> Med)
+    (
+        (-9.5, 43.0), (-9.0, 37.0), (-6.0, 36.0), (-2.0, 36.0), (4.0, 43.0), (12.0, 46.0),
+        (18.0, 40.0), (26.0, 37.0), (33.0, 31.0), (40.0, 30.0), (45.0, 13.0), (52.0, 25.0),
+        (60.0, 25.0), (67.0, 24.0), (72.0, 19.0), (75.0, 12.0), (77.0, 8.0), (80.0, 13.0),
+        (83.0, 18.0), (88.0, 22.0), (92.0, 21.0), (96.0, 16.0), (98.0, 8.0), (101.0, 2.0),
+        (104.0, 1.0), (109.0, 11.0), (108.0, 16.0), (114.0, 22.0), (121.0, 24.0), (122.0, 31.0),
+        (127.0, 33.0), (131.0, 34.0), (136.0, 42.0), (142.0, 45.0), (156.0, 52.0),
+        (162.0, 59.0), (175.0, 60.0), (180.0, 66.0), (175.0, 67.0), (165.0, 69.0),
+        (155.0, 71.0), (140.0, 72.0), (125.0, 73.0), (110.0, 74.0), (95.0, 76.0),
+        (80.0, 73.0), (70.0, 74.0), (60.0, 74.0), (52.0, 72.0), (40.0, 69.0), (31.0, 70.0),
+        (24.0, 71.0), (16.0, 69.0), (12.0, 66.0), (5.0, 62.0), (10.0, 58.0), (8.0, 54.0),
+        (2.0, 51.0), (0.0, 50.0), (-4.0, 49.0), (-8.0, 44.0), (-9.5, 43.0),
+    ),
+    # Australia (clockwise from the north)
+    (
+        (131.0, -12.0), (133.0, -12.0), (136.0, -12.0), (140.0, -13.0), (142.0, -11.0),
+        (143.0, -14.0), (145.0, -16.0), (146.0, -19.0), (150.0, -22.0), (153.0, -25.0),
+        (153.0, -29.0), (150.0, -34.0), (146.0, -38.0), (140.0, -38.0), (136.0, -35.0),
+        (133.0, -32.0), (129.0, -32.0), (124.0, -33.0), (119.0, -34.0), (115.0, -34.0),
+        (113.0, -29.0), (113.0, -23.0), (114.0, -18.0), (122.0, -14.0), (126.0, -14.0),
+        (129.0, -15.0), (131.0, -12.0),
+    ),
+    # Sumatra
+    (
+        (95.0, 5.5), (98.0, 3.0), (101.0, 0.0), (103.0, -2.0), (104.0, -5.0),
+        (102.0, -6.0), (100.0, -3.0), (97.0, 0.0), (95.0, 3.0),
+    ),
+    # Java
+    (
+        (105.0, -6.0), (108.0, -7.0), (112.0, -8.0), (114.0, -8.3), (111.0, -8.0),
+        (107.0, -7.5), (105.0, -6.8),
+    ),
+    # Borneo
+    (
+        (109.0, 2.0), (114.0, 4.0), (118.0, 5.0), (119.0, 2.0), (117.0, -1.0),
+        (113.0, -3.0), (110.0, -3.0), (109.0, 0.0),
+    ),
+    # Sulawesi
+    (
+        (120.0, 1.0), (124.0, 1.5), (124.0, -2.0), (122.0, -5.0), (119.0, -5.0),
+        (119.0, -1.0), (120.0, 1.0),
+    ),
+    # New Guinea
+    (
+        (131.0, -1.0), (136.0, -1.5), (141.0, -2.5), (145.0, -5.0), (150.0, -6.0),
+        (150.0, -9.0), (147.0, -10.0), (140.0, -8.0), (134.0, -5.0), (131.0, -2.0),
+    ),
+    # Philippines (rough)
+    (
+        (120.0, 18.0), (122.0, 20.0), (122.0, 14.0), (126.0, 12.0), (127.0, 7.0),
+        (123.0, 5.0), (120.0, 7.0), (120.0, 12.0), (118.0, 14.0), (120.0, 18.0),
+    ),
+    # Japan (Hokkaido + Honshu, rough)
+    (
+        (130.0, 33.0), (133.0, 34.0), (136.0, 35.0), (140.0, 36.0), (141.0, 39.0),
+        (142.0, 41.0), (145.0, 43.0), (143.0, 45.0), (141.0, 42.0), (138.0, 37.0),
+        (134.0, 34.0), (131.0, 32.0),
+    ),
+    # Taiwan
+    (
+        (120.0, 22.0), (122.0, 25.2), (121.0, 25.0), (120.0, 23.0), (120.0, 22.0),
+    ),
+    # Sri Lanka
+    (
+        (80.0, 9.5), (82.0, 7.0), (81.5, 6.0), (80.0, 6.0), (79.8, 8.0), (80.0, 9.5),
+    ),
+    # New Zealand - North Island
+    (
+        (173.0, -35.0), (175.0, -37.0), (178.0, -39.0), (176.0, -41.0),
+        (174.0, -41.0), (172.0, -39.0), (173.0, -35.0),
+    ),
+    # New Zealand - South Island
+    (
+        (167.0, -41.0), (171.0, -41.0), (174.0, -46.0), (172.0, -47.0),
+        (168.0, -46.5), (166.0, -44.0), (167.0, -41.0),
+    ),
+    # Madagascar
+    (
+        (44.0, -12.0), (49.0, -13.0), (50.0, -16.0), (50.0, -22.0), (47.0, -25.0),
+        (44.0, -23.0), (43.0, -18.0), (43.0, -12.0),
+    ),
+    # Hawaii (small cluster near 155W = 205E, at the right edge of the window)
+    (
+        (202.0, 19.0), (204.0, 21.0), (206.0, 21.0), (207.0, 19.0), (205.0, 19.0),
+        (202.0, 19.0),
+    ),
+)
 
-    The user drags a rectangle over a graticule that shows the Himawari full-disk
-    view; the selection is converted to latitude/longitude and a live pixel and
-    RAM estimate is shown. Confirming fills the main window's flat-map bounds and
-    switches it to the flat map view. Everything is pure tkinter and maths - no
-    external map data is needed.
+# Place-name labels for orientation, as (text, longitude, latitude). Only those
+# that fall inside the picker window are drawn.
+SIMPLIFIED_LAND_LABELS: tuple[tuple[str, float, float], ...] = (
+    ("ASIA", 90.0, 45.0),
+    ("SIBERIA", 105.0, 62.0),
+    ("CHINA", 110.0, 35.0),
+    ("INDIA", 78.0, 22.0),
+    ("SE ASIA", 107.0, 12.0),
+    ("JAPAN", 141.0, 38.5),
+    ("PHILIPPINES", 122.0, 11.0),
+    ("INDONESIA", 116.0, -2.0),
+    ("BORNEO", 115.0, 1.0),
+    ("PAPUA N.G.", 143.0, -6.0),
+    ("AUSTRALIA", 134.0, -25.0),
+    ("NEW ZEALAND", 173.0, -43.0),
+    ("PACIFIC OCEAN", 175.0, 8.0),
+    ("ARABIAN SEA", 62.0, 14.0),
+    ("HAWAII", 206.0, 23.0),
+    ("INDIAN OCEAN", 85.0, -15.0),
+)
+
+
+class RegionPickerDialog:
+    """A clickable equirectangular mini-map for choosing flat-map bounds.
+
+    The map shows the simplified continents and islands (Asia, India, SE Asia,
+    Indonesia, Japan, Australia, New Zealand, ...) over a graticule, with the
+    Himawari full-disk coverage outlined. The user drags a rectangle over the
+    landmasses they want; the selection is converted to latitude/longitude and a
+    live pixel and RAM estimate is shown. Confirming fills the main window's
+    flat-map bounds and switches it to the flat map view. Everything is pure
+    tkinter and maths - no external map data is needed.
     """
 
     LON_MIN = 60.0
@@ -8205,7 +8392,7 @@ class RegionPickerDialog:
     def _build(self) -> None:
         ttk.Label(
             self.window,
-            text="Drag a box over the map to set the flat-map crop. The dashed outline is the Himawari view.",
+            text="Drag a box over the map to set the flat-map crop. Landmasses are shown in green; the dashed cyan outline is the Himawari full-disk view.",
             wraplength=self.CANVAS_W,
         ).pack(padx=10, pady=(10, 6))
         self.canvas = tk.Canvas(
@@ -8254,6 +8441,7 @@ class RegionPickerDialog:
     # -- drawing --------------------------------------------------------
     def _draw_base_map(self) -> None:
         canvas = self.canvas
+        # Graticule first (faint), under the landmasses.
         for lon in range(60, 221, 20):
             x = self._lon_to_x(lon)
             canvas.create_line(x, 0, x, self.CANVAS_H, fill="#16304f")
@@ -8264,6 +8452,9 @@ class RegionPickerDialog:
             canvas.create_text(16, y, text=f"{lat}", fill="#7fa8d0", font=("TkDefaultFont", 7))
         equator_y = self._lat_to_y(0)
         canvas.create_line(0, equator_y, self.CANVAS_W, equator_y, fill="#274c79")
+        # Continents and islands so the user can see what they are selecting.
+        self._draw_landmasses()
+        # Himawari full-disk coverage outline + sub-satellite point on top.
         x1 = self._lon_to_x(80)
         x2 = self._lon_to_x(200)
         y_top = self._lat_to_y(81)
@@ -8273,6 +8464,28 @@ class RegionPickerDialog:
         sub_x = self._lon_to_x(AHI_SUB_SATELLITE_LON_DEG)
         canvas.create_line(sub_x, equator_y - 6, sub_x, equator_y + 6, fill="#ffd23f")
         canvas.create_line(sub_x - 6, equator_y, sub_x + 6, equator_y, fill="#ffd23f")
+        # Place-name labels on top of everything for orientation.
+        self._draw_land_labels()
+
+    def _draw_landmasses(self) -> None:
+        """Render the embedded simplified landmasses as filled polygons."""
+        canvas = self.canvas
+        for polygon in SIMPLIFIED_LANDMASSES:
+            coords: list[float] = []
+            for lon, lat in polygon:
+                coords.append(self._lon_to_x(lon))
+                coords.append(self._lat_to_y(lat))
+            canvas.create_polygon(*coords, fill="#33502b", outline="#7a9a5e", width=1)
+
+    def _draw_land_labels(self) -> None:
+        """Draw place-name labels that fall inside the visible window."""
+        for text, lon, lat in SIMPLIFIED_LAND_LABELS:
+            x = self._lon_to_x(lon)
+            y = self._lat_to_y(lat)
+            if 2 <= x <= self.CANVAS_W - 2 and 2 <= y <= self.CANVAS_H - 2:
+                self.canvas.create_text(
+                    x, y, text=text, fill="#a8c0d8", font=("TkDefaultFont", 8, "bold")
+                )
 
     def _show_initial_bounds(self) -> None:
         try:
@@ -8417,6 +8630,10 @@ class HimawariProcessorApp:
         self.dask_workers_var = tk.StringVar(value=str(initial_config.dask_num_workers))
         self.chunk_var = tk.StringVar(value=initial_config.dask_chunk_size)
         self.ram_limit_var = tk.StringVar(value=str(initial_config.ram_limit_gb))
+        # Max safe PNG pixel count drives the PNG -> GeoTIFF auto-switch. It has
+        # a default and is validated/used at runtime, but previously had no GUI
+        # binding, so every settings save silently reset it to the default.
+        self.max_safe_png_pixels_var = tk.StringVar(value=str(initial_config.max_safe_png_pixels))
         self.image_format_var = tk.StringVar(value=initial_config.image_format)
         self.output_template_var = tk.StringVar(value=initial_config.output_template)
         self.resampler_var = tk.StringVar(value=initial_config.resampler)
@@ -8465,6 +8682,8 @@ class HimawariProcessorApp:
         self._update_setup_status()
         self._set_running(False)
         self.root.after(100, self._poll_messages)
+        # Save settings on close so unsaved Entry/color edits are not lost.
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close_window)
 
     def _install_log_handler(self) -> None:
         configure_logging()
@@ -8898,6 +9117,15 @@ class HimawariProcessorApp:
         ttk.Spinbox(performance_frame, from_=1, to=64, increment=0.5, textvariable=self.ram_limit_var, width=8).grid(
             row=3, column=1, sticky="ew", pady=(2, 0)
         )
+        ttk.Label(performance_frame, text="Max PNG Pixels").grid(row=4, column=0, sticky="w")
+        ttk.Spinbox(
+            performance_frame,
+            from_=1_000_000,
+            to=200_000_000,
+            increment=1_000_000,
+            textvariable=self.max_safe_png_pixels_var,
+            width=12,
+        ).grid(row=5, column=0, sticky="ew", padx=(0, 8), pady=(2, 0))
         self.safe_perf_button = ttk.Button(
             performance_frame,
             text="Safe Mode",
@@ -9519,6 +9747,7 @@ class HimawariProcessorApp:
             self.dask_workers_var,
             self.chunk_var,
             self.ram_limit_var,
+            self.max_safe_png_pixels_var,
             self.image_format_var,
             self.resampler_var,
             self.night_fallback_mode_var,
@@ -9592,6 +9821,7 @@ class HimawariProcessorApp:
         self.dask_workers_var.set(str(config.dask_num_workers))
         self.chunk_var.set(config.dask_chunk_size)
         self.ram_limit_var.set(str(config.ram_limit_gb))
+        self.max_safe_png_pixels_var.set(str(config.max_safe_png_pixels))
         self.image_format_var.set(config.image_format)
         self.output_template_var.set(config.output_template)
         self.resampler_var.set(config.resampler)
@@ -9641,6 +9871,12 @@ class HimawariProcessorApp:
             self.crosshair_var.set(False)
             self.border_color_var.set(SATELLITE_LAYER_BORDER_COLOR)
             self.border_width_var.set(str(satellite_layer_border_width(self.border_width_var.get())))
+            # Mirror the runtime clamping in layer_defaults_config so the GUI
+            # shows the same label size the run will actually use. Previously
+            # the runtime clamped map_label_size via satellite_layer_map_label_size
+            # but the GUI left the raw value, so the displayed size and the saved
+            # config diverged from what the run produced.
+            self.map_label_size_var.set(str(satellite_layer_map_label_size(self.map_label_size_var.get())))
             self._append_log(f"Satellite layer set to {mode}; flat-map true-color defaults applied.")
         self._update_setup_status()
         self._write_current_settings()
@@ -10276,6 +10512,10 @@ class HimawariProcessorApp:
         _selected, hex_value = colorchooser.askcolor(color=initial_color, title=title)
         if hex_value:
             variable.set(hex_value)
+            # Persist the new color so it survives a window close. Previously a
+            # picked color lived only in the Tk var and was lost unless another
+            # save-triggering action ran first.
+            self._write_current_settings()
 
     def _choose_border_color(self) -> None:
         self._choose_color(self.border_color_var, "Choose border line color", "#00ff00")
@@ -10325,6 +10565,7 @@ class HimawariProcessorApp:
             ram_limit_gb=self._read_float_var(self.ram_limit_var, "RAM limit"),
             dask_chunk_size=self.chunk_var.get(),
             dask_num_workers=int(self.dask_workers_var.get()),
+            max_safe_png_pixels=int(self.max_safe_png_pixels_var.get()),
             segment_aware_downloads=self.segment_aware_var.get(),
             write_metadata_sidecar=self.write_sidecar_var.get(),
             overlay_theme=self.overlay_theme_var.get(),
@@ -10382,6 +10623,15 @@ class HimawariProcessorApp:
         self._append_log("Terminate requested.")
         self.root.after(100, self.root.destroy)
 
+    def _on_close_window(self) -> None:
+        # Persist the current settings before the window is destroyed. Without
+        # this, any typed Entry value or picked color that hasn't been saved by
+        # another action is lost on close (the per-var trace only refreshes the
+        # setup status, it does not write settings).
+        self._write_current_settings()
+        self.cancel_event.set()
+        self.root.destroy()
+
     def _run_worker(self, config: ProcessorConfig) -> None:
         def progress(message: str, current: int | None, total: int | None) -> None:
             self.messages.put(("progress", (message, current, total)))
@@ -10402,11 +10652,24 @@ class HimawariProcessorApp:
             self.messages.put(("error", str(exc)))
 
     def _poll_messages(self) -> None:
-        while True:
-            try:
-                kind, payload = self.messages.get_nowait()
-            except queue.Empty:
-                break
+        # Reschedule unconditionally so a handler exception can never permanently
+        # kill the poll loop (which would freeze the GUI while the queue keeps
+        # filling). Each message is handled in its own try/except so one bad
+        # payload cannot prevent the rest of the queue from being drained.
+        try:
+            while True:
+                try:
+                    kind, payload = self.messages.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self._handle_message(kind, payload)
+                except Exception as exc:  # noqa: BLE001 - must not kill the poll loop
+                    LOG.exception("Failed to handle GUI message %r: %s", kind, exc)
+        finally:
+            self.root.after(100, self._poll_messages)
+
+    def _handle_message(self, kind: str, payload: object) -> None:
 
             if kind == "log":
                 self._append_log(str(payload))
@@ -10555,8 +10818,6 @@ class HimawariProcessorApp:
                         )
                     )
                 messagebox.showerror("Processing failed", str(payload))
-
-        self.root.after(100, self._poll_messages)
 
     def _sync_runtime_run_state(self) -> None:
         config = getattr(run, "last_config", None)

@@ -65,7 +65,7 @@ except KeyboardInterrupt:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-APP_VERSION = "2026.06.08.10"
+APP_VERSION = "2026.06.17.02"
 APP_DISPLAY_NAME = "Himawari-8/9 Low-RAM Processor"
 USER_URL = "https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/2024/07/25/0400/HS_H09_20240725_0400_B01_FLDK_R10_S0110.DAT.bz2"
 MODE = "Single Image"  # "Single Image" or "Timelapse"
@@ -99,9 +99,9 @@ ADD_CROSSHAIR = False
 CROSSHAIR_TYPE = "target"
 CROSSHAIR_COLOR = "#7c3cff"
 ZOOM_EARTH_STYLE = False
-FLAT_MAP_INVALID_FILL = (4, 15, 28)
+FLAT_MAP_INVALID_FILL = (8, 10, 14)
 FLAT_MAP_SOURCE_VALID_MIN = 1.0e-6
-FLAT_MAP_BASEMAP_OCEAN = (5, 18, 32)
+FLAT_MAP_BASEMAP_OCEAN = (10, 12, 16)
 FLAT_MAP_BASEMAP_LAND = (58, 68, 58)
 FLAT_MAP_BASEMAP_COAST = (122, 134, 126)
 FLAT_MAP_LIMB_FADE_FRACTION = 0.075
@@ -3510,40 +3510,46 @@ def robust_true_color_stretch(image, lower_percentile: float = 0.6, upper_percen
 def apply_zoom_earth_true_color_enhancement(image, hd: bool = False):
     from PIL import Image, ImageEnhance
 
+    # Gentle, colour-neutral enhancement that keeps the disk balanced
+    # (target R:G:B ~ 1.00:0.98:0.95, matching a natural Satpy true-colour pass).
+    # Previous versions applied a heavy warm/blue-reduction to the whole image
+    # together with gamma 0.72 + saturation x1.48, which gave the Earth a
+    # yellow/brown cast and left the dark background tinted blue.
     alpha = image.getchannel("A") if "A" in image.getbands() else None
     original_rgb = np.asarray(image.convert("RGB"), dtype=np.float32)
     working = image.convert("RGB")
     if hd:
         working = robust_true_color_stretch(working)
-    gamma = 0.72 if hd else 0.84
+    gamma = 0.86 if hd else 0.92
     gamma_lut = [int(round((value / 255.0) ** gamma * 255.0)) for value in range(256)]
     working = working.point(gamma_lut * 3)
-    working = ImageEnhance.Color(working).enhance(1.48 if hd else 1.20)
-    working = ImageEnhance.Contrast(working).enhance(1.18 if hd else 1.07)
-    working = ImageEnhance.Brightness(working).enhance(1.12 if hd else 1.09)
-    working = ImageEnhance.Sharpness(working).enhance(1.14 if hd else 1.08)
+    working = ImageEnhance.Color(working).enhance(1.10 if hd else 1.06)
+    working = ImageEnhance.Contrast(working).enhance(1.06 if hd else 1.03)
+    working = ImageEnhance.Brightness(working).enhance(1.06 if hd else 1.04)
+    working = ImageEnhance.Sharpness(working).enhance(1.10 if hd else 1.06)
     if hd:
         enhanced = np.asarray(working.convert("RGB"), dtype=np.float32)
         luminance = 0.2126 * original_rgb[:, :, 0] + 0.7152 * original_rgb[:, :, 1] + 0.0722 * original_rgb[:, :, 2]
-        protect = np.clip((luminance - 198.0) / 57.0, 0.0, 0.38)
+        protect = np.clip((luminance - 198.0) / 57.0, 0.0, 0.30)
         protected = np.clip((enhanced * (1.0 - protect[:, :, None])) + (original_rgb * protect[:, :, None]), 0, 255)
         working = Image.fromarray(protected.astype(np.uint8), mode="RGB")
+
+    # White-balance only the bright, low-chroma cloud tops where a residual
+    # cool/blue tint is actually visible. Land/ocean is left untouched so the
+    # disk keeps its natural, balanced colour.
     balanced = np.asarray(working.convert("RGB"), dtype=np.float32)
     luminance = 0.2126 * balanced[:, :, 0] + 0.7152 * balanced[:, :, 1] + 0.0722 * balanced[:, :, 2]
     maximum = balanced.max(axis=2)
     minimum = balanced.min(axis=2)
     chroma = maximum - minimum
-    cloud_protect = np.clip((luminance - 196.0) / 58.0, 0.0, 0.55) * np.clip(1.0 - chroma / 92.0, 0.0, 1.0)
-    warm_mix = 1.0 - cloud_protect
-    warm = balanced.copy()
-    warm[:, :, 0] *= 1.08 if hd else 1.05
-    warm[:, :, 1] *= 1.03 if hd else 1.02
-    warm[:, :, 2] *= 0.86 if hd else 0.91
-    blue_excess = np.maximum(0.0, warm[:, :, 2] - np.maximum(warm[:, :, 0], warm[:, :, 1]))
-    warm[:, :, 2] -= blue_excess * (0.34 if hd else 0.24)
-    balanced = np.clip((balanced * (1.0 - warm_mix[:, :, None])) + (warm * warm_mix[:, :, None]), 0, 255)
+    cloud_mask = np.clip((luminance - 196.0) / 58.0, 0.0, 1.0) * np.clip(1.0 - chroma / 70.0, 0.0, 1.0)
+    cloud_mask = cloud_mask[:, :, None]
+    neutral = np.maximum(balanced[:, :, 0], balanced[:, :, 1])
+    balanced[:, :, 0] = balanced[:, :, 0] * (1.0 - cloud_mask[:, :, 0]) + (neutral + balanced[:, :, 0]) * 0.5 * cloud_mask[:, :, 0]
+    balanced[:, :, 1] = balanced[:, :, 1] * (1.0 - cloud_mask[:, :, 0]) + (neutral + balanced[:, :, 1]) * 0.5 * cloud_mask[:, :, 0]
+    balanced[:, :, 2] = balanced[:, :, 2] * (1.0 - cloud_mask[:, :, 0]) + (neutral + balanced[:, :, 2]) * 0.5 * cloud_mask[:, :, 0]
+    balanced = np.clip(balanced, 0, 255)
     working = Image.fromarray(balanced.astype(np.uint8), mode="RGB")
-    working = ImageEnhance.Color(working).enhance(1.18 if hd else 1.22)
     if alpha is not None:
         working.putalpha(alpha)
     return working
@@ -3903,13 +3909,12 @@ def generated_flat_map_ocean_image(area: AreaDefinition):
     y_grad = np.linspace(0.0, 1.0, height, dtype=np.float32)[:, None]
     lon_wave = ((np.sin(np.deg2rad(lon * 1.7)) + 1.0) * 0.5)[None, :]
     rgb = np.empty((height, width, 3), dtype=np.uint8)
-    rgb[:, :, 0] = np.clip(FLAT_MAP_BASEMAP_OCEAN[0] + 5.0 * lat_norm + 2.0 * lon_wave, 0, 255).astype(np.uint8)
-    rgb[:, :, 1] = np.clip(FLAT_MAP_BASEMAP_OCEAN[1] + 18.0 * lat_norm + 5.0 * lon_wave, 0, 255).astype(np.uint8)
-    rgb[:, :, 2] = np.clip(
-        FLAT_MAP_BASEMAP_OCEAN[2] + 34.0 * lat_norm + 9.0 * lon_wave + 8.0 * y_grad,
-        0,
-        255,
-    ).astype(np.uint8)
+    # Neutral grey-blue background: all channels share the same gentle gradients so
+    # invalid areas no longer add a saturated blue veil / "blue spot" around the disk.
+    shade = 6.0 * lat_norm + 2.0 * lon_wave + 2.0 * y_grad
+    rgb[:, :, 0] = np.clip(FLAT_MAP_BASEMAP_OCEAN[0] + shade, 0, 255).astype(np.uint8)
+    rgb[:, :, 1] = np.clip(FLAT_MAP_BASEMAP_OCEAN[1] + shade, 0, 255).astype(np.uint8)
+    rgb[:, :, 2] = np.clip(FLAT_MAP_BASEMAP_OCEAN[2] + shade, 0, 255).astype(np.uint8)
     return Image.fromarray(rgb, mode="RGB").convert("RGBA")
 
 
