@@ -65,7 +65,7 @@ except KeyboardInterrupt:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-APP_VERSION = "2026.06.16.01"
+APP_VERSION = "2026.06.17.01"
 APP_DISPLAY_NAME = "Himawari-8/9 Low-RAM Processor"
 USER_URL = "https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/2024/07/25/0400/HS_H09_20240725_0400_B01_FLDK_R10_S0110.DAT.bz2"
 MODE = "Single Image"  # "Single Image" or "Timelapse"
@@ -157,6 +157,103 @@ WEB_MERCATOR_PROJ4 = (
     "+x_0=0 +y_0=0 +units=m +over +no_defs"
 )
 WEB_MERCATOR_METERS_PER_DEGREE = (2.0 * math.pi * 6378137.0) / 360.0
+
+# ---------------------------------------------------------------------------
+# Segment-aware regional downloads.
+# Himawari FLDK scans are split into equal-height horizontal segments. For a
+# regional crop only the segments whose latitude band touches the requested
+# bounds need to be downloaded. The geostationary navigation below converts
+# segment pixel rows into latitude bands so the unneeded segments are skipped.
+# ---------------------------------------------------------------------------
+SEGMENT_AWARE_DOWNLOADS = True
+# CGMS/LRIT geostationary navigation constants for the Himawari AHI full disk.
+# These are fixed by the Himawari Standard Data specification. They are used
+# only to estimate each segment's latitude band, so the 2 km reference grid is
+# enough (segment latitude bands are the same fraction of the disk at every
+# band resolution).
+AHI_SUB_SATELLITE_LON_DEG = 140.7
+AHI_EARTH_EQUATORIAL_RADIUS_M = 6378137.0
+AHI_EARTH_POLAR_RADIUS_M = 6356752.3
+AHI_SATELLITE_DISTANCE_M = 42164000.0
+AHI_FULL_DISK_2KM_LINES = 5500
+AHI_FULL_DISK_2KM_COFF = 2750.5
+AHI_FULL_DISK_2KM_LOFF = 2750.5
+AHI_FULL_DISK_2KM_CFAC = 20466275.0
+AHI_FULL_DISK_2KM_LFAC = 20466275.0
+# Extra segments kept on each side of the intersecting band as a safety margin
+# so a slightly off latitude estimate can never drop a needed segment.
+SEGMENT_DOWNLOAD_MARGIN = 1
+
+# ---------------------------------------------------------------------------
+# Live preview (quicklook). A coarse, fast render used to check framing and
+# look before committing to a full-resolution run.
+# ---------------------------------------------------------------------------
+PREVIEW_FLAT_RESOLUTION_DEG = 0.16   # ~2 km per pixel at the equator
+PREVIEW_MAX_DIMENSION_PX = 900       # downscale the preview image for display
+PREVIEW_FLAT_FALLBACK_BOUNDS = (-60.0, 60.0, 80.0, 200.0)
+
+# ---------------------------------------------------------------------------
+# Rough timing model for the pre-run wall-clock estimate shown in the run
+# summary. These are deliberately conservative averages for a typical broadband
+# connection and a low-RAM machine; the live ETA during a run quickly replaces
+# them with measured speed, so they only need to be in the right ballpark.
+# ---------------------------------------------------------------------------
+ESTIMATE_SECONDS_PER_SEGMENT_DOWNLOAD = 3.0    # download + bz2 decompress, per segment
+ESTIMATE_SECONDS_PER_MEGAPIXEL_RENDER = 1.1    # load/resample/render/save, per output megapixel
+ESTIMATE_FRAME_FIXED_OVERHEAD = 4.0            # scene setup, night check and file I/O per frame
+ESTIMATE_TIMELAPSE_ASSEMBLY_PER_FRAME = 0.6    # GIF/MP4 assembly per frame
+ESTIMATE_MAX_RENDER_MEGAPIXELS = 520.0         # cap so a full-disk estimate stays sane
+
+# ---------------------------------------------------------------------------
+# Overlay colour themes. Each theme is a ready-made palette for the border
+# lines, labels, night boundary and crosshair so users can pick a look instead
+# of hand-entering hex colours. "Custom" keeps whatever colours are set.
+# Keys: border, label, night_boundary, crosshair.
+# ---------------------------------------------------------------------------
+OVERLAY_THEME_CUSTOM = "Custom (keep my colors)"
+OVERLAY_THEMES: dict[str, dict[str, str]] = {
+    "Subtle Light": {
+        "border": "#d8dee8",
+        "label": "#ebeef2",
+        "night_boundary": "#91b4d7",
+        "crosshair": "#7c3cff",
+    },
+    "High-Contrast Night": {
+        "border": "#ffd23f",
+        "label": "#ffffff",
+        "night_boundary": "#ff5d5d",
+        "crosshair": "#00e5ff",
+    },
+    "Classic Green": {
+        "border": "#37c837",
+        "label": "#eaffea",
+        "night_boundary": "#9fe0ff",
+        "crosshair": "#ff2f7b",
+    },
+    "Warm Amber": {
+        "border": "#f6a13c",
+        "label": "#fff1dd",
+        "night_boundary": "#ffb27a",
+        "crosshair": "#ff4d4d",
+    },
+    "Cool Cyan": {
+        "border": "#39d3e6",
+        "label": "#e6fbff",
+        "night_boundary": "#7ad0ff",
+        "crosshair": "#ff7ad0",
+    },
+    "Monochrome Ink": {
+        "border": "#101418",
+        "label": "#f5f7fa",
+        "night_boundary": "#101418",
+        "crosshair": "#101418",
+    },
+}
+OVERLAY_THEME_ORDER = (OVERLAY_THEME_CUSTOM, *OVERLAY_THEMES.keys())
+OVERLAY_THEME = OVERLAY_THEME_CUSTOM
+MAP_LABEL_COLOR = "#ebeef2"
+NIGHT_BOUNDARY_COLOR = "#91b4d7"
+WRITE_METADATA_SIDECAR = True
 
 # ---------------------------------------------------------------------------
 # Output-area presets (lat/lon bounding boxes inside the Himawari-8/9 view).
@@ -497,6 +594,51 @@ class GpuSupportStatus:
     package_version: str = ""
 
 
+@dataclass(frozen=True)
+class ConnectivityResult:
+    host: str
+    dns_ok: bool
+    dns_ms: float | None
+    resolved_ips: tuple[str, ...]
+    http_ok: bool
+    http_status: int | None
+    http_ms: float | None
+    error: str = ""
+
+    @property
+    def reachable(self) -> bool:
+        # Any HTTP response (even 403/405 from S3) means the network path works.
+        return self.dns_ok and self.http_ok
+
+    def display_text(self) -> str:
+        lines = [f"Data host: {self.host}"]
+        if self.dns_ok:
+            ip_text = ", ".join(self.resolved_ips[:4]) if self.resolved_ips else "resolved"
+            ms = f"{self.dns_ms:.0f} ms" if self.dns_ms is not None else "ok"
+            lines.append(f"DNS lookup: OK ({ms}) -> {ip_text}")
+        else:
+            lines.append("DNS lookup: FAILED - the host name could not be resolved.")
+        if self.http_ok:
+            ms = f"{self.http_ms:.0f} ms" if self.http_ms is not None else "ok"
+            status = self.http_status if self.http_status is not None else "response"
+            lines.append(f"HTTP HEAD: OK (status {status}, {ms})")
+        else:
+            lines.append("HTTP HEAD: FAILED - no HTTP response from the host.")
+        if self.reachable:
+            lines.append("")
+            lines.append("The data host is reachable. A failed run is unlikely to be the network.")
+        else:
+            lines.append("")
+            lines.append(
+                "The data host is NOT reachable from here. This points to a network/DNS "
+                "problem (VPN, firewall, proxy, or an outage) rather than the app itself."
+            )
+        if self.error:
+            lines.append("")
+            lines.append(f"Detail: {self.error}")
+        return "\n".join(lines)
+
+
 @dataclass
 class ProcessorConfig:
     user_url: str = USER_URL
@@ -537,6 +679,11 @@ class ProcessorConfig:
     ram_limit_gb: float = RAM_LIMIT_GB
     dask_chunk_size: str = DASK_CHUNK_SIZE
     dask_num_workers: int = DASK_NUM_WORKERS
+    segment_aware_downloads: bool = SEGMENT_AWARE_DOWNLOADS
+    write_metadata_sidecar: bool = WRITE_METADATA_SIDECAR
+    overlay_theme: str = OVERLAY_THEME
+    map_label_color: str = MAP_LABEL_COLOR
+    night_boundary_color: str = NIGHT_BOUNDARY_COLOR
 
 
 ProgressCallback = Callable[[str, int | None, int | None], None]
@@ -574,18 +721,34 @@ class RunSummary:
     total_segments: int
     output: str
     warnings: tuple[str, ...]
+    estimated_seconds: float | None = None
+    segments_per_frame: int | None = None
+    all_segments_per_frame: int | None = None
 
     def display_text(self) -> str:
         frame_word = "frame" if self.frames == 1 else "frames"
         segment_word = "segment" if self.total_segments == 1 else "segments"
+        download_line = f"Downloads: {self.total_segments} {segment_word}"
+        if (
+            self.segments_per_frame is not None
+            and self.all_segments_per_frame is not None
+            and self.segments_per_frame < self.all_segments_per_frame
+        ):
+            saved = self.all_segments_per_frame - self.segments_per_frame
+            download_line += (
+                f" (segment-aware: {self.segments_per_frame} of {self.all_segments_per_frame} "
+                f"per band, skipping {saved})"
+            )
         lines = [
             f"Source: {self.source}",
             f"Product: {self.product}",
             f"Frames: {self.frames} {frame_word}",
             f"Bands: {', '.join(self.bands)}",
-            f"Downloads: {self.total_segments} {segment_word}",
+            download_line,
             f"Output: {self.output}",
         ]
+        if self.estimated_seconds is not None:
+            lines.append(f"Estimated time: ~{format_estimated_duration(self.estimated_seconds)} (rough)")
         if self.warnings:
             lines.append("")
             lines.append("Warnings:")
@@ -1553,6 +1716,82 @@ def fetch_s3_prefix_listing(prefix: str, timeout: int = 20, sat_id: str | None =
     return response.text
 
 
+def data_host_for_source(source: str | None) -> str:
+    """Return the bucket URL whose host should be tested for a given source.
+
+    Falls back to the Himawari-9 bucket when the source cannot be parsed.
+    """
+    try:
+        return himawari_bucket_for_sat_id(sat_id_from_himawari_source(source))
+    except Exception:
+        return NOAA_HIMAWARI9_BUCKET
+
+
+def check_data_host_connectivity(source: str | None = None, timeout: float = 8.0) -> ConnectivityResult:
+    """Test whether the satellite data host is reachable (DNS + HTTP HEAD).
+
+    This isolates "is it the network?" from "is it the app?" when a run fails. It
+    resolves the host name (DNS) and issues a lightweight HEAD request to the
+    bucket, timing both. Any HTTP status (including S3's 403/405 on the root)
+    counts as reachable because it proves the request reached the host.
+    """
+    import socket
+    from urllib.parse import urlparse
+
+    bucket_url = data_host_for_source(source)
+    host = urlparse(bucket_url).netloc or "noaa-himawari9.s3.amazonaws.com"
+
+    dns_ok = False
+    dns_ms: float | None = None
+    resolved: tuple[str, ...] = ()
+    http_ok = False
+    http_status: int | None = None
+    http_ms: float | None = None
+    error = ""
+
+    start = time.perf_counter()
+    try:
+        infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+        dns_ms = (time.perf_counter() - start) * 1000.0
+        dns_ok = True
+        ips: list[str] = []
+        for info in infos:
+            ip = info[4][0]
+            if ip not in ips:
+                ips.append(ip)
+        resolved = tuple(ips)
+    except Exception as exc:
+        dns_ms = (time.perf_counter() - start) * 1000.0
+        error = f"DNS resolution failed: {exc}"
+
+    if dns_ok:
+        start = time.perf_counter()
+        try:
+            response = requests.head(
+                bucket_url,
+                timeout=timeout,
+                allow_redirects=True,
+                headers={"User-Agent": f"{APP_DISPLAY_NAME}/{APP_VERSION}"},
+            )
+            http_ms = (time.perf_counter() - start) * 1000.0
+            http_status = int(response.status_code)
+            http_ok = True
+        except Exception as exc:
+            http_ms = (time.perf_counter() - start) * 1000.0
+            error = error or f"HTTP HEAD request failed: {exc}"
+
+    return ConnectivityResult(
+        host=host,
+        dns_ok=dns_ok,
+        dns_ms=dns_ms,
+        resolved_ips=resolved,
+        http_ok=http_ok,
+        http_status=http_status,
+        http_ms=http_ms,
+        error=error,
+    )
+
+
 def recent_himawari_scan_datetimes(
     now: datetime | None = None,
     lookback_hours: int = 48,
@@ -1836,13 +2075,153 @@ def offline_source_url_for_import(result: LocalImportResult) -> str:
     return f"{himawari_bucket_for_sat_id(result.sat_id)}/AHI-L1b-{ahi_l1b_folder_for_area(result.area)}/{timestamp_path(timestamp)}{filename}"
 
 
-def make_download_tasks(info: UrlInfo, dt: datetime, bands: Iterable[str], temp_dir: Path) -> list[DownloadTask]:
+def _geos_pixel_to_lonlat(col: np.ndarray, line: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Convert AHI full-disk pixel (column, line) to (lon, lat) in degrees.
+
+    Implements the standard CGMS/LRIT geostationary inverse navigation using the
+    fixed Himawari AHI full-disk constants. Pixels that fall off the Earth disk
+    return NaN. Only used to estimate each download segment's latitude band, so
+    the 2 km reference grid is sufficient.
+    """
+    req = AHI_EARTH_EQUATORIAL_RADIUS_M
+    rpol = AHI_EARTH_POLAR_RADIUS_M
+    h = AHI_SATELLITE_DISTANCE_M
+    ratio = (req / rpol) ** 2
+    x = np.radians((col - AHI_FULL_DISK_2KM_COFF) / ((2.0 ** -16) * AHI_FULL_DISK_2KM_CFAC))
+    y = np.radians((line - AHI_FULL_DISK_2KM_LOFF) / ((2.0 ** -16) * AHI_FULL_DISK_2KM_LFAC))
+    cosx = np.cos(x)
+    sinx = np.sin(x)
+    cosy = np.cos(y)
+    siny = np.sin(y)
+    denom = cosy ** 2 + ratio * siny ** 2
+    disc = (h * cosx * cosy) ** 2 - denom * (h ** 2 - req ** 2)
+    with np.errstate(invalid="ignore"):
+        disc = np.where(disc < 0.0, np.nan, disc)
+        sd = np.sqrt(disc)
+        sn = (h * cosx * cosy - sd) / denom
+        s1 = h - sn * cosx * cosy
+        s2 = sn * sinx * cosy
+        s3 = -sn * siny
+        lon = np.degrees(np.arctan2(s2, s1)) + AHI_SUB_SATELLITE_LON_DEG
+        lat = np.degrees(np.arctan(ratio * s3 / np.sqrt(s1 ** 2 + s2 ** 2)))
+    return lon, lat
+
+
+def fldk_segment_latitude_bounds(total_segments: int) -> list[tuple[float, float] | None]:
+    """Return the (min_lat, max_lat) latitude band each FLDK segment covers.
+
+    Himawari full-disk scans are split into ``total_segments`` equal-height
+    horizontal strips. Segment k covers the same fraction of the disk at every
+    band resolution, so the 2 km reference grid gives the latitude band that
+    applies to every band. A segment that is entirely off-disk returns None.
+    """
+    total = int(total_segments)
+    if total <= 0:
+        return []
+    lines_total = float(AHI_FULL_DISK_2KM_LINES)
+    seg_height = lines_total / total
+    cols = np.linspace(0.0, lines_total - 1.0, 48)
+    bands: list[tuple[float, float] | None] = []
+    for k in range(1, total + 1):
+        row0 = (k - 1) * seg_height
+        row1 = k * seg_height - 1.0
+        rows = np.linspace(row0, row1, 20)
+        grid_cols, grid_rows = np.meshgrid(cols, rows)
+        _lon, lat = _geos_pixel_to_lonlat(grid_cols, grid_rows)
+        finite = lat[np.isfinite(lat)]
+        if finite.size == 0:
+            bands.append(None)
+        else:
+            bands.append((float(finite.min()), float(finite.max())))
+    return bands
+
+
+def segments_intersecting_lat_bounds(
+    total_segments: int,
+    min_lat: float,
+    max_lat: float,
+    margin: int = SEGMENT_DOWNLOAD_MARGIN,
+) -> list[int]:
+    """Contiguous list of segment numbers whose latitude band touches the bounds.
+
+    ``margin`` keeps a few extra segments on each side so a slightly imperfect
+    latitude estimate can never drop a needed segment. If nothing intersects (or
+    the geometry cannot be evaluated) every segment is returned, so the result is
+    always a safe superset of what the crop needs.
+    """
+    total = int(total_segments)
+    if total <= 0:
+        return []
+    try:
+        lo = float(min(min_lat, max_lat))
+        hi = float(max(min_lat, max_lat))
+        bands = fldk_segment_latitude_bounds(total)
+        hits: list[int] = []
+        for index, band in enumerate(bands, start=1):
+            if band is None:
+                # Polar/off-disk segment: keep it rather than risk dropping data.
+                hits.append(index)
+                continue
+            band_lo, band_hi = band
+            if band_hi >= lo and band_lo <= hi:
+                hits.append(index)
+        if not hits:
+            return list(range(1, total + 1))
+        margin = max(0, int(margin))
+        lo_seg = max(1, min(hits) - margin)
+        hi_seg = min(total, max(hits) + margin)
+        return list(range(lo_seg, hi_seg + 1))
+    except Exception as exc:  # pragma: no cover - safety net
+        LOG.debug("Segment latitude estimate failed (%s); downloading all segments.", exc)
+        return list(range(1, total + 1))
+
+
+def segments_for_flat_bounds(info: UrlInfo, config: ProcessorConfig) -> list[int] | None:
+    """Segments needed for the configured flat-map crop, or None to use all.
+
+    Returns None (meaning "download every segment") when segment-aware downloads
+    are disabled, when the source is not a full disk, or when the crop already
+    spans effectively the whole disk so trimming would save nothing.
+    """
+    if not getattr(config, "segment_aware_downloads", True):
+        return None
+    if not SEGMENT_AWARE_DOWNLOADS:
+        return None
+    if str(info.area).upper() != "FLDK":
+        return None
+    if not is_flat_map(config):
+        return None
+    total = int(info.total_segments)
+    if total <= 1:
+        return None
+    selected = segments_intersecting_lat_bounds(
+        total, config.flat_min_lat, config.flat_max_lat, margin=SEGMENT_DOWNLOAD_MARGIN
+    )
+    if not selected or len(selected) >= total:
+        return None
+    return selected
+
+
+def make_download_tasks(
+    info: UrlInfo,
+    dt: datetime,
+    bands: Iterable[str],
+    temp_dir: Path,
+    segment_numbers: Iterable[int] | None = None,
+) -> list[DownloadTask]:
     tasks = []
     d_path = timestamp_path(dt)
     frame_dir = temp_dir / dt.strftime("%Y%m%d_%H%M")
     frame_dir.mkdir(parents=True, exist_ok=True)
+    if segment_numbers is None:
+        segments = list(range(1, info.total_segments + 1))
+    else:
+        # Keep only valid, in-range, sorted, de-duplicated segment numbers.
+        segments = sorted({int(s) for s in segment_numbers if 1 <= int(s) <= info.total_segments})
+        if not segments:
+            segments = list(range(1, info.total_segments + 1))
     for band in bands:
-        for segment in range(1, info.total_segments + 1):
+        for segment in segments:
             filename = segment_filename(info, dt, band, segment)
             tasks.append(
                 DownloadTask(
@@ -1908,6 +2287,59 @@ def format_eta_duration(seconds: float | int) -> str:
     return f"{days}d {hours}h"
 
 
+def format_estimated_duration(seconds: float | int) -> str:
+    """Friendly, intentionally coarse duration for a pre-run estimate.
+
+    The numbers are rounded into easy-to-read buckets so the value reads as a
+    ballpark ("about 3 min") rather than a false-precision figure.
+    """
+    total = max(0.0, float(seconds))
+    if total < 45.0:
+        return "under 1 min"
+    if total < 90.0:
+        return "about 1 min"
+    minutes = total / 60.0
+    if minutes < 10.0:
+        return f"about {int(round(minutes))} min"
+    if minutes < 60.0:
+        rounded = int(round(minutes / 5.0)) * 5
+        return f"about {rounded} min"
+    hours = int(total // 3600)
+    remainder_minutes = int(round((total - hours * 3600) / 60.0))
+    if remainder_minutes >= 60:
+        hours += 1
+        remainder_minutes = 0
+    if remainder_minutes == 0:
+        return f"about {hours}h"
+    return f"about {hours}h {remainder_minutes:02d}m"
+
+
+def estimate_run_seconds(
+    config: ProcessorConfig,
+    frame_count: int,
+    band_count: int,
+    segments_per_frame: int,
+    output_megapixels: float,
+) -> float:
+    """Rough wall-clock estimate for a run, in seconds.
+
+    Combines three terms: parallel segment downloads, per-frame rendering that
+    scales with the output size, and (for timelapses) animation assembly. This
+    is a planning aid only; the in-run ETA measures real speed.
+    """
+    workers = max(1, min(4, int(config.download_workers)))
+    segments_total = max(0, int(frame_count)) * max(1, int(band_count)) * max(0, int(segments_per_frame))
+    download_seconds = math.ceil(segments_total / workers) * ESTIMATE_SECONDS_PER_SEGMENT_DOWNLOAD
+    megapixels = max(0.0, min(float(output_megapixels), ESTIMATE_MAX_RENDER_MEGAPIXELS))
+    render_seconds = frame_count * (
+        ESTIMATE_FRAME_FIXED_OVERHEAD + megapixels * ESTIMATE_SECONDS_PER_MEGAPIXEL_RENDER
+    )
+    assembly_seconds = 0.0
+    if config.mode == "Timelapse" and frame_count > 1:
+        assembly_seconds = frame_count * ESTIMATE_TIMELAPSE_ASSEMBLY_PER_FRAME
+    return float(download_seconds + render_seconds + assembly_seconds)
+
+
 class ProgressEtaEstimator:
     def __init__(self, clock: Callable[[], float] | None = None, min_elapsed_seconds: float = 1.0) -> None:
         self.clock = clock or time.monotonic
@@ -1916,12 +2348,14 @@ class ProgressEtaEstimator:
         self._last_current: int | None = None
         self._last_total: int | None = None
         self._last_phase: str | None = None
+        self._smoothed_rate: float | None = None
 
     def reset(self) -> None:
         self._started_at = None
         self._last_current = None
         self._last_total = None
         self._last_phase = None
+        self._smoothed_rate = None
 
     def update(self, message: str, current: int | None = None, total: int | None = None) -> str | None:
         if current is None or total is None or total <= 0:
@@ -1937,6 +2371,7 @@ class ProgressEtaEstimator:
             or (self._last_current is not None and current_int < self._last_current)
         ):
             self._started_at = now
+            self._smoothed_rate = None
         self._last_current = current_int
         self._last_total = total_int
         self._last_phase = phase
@@ -1946,7 +2381,13 @@ class ProgressEtaEstimator:
         if elapsed < self.min_elapsed_seconds:
             return None
         seconds_per_unit = elapsed / float(current_int)
-        remaining_seconds = seconds_per_unit * float(total_int - current_int)
+        # Exponentially smooth the per-unit rate so the displayed ETA settles
+        # instead of jumping on every progress tick.
+        if self._smoothed_rate is None:
+            self._smoothed_rate = seconds_per_unit
+        else:
+            self._smoothed_rate = 0.6 * self._smoothed_rate + 0.4 * seconds_per_unit
+        remaining_seconds = self._smoothed_rate * float(total_int - current_int)
         if not math.isfinite(remaining_seconds) or remaining_seconds < 1.0:
             return None
         return f"ETA {format_eta_duration(remaining_seconds)}"
@@ -2970,6 +3411,39 @@ def layer_defaults_config(config: ProcessorConfig) -> ProcessorConfig:
     )
 
 
+def build_preview_config(config: ProcessorConfig) -> ProcessorConfig:
+    """Derive a fast, coarse flat-map "quicklook" config from the user's settings.
+
+    The preview always renders a single coarse flat-map PNG so framing and the
+    overall look can be checked in a few seconds before committing to a full-
+    resolution (and possibly multi-frame) run. The product and overlay choices
+    are kept so the preview resembles the final image; only speed-related fields
+    are overridden.
+    """
+    base = layer_defaults_config(config)
+    if normalized_map_view(base.map_view) == "flat":
+        min_lat, max_lat = base.flat_min_lat, base.flat_max_lat
+        min_lon, max_lon = base.flat_min_lon, base.flat_max_lon
+    else:
+        min_lat, max_lat, min_lon, max_lon = PREVIEW_FLAT_FALLBACK_BOUNDS
+    resolution = max(float(base.flat_resolution_deg), PREVIEW_FLAT_RESOLUTION_DEG)
+    return replace(
+        base,
+        mode="Single Image",
+        map_view="flat",
+        flat_min_lat=min_lat,
+        flat_max_lat=max_lat,
+        flat_min_lon=min_lon,
+        flat_max_lon=max_lon,
+        flat_resolution_deg=resolution,
+        image_format="png",
+        segment_aware_downloads=True,
+        allow_quality_fallback=True,
+        write_metadata_sidecar=False,
+        gpu_acceleration=False,
+    )
+
+
 def resolve_live_satellite_url(config: ProcessorConfig) -> ProcessorConfig:
     if not is_live_satellite_layer(config):
         return config
@@ -3370,6 +3844,23 @@ def flat_map_visual_style_enabled(config: ProcessorConfig) -> bool:
     return bool(config.zoom_earth_style or functional_map_overlay_enabled(config))
 
 
+def overlay_theme_colors(theme_name: str | None) -> dict[str, str] | None:
+    """Return the {border, label, night_boundary, crosshair} colours for a theme.
+
+    Returns None for the "Custom" theme (or any unknown name), meaning the user's
+    hand-picked colours should be left untouched.
+    """
+    if not theme_name:
+        return None
+    name = str(theme_name).strip()
+    if name == OVERLAY_THEME_CUSTOM:
+        return None
+    palette = OVERLAY_THEMES.get(name)
+    if palette is None:
+        return None
+    return dict(palette)
+
+
 def should_style_output(config: ProcessorConfig, product: str) -> bool:
     """Whether the saved image should be post-processed with overlays/styling.
 
@@ -3469,7 +3960,12 @@ def map_label_font(size: int):
         return ImageFont.load_default()
 
 
-def draw_zoom_earth_labels(image, area: AreaDefinition, label_size: int = MAP_LABEL_SIZE) -> None:
+def draw_zoom_earth_labels(
+    image,
+    area: AreaDefinition,
+    label_size: int = MAP_LABEL_SIZE,
+    label_color: tuple[int, int, int] | None = None,
+) -> None:
     from PIL import ImageDraw, ImageFont
 
     draw = ImageDraw.Draw(image, "RGBA")
@@ -3483,7 +3979,11 @@ def draw_zoom_earth_labels(image, area: AreaDefinition, label_size: int = MAP_LA
         point = lonlat_to_area_pixel(area, lon, lat)
         if point is None:
             continue
-        fill = (235, 238, 242, 235) if kind == "land" else (205, 220, 238, 210)
+        if label_color is None:
+            fill = (235, 238, 242, 235) if kind == "land" else (205, 220, 238, 210)
+        else:
+            # Keep the land/water opacity difference but use the themed colour.
+            fill = (*label_color, 235) if kind == "land" else (*label_color, 210)
         draw_text_with_halo(draw, point, label, font, fill, halo_width=halo_width)
 
 
@@ -3558,16 +4058,22 @@ def visible_polyline_segments(points: Iterable[tuple[float, float] | None], max_
     return segments
 
 
-def draw_night_boundary(image, area: AreaDefinition, scan_time: datetime) -> None:
+def draw_night_boundary(
+    image,
+    area: AreaDefinition,
+    scan_time: datetime,
+    boundary_color: tuple[int, int, int] | None = None,
+) -> None:
     from PIL import ImageDraw
 
     draw = ImageDraw.Draw(image, "RGBA")
     pixels = [lonlat_to_area_pixel(area, lon, lat) for lon, lat in night_boundary_points(scan_time, step_deg=0.5)]
     max_jump_px = max(24.0, min(float(area.width), float(area.height)) * 0.08)
+    line_color = (145, 180, 215) if boundary_color is None else boundary_color
     for segment in visible_polyline_segments(pixels, max_jump_px):
         draw.line(segment, fill=(0, 0, 0, 225), width=9)
         draw.line(segment, fill=(255, 255, 255, 235), width=5)
-        draw.line(segment, fill=(145, 180, 215, 210), width=2)
+        draw.line(segment, fill=(*line_color, 210), width=2)
 
 
 def normalized_crosshair_type(value: str | None) -> str:
@@ -3888,6 +4394,40 @@ def finish_zoom_earth_true_color_quality(image, hd: bool = False):
     # Final highlight roll-off: pull the brightest cloud tops just below pure
     # white so they read as bright clouds with shape instead of blown-out white.
     working = compress_true_color_highlights(working, knee=204.0, ceiling=240.0)
+    if alpha is not None:
+        working = working.convert("RGBA")
+        working.putalpha(alpha)
+    return working
+
+
+def apply_faithful_true_color_enhancement(image):
+    """Gentle, faithful tone curve for standard (non-cosmetic) true-color flat maps.
+
+    The Zoom Earth / HD enhancement (``apply_zoom_earth_true_color_enhancement``)
+    is a deliberately punchy, stylised look: it warms clouds, lifts ocean toward a
+    vivid blue and boosts saturation. On a plain flat-map true-color export that
+    styling made the picture look washed out and yellow-tinted compared with the
+    native True Color Reproduction image (clouds went cream, ocean went muddy
+    teal). This routine instead applies only a light, hue-preserving correction so
+    a standard flat map closely matches the native look:
+
+      * a small shadow lift so deep ocean is legible without going bright,
+      * very mild contrast/saturation/brightness/sharpness for a clean image,
+      * a gentle highlight roll-off so the brightest cloud tops keep texture.
+
+    Clouds stay neutral white and ocean stays a deep, natural blue. Alpha is
+    preserved so the off-disk / out-of-bounds transparency is untouched.
+    """
+    from PIL import ImageEnhance
+
+    alpha = image.getchannel("A") if "A" in image.getbands() else None
+    working = image.convert("RGB")
+    working = lift_true_color_shadows(working, strength=0.22)
+    working = ImageEnhance.Contrast(working).enhance(1.05)
+    working = ImageEnhance.Color(working).enhance(1.07)
+    working = ImageEnhance.Brightness(working).enhance(1.02)
+    working = ImageEnhance.Sharpness(working).enhance(1.06)
+    working = compress_true_color_highlights(working, knee=210.0, ceiling=246.0)
     if alpha is not None:
         working = working.convert("RGBA")
         working.putalpha(alpha)
@@ -4317,14 +4857,25 @@ def apply_flat_map_style_to_image(
     if not native:
         fill_invalid_flat_map_pixels(working, valid_mask)
         if is_true_color:
-            # Aggressive red/magenta artifact cleanup and true-color tone enhancement
-            # are the default for every true-color flat map, not only Zoom Earth style.
-            # They run before any overlay so green borders, labels and the crosshair
-            # are drawn on top of the cleaned image and never removed by the cleanup.
+            # Red/magenta artifact cleanup runs for every true-color flat map, then
+            # the tone curve is chosen by mode. Both run before any overlay so green
+            # borders, labels and the crosshair are drawn on top of the cleaned image
+            # and are never removed by the speckle cleanup.
+            #
+            # Cosmetic modes (Zoom Earth style, or the enhanced "live"/"hd" satellite
+            # layers) get the punchy stylised look. A plain standard flat map instead
+            # gets a gentle, faithful correction so it matches the native True Color
+            # Reproduction image (deep-blue ocean, neutral white clouds) rather than
+            # the old washed-out, yellow-tinted result.
             hd = is_enhanced_satellite_layer(config)
-            working = apply_zoom_earth_true_color_enhancement(working, hd=hd)
-            cleanup_true_color_chroma_speckles(working, aggressive=True)
-            working = finish_zoom_earth_true_color_quality(working, hd=hd)
+            cosmetic_true_color = config.zoom_earth_style or hd
+            if cosmetic_true_color:
+                working = apply_zoom_earth_true_color_enhancement(working, hd=hd)
+                cleanup_true_color_chroma_speckles(working, aggressive=True)
+                working = finish_zoom_earth_true_color_quality(working, hd=hd)
+            else:
+                working = apply_faithful_true_color_enhancement(working)
+                cleanup_true_color_chroma_speckles(working, aggressive=True)
         if is_zoom_true_color:
             composite_flat_map_basemap(working, area, valid_mask)
     try:
@@ -4338,9 +4889,17 @@ def apply_flat_map_style_to_image(
     except Exception as exc:
         LOG.warning("Map border overlay failed (%s). Continuing without border lines.", exc)
     if config.add_night_boundary:
-        draw_night_boundary(working, area, scan_time)
+        try:
+            night_color = parse_rgb_color(getattr(config, "night_boundary_color", NIGHT_BOUNDARY_COLOR))
+        except Exception:
+            night_color = None
+        draw_night_boundary(working, area, scan_time, boundary_color=night_color)
     if config.add_map_labels:
-        draw_zoom_earth_labels(working, area, config.map_label_size)
+        try:
+            label_color = parse_rgb_color(getattr(config, "map_label_color", MAP_LABEL_COLOR))
+        except Exception:
+            label_color = None
+        draw_zoom_earth_labels(working, area, config.map_label_size, label_color=label_color)
     if config.add_crosshair:
         draw_crosshair(
             working,
@@ -5699,6 +6258,163 @@ def save_true_color_reproduction_fallback(
     )
 
 
+def _world_file_path(output_path: Path) -> Path:
+    """Return the conventional ESRI world-file path for a raster output."""
+    suffix = output_path.suffix.lower()
+    mapping = {
+        ".png": ".pgw",
+        ".tif": ".tfw",
+        ".tiff": ".tfw",
+        ".jpg": ".jgw",
+        ".jpeg": ".jgw",
+    }
+    return output_path.with_suffix(mapping.get(suffix, ".wld"))
+
+
+def _area_lonlat_corner_bounds(area: AreaDefinition) -> tuple[float, float, float, float] | None:
+    """Best-effort (min_lon, min_lat, max_lon, max_lat) from an area's corners.
+
+    Returns None when corners fall off the Earth disk (e.g. a full-disk
+    geostationary area), in which case the caller omits lat/lon bounds.
+    """
+    try:
+        height = int(area.height)
+        width = int(area.width)
+        cols = [0, width - 1, 0, width - 1]
+        rows = [0, 0, height - 1, height - 1]
+        lons: list[float] = []
+        lats: list[float] = []
+        for col, row in zip(cols, rows):
+            lon, lat = area.get_lonlat(row, col)
+            if np.isfinite(lon) and np.isfinite(lat):
+                lons.append(float(lon))
+                lats.append(float(lat))
+        if len(lons) < 4:
+            return None
+        return (min(lons), min(lats), max(lons), max(lats))
+    except Exception:
+        return None
+
+
+def write_output_sidecar(
+    output_path: Path,
+    config: ProcessorConfig,
+    info: UrlInfo,
+    scan_time: datetime,
+    area: AreaDefinition,
+    product: str,
+) -> None:
+    """Write a small JSON + world file (+ .prj) next to a rendered image.
+
+    The sidecar makes each image self-documenting and re-loadable in GIS tools:
+    it records the exact geographic bounds, the scan time, the projection and the
+    settings that produced the picture. Any failure here is logged and swallowed
+    so writing metadata can never break an otherwise successful run.
+    """
+    if not getattr(config, "write_metadata_sidecar", True):
+        return
+    try:
+        suffix = output_path.suffix.lower()
+        if suffix not in {".png", ".tif", ".tiff", ".jpg", ".jpeg"}:
+            return
+        width = int(area.width)
+        height = int(area.height)
+        x_min, y_min, x_max, y_max = (float(v) for v in area.area_extent)
+        pixel_size_x = (x_max - x_min) / width if width else 0.0
+        pixel_size_y = (y_max - y_min) / height if height else 0.0
+
+        # Projection description (WKT preferred, proj4 as a fallback).
+        proj4 = ""
+        wkt = ""
+        try:
+            proj4 = area.crs.to_proj4() or ""
+        except Exception:
+            proj4 = getattr(area, "proj_str", "") or ""
+        try:
+            wkt = area.crs.to_wkt()
+        except Exception:
+            wkt = ""
+
+        flat = is_flat_map(config)
+        metadata: dict[str, object] = {
+            "generator": f"{APP_DISPLAY_NAME}",
+            "app_version": APP_VERSION,
+            "image_file": output_path.name,
+            "product": product,
+            "requested_product": config.composite_choice,
+            "scan_time_utc": scan_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "satellite_id": info.sat_id,
+            "source_area": info.area,
+            "view": "flat_map" if flat else "native",
+            "pixels": {"width": width, "height": height},
+            "projection": {
+                "name": area.proj_id if hasattr(area, "proj_id") else "",
+                "proj4": proj4,
+                "extent_xy_min_max": [x_min, y_min, x_max, y_max],
+                "pixel_size": [pixel_size_x, abs(pixel_size_y)],
+                "units": "meters",
+            },
+            "settings": {
+                "map_view": config.map_view,
+                "image_format": config.image_format,
+                "resampler": config.resampler,
+                "zoom_earth_style": bool(config.zoom_earth_style),
+                "overlay_theme": getattr(config, "overlay_theme", OVERLAY_THEME),
+                "segment_aware_downloads": bool(getattr(config, "segment_aware_downloads", True)),
+                "add_border_lines": bool(config.add_border_lines),
+                "add_map_labels": bool(config.add_map_labels),
+                "add_night_boundary": bool(config.add_night_boundary),
+                "add_crosshair": bool(config.add_crosshair),
+            },
+        }
+
+        if flat:
+            metadata["geographic_bounds"] = {
+                "min_lat": float(config.flat_min_lat),
+                "max_lat": float(config.flat_max_lat),
+                "min_lon": float(config.flat_min_lon),
+                "max_lon": float(config.flat_max_lon),
+                "resolution_deg": float(config.flat_resolution_deg),
+                "note": "Requested crop in degrees; image grid is Web Mercator.",
+            }
+        else:
+            corner_bounds = _area_lonlat_corner_bounds(area)
+            if corner_bounds is not None:
+                min_lon, min_lat, max_lon, max_lat = corner_bounds
+                metadata["geographic_bounds"] = {
+                    "min_lat": min_lat,
+                    "max_lat": max_lat,
+                    "min_lon": min_lon,
+                    "max_lon": max_lon,
+                    "note": "Approximate lat/lon of the image corners.",
+                }
+            else:
+                metadata["geographic_bounds"] = {
+                    "note": "Full-disk geostationary image; corners fall off the Earth.",
+                }
+
+        json_path = output_path.with_suffix(output_path.suffix + ".json")
+        json_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+        # ESRI world file: pixel size and the centre of the upper-left pixel.
+        world_path = _world_file_path(output_path)
+        world_lines = [
+            repr(pixel_size_x),
+            "0.0",
+            "0.0",
+            repr(-abs(pixel_size_y)),
+            repr(x_min + pixel_size_x / 2.0),
+            repr(y_max - abs(pixel_size_y) / 2.0),
+        ]
+        world_path.write_text("\n".join(world_lines) + "\n", encoding="utf-8")
+
+        if wkt:
+            prj_path = output_path.with_suffix(".prj")
+            prj_path.write_text(wkt, encoding="utf-8")
+    except Exception as exc:  # pragma: no cover - metadata must never break a run
+        LOG.warning("Could not write metadata sidecar for %s (%s).", output_path.name, exc)
+
+
 def process_frame(
     dt: datetime,
     info: UrlInfo,
@@ -5719,7 +6435,14 @@ def process_frame(
         use_night_fallback=config.use_night_fallback,
         night_fallback_mode=config.night_fallback_mode,
     )
-    tasks = make_download_tasks(info, dt, bands, TEMP_DIR)
+    segment_numbers = segments_for_flat_bounds(info, config)
+    if segment_numbers is not None and len(segment_numbers) < info.total_segments:
+        LOG.info(
+            "Segment-aware download: fetching %s of %s FLDK segments for the regional crop "
+            "(latitude %.1f..%.1f).",
+            len(segment_numbers), info.total_segments, config.flat_min_lat, config.flat_max_lat,
+        )
+    tasks = make_download_tasks(info, dt, bands, TEMP_DIR, segment_numbers=segment_numbers)
     frame_dir = tasks[0].destination.parent if tasks else TEMP_DIR
     local_files: list[Path] = []
     scene: Scene | None = None
@@ -5938,6 +6661,12 @@ def process_frame(
         LOG.exception("Frame failed: %s", exc)
         return None
     finally:
+        if frame_succeeded:
+            try:
+                if "output_path" in locals() and output_path is not None and "active" in locals():
+                    write_output_sidecar(output_path, config, info, dt, master_area, active)
+            except Exception as exc:
+                LOG.debug("Sidecar metadata step skipped (%s).", exc)
         scene = None
         cleanup_partial_downloads(frame_dir)
         gc.collect()
@@ -6052,6 +6781,19 @@ def validate_configuration(config: ProcessorConfig | None = None) -> None:
         parse_rgb_color(config.crosshair_color)
     except ValueError as exc:
         raise ValueError("Crosshair color must be a name, #RRGGBB, or R,G,B values.") from exc
+    if config.add_map_labels:
+        try:
+            parse_rgb_color(getattr(config, "map_label_color", MAP_LABEL_COLOR))
+        except ValueError as exc:
+            raise ValueError("Map label color must be a name, #RRGGBB, or R,G,B values.") from exc
+    if config.add_night_boundary:
+        try:
+            parse_rgb_color(getattr(config, "night_boundary_color", NIGHT_BOUNDARY_COLOR))
+        except ValueError as exc:
+            raise ValueError("Night boundary color must be a name, #RRGGBB, or R,G,B values.") from exc
+    theme = getattr(config, "overlay_theme", OVERLAY_THEME)
+    if theme not in OVERLAY_THEME_ORDER:
+        raise ValueError(f"Overlay theme must be one of: {', '.join(OVERLAY_THEME_ORDER)}.")
     if config.zoom_earth_style and not is_flat_map(config):
         raise ValueError(
             "Zoom Earth-style flat-map styling requires flat map output. Turn it off to render the "
@@ -6107,6 +6849,24 @@ def validate_runtime_dependencies(config: ProcessorConfig, info: UrlInfo, start:
         )
 
 
+def estimated_output_megapixels(config: ProcessorConfig, info: UrlInfo) -> float:
+    """Approximate output size in megapixels, for the run-time estimate."""
+    try:
+        if is_flat_map(config):
+            area = flat_map_area(config)
+            return (int(area.width) * int(area.height)) / 1.0e6
+        pixel_size = target_pixel_size_m(
+            config.composite_choice,
+            config.use_night_fallback,
+            config.night_fallback_mode,
+        )
+        pixel_size = max(250, int(pixel_size))
+        side = AHI_FULL_DISK_2KM_LINES * 2000.0 / pixel_size
+        return (side * side) / 1.0e6
+    except Exception:
+        return 30.0
+
+
 def build_run_summary(config: ProcessorConfig) -> RunSummary:
     config = layer_defaults_config(config)
     info = parse_url(config.user_url)
@@ -6117,7 +6877,18 @@ def build_run_summary(config: ProcessorConfig) -> RunSummary:
         use_night_fallback=config.use_night_fallback,
         night_fallback_mode=config.night_fallback_mode,
     )
-    total_segments = len(steps) * len(bands) * info.total_segments
+    all_segments_per_frame = int(info.total_segments)
+    selected_segments = segments_for_flat_bounds(info, config)
+    segments_per_frame = len(selected_segments) if selected_segments is not None else all_segments_per_frame
+    total_segments = len(steps) * len(bands) * segments_per_frame
+    output_megapixels = estimated_output_megapixels(config, info)
+    estimated_seconds = estimate_run_seconds(
+        config,
+        frame_count=len(steps),
+        band_count=len(bands),
+        segments_per_frame=segments_per_frame,
+        output_megapixels=output_megapixels,
+    )
     warnings: list[str] = []
     if config.mode == "Timelapse" and config.composite_choice in QUALITY_CRITICAL_COMPOSITES:
         warnings.append("True color timelapses can be slow and memory-sensitive; IR products are safer.")
@@ -6125,6 +6896,11 @@ def build_run_summary(config: ProcessorConfig) -> RunSummary:
         warnings.append("Hybrid night fallback fills the dark side with B13 infrared while keeping sunlit true color.")
     if is_flat_map(config):
         warnings.append("Web Mercator flat map output uses nearest-neighbor reprojection and a bounded regional extent.")
+        if selected_segments is not None and segments_per_frame < all_segments_per_frame:
+            warnings.append(
+                f"Segment-aware download will fetch {segments_per_frame} of {all_segments_per_frame} "
+                "scan segments that cover the selected latitude band."
+            )
         if config.zoom_earth_style:
             warnings.append("Zoom Earth-style flat maps keep the selected satellite product; no map tiles are added.")
         if config.add_map_labels or config.add_night_boundary or config.add_crosshair:
@@ -6145,6 +6921,9 @@ def build_run_summary(config: ProcessorConfig) -> RunSummary:
         total_segments=total_segments,
         output=output_behavior_for_config(config, info, start),
         warnings=tuple(warnings),
+        estimated_seconds=estimated_seconds,
+        segments_per_frame=segments_per_frame,
+        all_segments_per_frame=all_segments_per_frame,
     )
 
 
@@ -7392,6 +8171,213 @@ class _Tooltip:
             self._tip = None
 
 
+class RegionPickerDialog:
+    """A simple clickable equirectangular mini-map for choosing flat-map bounds.
+
+    The user drags a rectangle over a graticule that shows the Himawari full-disk
+    view; the selection is converted to latitude/longitude and a live pixel and
+    RAM estimate is shown. Confirming fills the main window's flat-map bounds and
+    switches it to the flat map view. Everything is pure tkinter and maths - no
+    external map data is needed.
+    """
+
+    LON_MIN = 60.0
+    LON_MAX = 220.0
+    LAT_MIN = -85.0
+    LAT_MAX = 85.0
+    CANVAS_W = 720
+    CANVAS_H = 460
+
+    def __init__(self, app: "HimawariProcessorApp") -> None:
+        self.app = app
+        self.root = app.root
+        self.window = tk.Toplevel(self.root)
+        self.window.title("Pick a region")
+        self.window.transient(self.root)
+        self._drag_start: tuple[float, float] | None = None
+        self._box_id: int | None = None
+        self._selection: tuple[float, float, float, float] | None = None
+        self._build()
+        self._draw_base_map()
+        self._show_initial_bounds()
+
+    # -- layout ---------------------------------------------------------
+    def _build(self) -> None:
+        ttk.Label(
+            self.window,
+            text="Drag a box over the map to set the flat-map crop. The dashed outline is the Himawari view.",
+            wraplength=self.CANVAS_W,
+        ).pack(padx=10, pady=(10, 6))
+        self.canvas = tk.Canvas(
+            self.window,
+            width=self.CANVAS_W,
+            height=self.CANVAS_H,
+            bg="#0b1e3a",
+            highlightthickness=1,
+            highlightbackground="#3a4a60",
+        )
+        self.canvas.pack(padx=10)
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.estimate_var = tk.StringVar(value="Drag to select a region.")
+        ttk.Label(self.window, textvariable=self.estimate_var, style="Status.TLabel").pack(padx=10, pady=(6, 4))
+        row = ttk.Frame(self.window)
+        row.pack(pady=(4, 10))
+        self.apply_button = ttk.Button(row, text="Use This Region", command=self._apply, state="disabled")
+        self.apply_button.grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(row, text="Cancel", command=self.window.destroy).grid(row=0, column=1)
+
+    # -- coordinate helpers --------------------------------------------
+    def _lon_to_x(self, lon: float) -> float:
+        return (lon - self.LON_MIN) / (self.LON_MAX - self.LON_MIN) * self.CANVAS_W
+
+    def _lat_to_y(self, lat: float) -> float:
+        return (self.LAT_MAX - lat) / (self.LAT_MAX - self.LAT_MIN) * self.CANVAS_H
+
+    def _x_to_lon(self, x: float) -> float:
+        clamped = max(0.0, min(self.CANVAS_W, x))
+        return self.LON_MIN + (clamped / self.CANVAS_W) * (self.LON_MAX - self.LON_MIN)
+
+    def _y_to_lat(self, y: float) -> float:
+        clamped = max(0.0, min(self.CANVAS_H, y))
+        return self.LAT_MAX - (clamped / self.CANVAS_H) * (self.LAT_MAX - self.LAT_MIN)
+
+    @staticmethod
+    def _lon_label(lon: float) -> str:
+        value = lon
+        if value > 180.0:
+            value -= 360.0
+        hemi = "E" if value >= 0 else "W"
+        return f"{abs(value):g}{hemi}"
+
+    # -- drawing --------------------------------------------------------
+    def _draw_base_map(self) -> None:
+        canvas = self.canvas
+        for lon in range(60, 221, 20):
+            x = self._lon_to_x(lon)
+            canvas.create_line(x, 0, x, self.CANVAS_H, fill="#16304f")
+            canvas.create_text(x, self.CANVAS_H - 8, text=self._lon_label(lon), fill="#7fa8d0", font=("TkDefaultFont", 7))
+        for lat in range(-80, 81, 20):
+            y = self._lat_to_y(lat)
+            canvas.create_line(0, y, self.CANVAS_W, y, fill="#16304f")
+            canvas.create_text(16, y, text=f"{lat}", fill="#7fa8d0", font=("TkDefaultFont", 7))
+        equator_y = self._lat_to_y(0)
+        canvas.create_line(0, equator_y, self.CANVAS_W, equator_y, fill="#274c79")
+        x1 = self._lon_to_x(80)
+        x2 = self._lon_to_x(200)
+        y_top = self._lat_to_y(81)
+        y_bottom = self._lat_to_y(-81)
+        canvas.create_rectangle(x1, y_top, x2, y_bottom, outline="#5fd0ff", dash=(4, 3))
+        canvas.create_text((x1 + x2) / 2, y_top + 12, text="Himawari full-disk view", fill="#5fd0ff", font=("TkDefaultFont", 8))
+        sub_x = self._lon_to_x(AHI_SUB_SATELLITE_LON_DEG)
+        canvas.create_line(sub_x, equator_y - 6, sub_x, equator_y + 6, fill="#ffd23f")
+        canvas.create_line(sub_x - 6, equator_y, sub_x + 6, equator_y, fill="#ffd23f")
+
+    def _show_initial_bounds(self) -> None:
+        try:
+            min_lat = float(self.app.flat_min_lat_var.get())
+            max_lat = float(self.app.flat_max_lat_var.get())
+            min_lon = float(self.app.flat_min_lon_var.get())
+            max_lon = float(self.app.flat_max_lon_var.get())
+        except Exception:
+            return
+        if min_lat >= max_lat or min_lon >= max_lon:
+            return
+        self._selection = (min_lat, max_lat, min_lon, max_lon)
+        self._draw_selection_box()
+        self._update_estimate()
+        self.apply_button.configure(state="normal")
+
+    def _draw_selection_box(self) -> None:
+        if self._selection is None:
+            return
+        min_lat, max_lat, min_lon, max_lon = self._selection
+        x1 = self._lon_to_x(min_lon)
+        x2 = self._lon_to_x(max_lon)
+        y1 = self._lat_to_y(max_lat)
+        y2 = self._lat_to_y(min_lat)
+        if self._box_id is not None:
+            self.canvas.delete(self._box_id)
+        self._box_id = self.canvas.create_rectangle(x1, y1, x2, y2, outline="#ff7ad0", width=2)
+
+    # -- interaction ----------------------------------------------------
+    def _on_press(self, event: tk.Event) -> None:
+        self._drag_start = (event.x, event.y)
+        if self._box_id is not None:
+            self.canvas.delete(self._box_id)
+            self._box_id = None
+
+    def _on_drag(self, event: tk.Event) -> None:
+        if self._drag_start is None:
+            return
+        x0, y0 = self._drag_start
+        if self._box_id is not None:
+            self.canvas.delete(self._box_id)
+        self._box_id = self.canvas.create_rectangle(x0, y0, event.x, event.y, outline="#ff7ad0", width=2)
+
+    def _on_release(self, event: tk.Event) -> None:
+        if self._drag_start is None:
+            return
+        x0, y0 = self._drag_start
+        self._drag_start = None
+        if abs(event.x - x0) < 4 or abs(event.y - y0) < 4:
+            self.estimate_var.set("Selection too small - drag a larger box.")
+            return
+        lon_a = self._x_to_lon(x0)
+        lon_b = self._x_to_lon(event.x)
+        lat_a = self._y_to_lat(y0)
+        lat_b = self._y_to_lat(event.y)
+        min_lon, max_lon = sorted((lon_a, lon_b))
+        min_lat, max_lat = sorted((lat_a, lat_b))
+        max_lat = min(max_lat, WEB_MERCATOR_MAX_LAT)
+        min_lat = max(min_lat, -WEB_MERCATOR_MAX_LAT)
+        self._selection = (round(min_lat, 3), round(max_lat, 3), round(min_lon, 3), round(max_lon, 3))
+        self._draw_selection_box()
+        self._update_estimate()
+        self.apply_button.configure(state="normal")
+
+    def _update_estimate(self) -> None:
+        if self._selection is None:
+            return
+        min_lat, max_lat, min_lon, max_lon = self._selection
+        try:
+            resolution = float(self.app.flat_resolution_var.get())
+        except Exception:
+            resolution = FLAT_RESOLUTION_DEG
+        text = (
+            f"lat {min_lat:g}..{max_lat:g}, lon {min_lon:g}..{max_lon:g}"
+        )
+        try:
+            height, width = flat_map_shape(min_lat, max_lat, min_lon, max_lon, resolution)
+            pixels = width * height
+            peak_mb = pixels * 16 / 1.0e6
+            text += f"   ->  {width:,} x {height:,} px  (~{peak_mb:,.0f} MB peak, rough)"
+            if pixels > MAX_FLAT_MAP_PIXELS:
+                text += f"   TOO LARGE: over {MAX_FLAT_MAP_PIXELS:,} px; coarsen resolution or shrink the box."
+        except Exception as exc:
+            text += f"   (size estimate unavailable: {exc})"
+        self.estimate_var.set(text)
+
+    def _apply(self) -> None:
+        if self._selection is None:
+            self.window.destroy()
+            return
+        min_lat, max_lat, min_lon, max_lon = self._selection
+        self.app.flat_min_lat_var.set(str(min_lat))
+        self.app.flat_max_lat_var.set(str(max_lat))
+        self.app.flat_min_lon_var.set(str(min_lon))
+        self.app.flat_max_lon_var.set(str(max_lon))
+        self.app.map_view_var.set("flat")
+        self.app.area_preset_var.set(AREA_PRESET_CUSTOM)
+        self.app._append_log(
+            f"Region picker set flat map bounds: lat {min_lat:g}..{max_lat:g}, lon {min_lon:g}..{max_lon:g}."
+        )
+        self.app._update_setup_status()
+        self.app._write_current_settings()
+        self.window.destroy()
+
+
 class HimawariProcessorApp:
     def __init__(self, root: tk.Tk) -> None:
         loaded_settings = load_gui_settings()
@@ -7458,6 +8444,11 @@ class HimawariProcessorApp:
         self.crosshair_type_var = tk.StringVar(value=initial_config.crosshair_type)
         self.crosshair_color_var = tk.StringVar(value=initial_config.crosshair_color)
         self.zoom_earth_style_var = tk.BooleanVar(value=initial_config.zoom_earth_style)
+        self.segment_aware_var = tk.BooleanVar(value=initial_config.segment_aware_downloads)
+        self.write_sidecar_var = tk.BooleanVar(value=initial_config.write_metadata_sidecar)
+        self.overlay_theme_var = tk.StringVar(value=initial_config.overlay_theme)
+        self.map_label_color_var = tk.StringVar(value=initial_config.map_label_color)
+        self.night_boundary_color_var = tk.StringVar(value=initial_config.night_boundary_color)
         self.status_var = tk.StringVar(value="Ready")
         self.progress_var = tk.DoubleVar(value=0)
         self.setup_status_var = tk.StringVar(value="")
@@ -7798,6 +8789,51 @@ class HimawariProcessorApp:
             width=8,
         ).grid(row=9, column=0, sticky="w", pady=(2, 0))
 
+        ttk.Separator(options_frame, orient="horizontal").grid(
+            row=10, column=0, columnspan=2, sticky="ew", pady=(8, 6)
+        )
+        ttk.Label(options_frame, text="Overlay Theme").grid(row=11, column=0, sticky="w", pady=(2, 4))
+        self.overlay_theme_box = ttk.Combobox(
+            options_frame,
+            textvariable=self.overlay_theme_var,
+            values=list(OVERLAY_THEME_ORDER),
+            state="readonly",
+        )
+        self.overlay_theme_box.grid(row=11, column=0, sticky="ew", padx=(110, 8), pady=(2, 4))
+        self.overlay_theme_box.bind("<<ComboboxSelected>>", lambda _event: self._on_overlay_theme_change())
+        ttk.Label(options_frame, text="Label Color").grid(row=11, column=1, sticky="w", padx=(0, 8), pady=(2, 4))
+        label_color_row = ttk.Frame(options_frame)
+        label_color_row.grid(row=12, column=1, sticky="ew", pady=(0, 4))
+        label_color_row.columnconfigure(0, weight=1)
+        ttk.Entry(label_color_row, textvariable=self.map_label_color_var, width=14).grid(row=0, column=0, sticky="ew")
+        ttk.Button(
+            label_color_row,
+            text="Pick",
+            command=lambda: self._choose_color(self.map_label_color_var, "Map label color", MAP_LABEL_COLOR),
+        ).grid(row=0, column=1, padx=(8, 0))
+        ttk.Label(options_frame, text="Night Line Color").grid(row=12, column=0, sticky="w", pady=(0, 4))
+        night_color_row = ttk.Frame(options_frame)
+        night_color_row.grid(row=13, column=0, sticky="ew", pady=(0, 4))
+        night_color_row.columnconfigure(0, weight=1)
+        ttk.Entry(night_color_row, textvariable=self.night_boundary_color_var, width=14).grid(row=0, column=0, sticky="ew")
+        ttk.Button(
+            night_color_row,
+            text="Pick",
+            command=lambda: self._choose_color(
+                self.night_boundary_color_var, "Night boundary color", NIGHT_BOUNDARY_COLOR
+            ),
+        ).grid(row=0, column=1, padx=(8, 0))
+        ttk.Checkbutton(
+            options_frame,
+            text="Segment-aware downloads (regional crops skip unused scan segments)",
+            variable=self.segment_aware_var,
+        ).grid(row=14, column=0, columnspan=2, sticky="w", pady=(6, 2))
+        ttk.Checkbutton(
+            options_frame,
+            text="Write a metadata sidecar (.json + world file) next to each image",
+            variable=self.write_sidecar_var,
+        ).grid(row=15, column=0, columnspan=2, sticky="w", pady=(2, 2))
+
         simple_frame = ttk.LabelFrame(settings, text="Simple View", style="Section.TLabelframe")
         simple_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         simple_frame.columnconfigure(0, weight=1)
@@ -8073,6 +9109,12 @@ class HimawariProcessorApp:
         self.update_app_button.grid(row=1, column=5, padx=(0, 8), pady=(8, 0))
         self.help_button = ttk.Button(buttons, text="Help (?)", command=self._open_help_window)
         self.help_button.grid(row=1, column=6, padx=(0, 8), pady=(8, 0))
+        self.preview_button = ttk.Button(buttons, text="Quick Look", command=self._start_preview)
+        self.preview_button.grid(row=1, column=7, padx=(0, 8), pady=(8, 0))
+        self.pick_region_button = ttk.Button(buttons, text="Pick Region", command=self._open_region_picker)
+        self.pick_region_button.grid(row=2, column=1, padx=(0, 8), pady=(8, 0))
+        self.test_host_button = ttk.Button(buttons, text="Test Data Host", command=self._start_connectivity_check)
+        self.test_host_button.grid(row=2, column=2, padx=(0, 8), pady=(8, 0))
         self._install_tooltips()
         self._refresh_mode_state()
         self._configure_main_split()
@@ -8503,6 +9545,11 @@ class HimawariProcessorApp:
             self.crosshair_color_var,
             self.zoom_earth_style_var,
             self.output_template_var,
+            self.segment_aware_var,
+            self.write_sidecar_var,
+            self.overlay_theme_var,
+            self.map_label_color_var,
+            self.night_boundary_color_var,
         )
         for watched_var in watched_vars:
             watched_var.trace_add("write", lambda *_args: self._update_setup_status())
@@ -8571,6 +9618,11 @@ class HimawariProcessorApp:
         self.crosshair_type_var.set(normalized_crosshair_type(config.crosshair_type))
         self.crosshair_color_var.set(config.crosshair_color)
         self.zoom_earth_style_var.set(config.zoom_earth_style)
+        self.segment_aware_var.set(config.segment_aware_downloads)
+        self.write_sidecar_var.set(config.write_metadata_sidecar)
+        self.overlay_theme_var.set(config.overlay_theme)
+        self.map_label_color_var.set(config.map_label_color)
+        self.night_boundary_color_var.set(config.night_boundary_color)
         self._refresh_mode_state()
         self._update_setup_status()
 
@@ -8628,6 +9680,25 @@ class HimawariProcessorApp:
         self._update_setup_status()
         self._write_current_settings()
 
+    def _on_overlay_theme_change(self) -> None:
+        theme = self.overlay_theme_var.get()
+        colors = overlay_theme_colors(theme)
+        if colors is None:
+            self._append_log(f"Overlay theme set to '{theme}'; keeping your current colors.")
+            self._update_setup_status()
+            self._write_current_settings()
+            return
+        self.border_color_var.set(colors["border"])
+        self.map_label_color_var.set(colors["label"])
+        self.night_boundary_color_var.set(colors["night_boundary"])
+        self.crosshair_color_var.set(colors["crosshair"])
+        self._append_log(
+            f"Overlay theme '{theme}' applied: border {colors['border']}, label {colors['label']}, "
+            f"night line {colors['night_boundary']}, crosshair {colors['crosshair']}."
+        )
+        self._update_setup_status()
+        self._write_current_settings()
+
     def _add_tooltip(self, widget, text: str) -> None:
         if widget is None:
             return
@@ -8661,6 +9732,9 @@ class HimawariProcessorApp:
             "choose_temp_button": "Choose Temp Folder: pick where temporary download files are stored.",
             "open_temp_button": "Open Temp Folder: open the temporary working folder.",
             "overlay_check_button": "Check Overlay Setup: verify the coastline/border overlay data is installed.",
+            "preview_button": "Quick Look: render a fast, coarse flat-map preview so you can check framing and colour before a full run. It does not change your settings.",
+            "pick_region_button": "Pick Region: open a clickable mini-map and drag a box to set the flat-map crop instead of typing latitude and longitude.",
+            "test_host_button": "Test Data Host: check whether the satellite data server is reachable (DNS and a quick HTTP request). Use this to tell a failed run apart from a network problem.",
             "area_preset_box": "Output Region: pick a region to frame the image. Regional presets and 'Full Disk (flat map)' switch to the flat map and fill the bounds; 'Full Disk (native)' uses the round-Earth view.",
             "satellite_layer_box": "Satellite Layer: 'standard' is normal; 'live' grabs the latest scan; 'hd' applies stronger enhancement. live/hd also turn on flat-map true-color styling.",
             "map_view_box": "Map View: 'native' is the round full-disk Earth; 'flat' is a rectangular Web Mercator map you can crop with the bounds.",
@@ -8691,6 +9765,7 @@ class HimawariProcessorApp:
         scroll.pack(side="right", fill="y")
         sections = [
             ("Run", ["start_button", "stop_button", "open_output_button", "open_last_button"]),
+            ("Tools", ["preview_button", "pick_region_button", "test_host_button", "overlay_check_button"]),
             ("Clipboard", ["copy_paths_button", "copy_error_button", "copy_log_button", "copy_settings_button"]),
             ("Maintenance", ["update_app_button", "check_env_button", "quick_fix_button", "auto_fix_button", "help_button"]),
             ("Source", ["latest_url_button", "scan_browser_button", "local_files_button"]),
@@ -8885,6 +9960,9 @@ class HimawariProcessorApp:
             getattr(self, "copy_paths_button", None),
             getattr(self, "copy_error_button", None),
             getattr(self, "custom_preset_box", None),
+            getattr(self, "preview_button", None),
+            getattr(self, "pick_region_button", None),
+            getattr(self, "test_host_button", None),
         ):
             if widget is not None:
                 widget.configure(state=mutable_state)
@@ -9067,6 +10145,113 @@ class HimawariProcessorApp:
         else:
             messagebox.showwarning("Overlay setup", status.display_text())
 
+    # ------------------------------------------------------------------
+    # Connectivity check (Test Data Host)
+    # ------------------------------------------------------------------
+    def _start_connectivity_check(self) -> None:
+        if self.is_running:
+            return
+        source = self.url_var.get().strip()
+        self.status_var.set("Testing data host")
+        self._append_log("Testing whether the satellite data host is reachable...")
+        self.test_host_button.configure(state="disabled")
+
+        def worker() -> None:
+            try:
+                result = check_data_host_connectivity(source or None)
+                self.messages.put(("connectivity_result", result))
+            except Exception as exc:
+                self.messages.put(("connectivity_error", str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # Live preview (Quick Look)
+    # ------------------------------------------------------------------
+    def _start_preview(self) -> None:
+        if self.is_running:
+            messagebox.showinfo("Quick Look", "A run is already in progress. Wait for it to finish first.")
+            return
+        try:
+            config = self._read_config()
+            preview_config = build_preview_config(config)
+            validate_configuration(preview_config)
+        except Exception as exc:
+            self._append_log(f"Quick Look could not start: {exc}")
+            messagebox.showerror("Quick Look", str(exc))
+            return
+
+        self.status_var.set("Building quick look")
+        self.phase_var.set("Quick Look")
+        self._append_log(
+            "Quick Look: rendering a coarse flat-map preview "
+            f"(~{preview_config.flat_resolution_deg:g} deg/pixel). This does not affect a full run."
+        )
+        self.preview_button.configure(state="disabled")
+        preview_started_utc = utc_timestamp()
+
+        def progress(message: str, current: int | None, total: int | None) -> None:
+            self.messages.put(("progress", (f"Quick Look: {message}", current, total)))
+
+        def worker() -> None:
+            try:
+                outputs = run(
+                    preview_config,
+                    progress=progress,
+                    cancel_event=self.cancel_event,
+                    started_at_utc=preview_started_utc,
+                )
+                self.messages.put(("preview_done", outputs))
+            except ProcessingCancelled as exc:
+                self.messages.put(("preview_error", f"Canceled: {exc}"))
+            except Exception as exc:
+                LOG.exception("Quick Look preview failed")
+                self.messages.put(("preview_error", str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_preview_window(self, image_path: Path) -> None:
+        try:
+            from PIL import Image, ImageTk
+        except Exception as exc:
+            messagebox.showinfo("Quick Look", f"Preview image saved to:\n{image_path}\n\n(Could not display inline: {exc})")
+            return
+        try:
+            with Image.open(image_path) as opened:
+                preview = opened.convert("RGBA")
+                width, height = preview.size
+                scale = min(1.0, PREVIEW_MAX_DIMENSION_PX / float(max(width, height)))
+                if scale < 1.0:
+                    preview = preview.resize(
+                        (max(1, int(width * scale)), max(1, int(height * scale))),
+                        Image.LANCZOS,
+                    )
+                photo = ImageTk.PhotoImage(preview)
+        except Exception as exc:
+            messagebox.showinfo("Quick Look", f"Preview image saved to:\n{image_path}\n\n(Could not open image: {exc})")
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("Quick Look preview")
+        window.transient(self.root)
+        # Keep a reference so the image is not garbage-collected.
+        self.preview_image = photo
+        ttk.Label(window, text=f"{image_path.name}  ({width} x {height} px source)").pack(padx=10, pady=(10, 4))
+        ttk.Label(window, image=photo).pack(padx=10, pady=(0, 6))
+        ttk.Label(
+            window,
+            text="This is a coarse preview for framing and colour. The full run uses your real settings.",
+            wraplength=max(360, photo.width()),
+            style="Status.TLabel",
+        ).pack(padx=10, pady=(0, 8))
+        ttk.Button(window, text="Close", command=window.destroy).pack(pady=(0, 10))
+
+    # ------------------------------------------------------------------
+    # Visual region picker (Pick Region)
+    # ------------------------------------------------------------------
+    def _open_region_picker(self) -> None:
+        RegionPickerDialog(self)
+
     def _fill_latest_fldk_url(self) -> None:
         sat_id = sat_id_from_himawari_source(self.url_var.get())
         self.status_var.set("Finding latest FLDK")
@@ -9140,6 +10325,11 @@ class HimawariProcessorApp:
             ram_limit_gb=self._read_float_var(self.ram_limit_var, "RAM limit"),
             dask_chunk_size=self.chunk_var.get(),
             dask_num_workers=int(self.dask_workers_var.get()),
+            segment_aware_downloads=self.segment_aware_var.get(),
+            write_metadata_sidecar=self.write_sidecar_var.get(),
+            overlay_theme=self.overlay_theme_var.get(),
+            map_label_color=self.map_label_color_var.get(),
+            night_boundary_color=self.night_boundary_color_var.get(),
         )
 
     def _start(self) -> None:
@@ -9261,6 +10451,43 @@ class HimawariProcessorApp:
                 self.status_var.set("Environment check failed")
                 self._append_log(f"Environment check failed: {payload}")
                 messagebox.showerror("Environment check failed", str(payload))
+            elif kind == "connectivity_result":
+                result = payload
+                if not self.is_running:
+                    self.test_host_button.configure(state="normal")
+                text = result.display_text()  # type: ignore[union-attr]
+                self.status_var.set("Data host reachable" if result.reachable else "Data host unreachable")  # type: ignore[union-attr]
+                self._append_log("Data host connectivity:\n" + text)
+                if result.reachable:  # type: ignore[union-attr]
+                    messagebox.showinfo("Data host connectivity", text)
+                else:
+                    messagebox.showwarning("Data host connectivity", text)
+            elif kind == "connectivity_error":
+                if not self.is_running:
+                    self.test_host_button.configure(state="normal")
+                self.status_var.set("Connectivity test failed")
+                self._append_log(f"Connectivity test failed: {payload}")
+                messagebox.showerror("Data host connectivity", str(payload))
+            elif kind == "preview_done":
+                if not self.is_running:
+                    self.preview_button.configure(state="normal")
+                outputs = list(payload) if payload else []
+                self.status_var.set("Quick Look ready")
+                self.phase_var.set("Ready")
+                if outputs:
+                    preview_path = Path(outputs[0])
+                    self._append_log(f"Quick Look preview saved: {preview_path}")
+                    self._show_preview_window(preview_path)
+                else:
+                    self._append_log("Quick Look finished but produced no image.")
+                    messagebox.showinfo("Quick Look", "The preview finished but produced no image.")
+            elif kind == "preview_error":
+                if not self.is_running:
+                    self.preview_button.configure(state="normal")
+                self.status_var.set("Quick Look failed")
+                self.phase_var.set("Ready")
+                self._append_log(f"Quick Look failed: {payload}")
+                messagebox.showerror("Quick Look", str(payload))
             elif kind == "latest_url":
                 self.latest_url_button.configure(state="normal" if not self.is_running else "disabled")
                 self.url_var.set(str(payload))
