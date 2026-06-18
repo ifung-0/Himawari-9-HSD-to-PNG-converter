@@ -65,7 +65,7 @@ except KeyboardInterrupt:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-APP_VERSION = "2026.06.17.06"
+APP_VERSION = "2026.06.17.08"
 APP_DISPLAY_NAME = "Himawari-8/9 Low-RAM Processor"
 USER_URL = "https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/2024/07/25/0400/HS_H09_20240725_0400_B01_FLDK_R10_S0110.DAT.bz2"
 MODE = "Single Image"  # "Single Image" or "Timelapse"
@@ -101,9 +101,9 @@ ADD_CROSSHAIR = False
 CROSSHAIR_TYPE = "target"
 CROSSHAIR_COLOR = "#7c3cff"
 ZOOM_EARTH_STYLE = False
-FLAT_MAP_INVALID_FILL = (18, 24, 32)  # neutral dark blue-gray: visible (not near-black) so off-disk corners don't look black
+FLAT_MAP_INVALID_FILL = (30, 34, 40)  # neutral mid-dark gray: bright enough to read as "ocean" not "black" against the disk
 FLAT_MAP_SOURCE_VALID_MIN = 1.0e-6
-FLAT_MAP_BASEMAP_OCEAN = (18, 24, 32)  # neutral dark blue-gray basemap: dark enough to recede, light enough to not look black
+FLAT_MAP_BASEMAP_OCEAN = (30, 34, 40)  # neutral mid-dark gray-blue basemap: recedes but doesn't look black; minimal blue cast
 FLAT_MAP_BASEMAP_LAND = (60, 72, 60)
 FLAT_MAP_BASEMAP_COAST = (122, 134, 126)
 FLAT_MAP_LIMB_FADE_FRACTION = 0.05
@@ -4288,7 +4288,12 @@ def impossible_true_color_chroma_mask(rgb: np.ndarray) -> np.ndarray:
     impossible_red = (red >= 245) & (green <= 45) & (blue <= 45)
     impossible_green = (green >= 245) & (red <= 45) & (blue <= 45)
     impossible_magenta = (red >= 220) & (blue >= 220) & (green <= 65)
-    return impossible_red | impossible_green | impossible_magenta
+    # Vivid saturated red/magenta that cannot occur in real Himawari true
+    # color: very high red, very low green, and blue well below red. These are
+    # the persistent "red spot" artifacts (mean ~250,13,52) that survived the
+    # older impossible_red check because blue was 46-60 (just above 45).
+    impossible_vivid_red = (red >= 200) & (green <= 40) & (red > blue + 150)
+    return impossible_red | impossible_green | impossible_magenta | impossible_vivid_red
 
 
 def aggressive_true_color_artifact_mask(rgb: np.ndarray) -> np.ndarray:
@@ -4335,7 +4340,7 @@ def cleanup_true_color_chroma_speckles(
     image,
     max_component_pixels: int = 24,
     aggressive: bool = False,
-    aggressive_component_pixels: int = 192,
+    aggressive_component_pixels: int = 600,
 ) -> None:
     from PIL import Image
 
