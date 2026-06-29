@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "app_version": "2026.06.17.06",
+  "app_version": "2026.06.17.08",
   "config": {
     "user_url": "https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/2024/07/25/0400/HS_H09_20240725_0400_B01_FLDK_R10_S0110.DAT.bz2",
     "mode": "Single Image",

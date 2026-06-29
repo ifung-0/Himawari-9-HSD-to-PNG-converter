@@ -314,10 +314,17 @@ class HimawariSimpleApp(h.HimawariProcessorApp):
     # ---- build the simplified UI --------------------------------------------
     def _build_ui(self) -> None:
         self.root.title(f"{APP_DISPLAY_NAME} (Simple) v{APP_VERSION}")
-        self.root.geometry("980x760")
-        self.root.minsize(760, 600)
+        self.root.geometry("980x820")
+        self.root.minsize(760, 660)
 
-        # A single scrollable notebook with two tabs: Run Setup and Advanced.
+        # Pack the bottom elements FIRST (side="bottom") so they reserve their
+        # space before the notebook + log expand to fill the rest. Packing them
+        # last with the log using expand=True previously squeezed the button bar
+        # below the visible window.
+        self._build_bottom_buttons(bottom_side=True)
+        self._build_status_and_log(bottom_side=True)
+
+        # A single notebook with two tabs: Run Setup and Advanced.
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill="both", expand=True, padx=8, pady=8)
 
@@ -328,10 +335,6 @@ class HimawariSimpleApp(h.HimawariProcessorApp):
 
         self._build_setup_tab(setup_tab)
         self._build_advanced_tab(advanced_tab)
-
-        # Bottom: status + progress + log + button row (kept from the full GUI).
-        self._build_status_and_log()
-        self._build_bottom_buttons()
 
     # ---- Run Setup tab ------------------------------------------------------
     def _build_setup_tab(self, parent: ttk.Frame) -> None:
@@ -524,24 +527,28 @@ class HimawariSimpleApp(h.HimawariProcessorApp):
         note.pack(anchor="w", padx=12, pady=(4, 8))
 
     # ---- status + log + bottom buttons --------------------------------------
-    def _build_status_and_log(self) -> None:
-        bottom = ttk.Frame(self.root)
-        bottom.pack(fill="x", padx=8, pady=(0, 4))
-        ttk.Label(bottom, text="Status:").pack(side="left")
-        ttk.Label(bottom, textvariable=self.status_var).pack(side="left", padx=(4, 12))
-        ttk.Label(bottom, textvariable=self.phase_var).pack(side="left")
-        self.progress_bar = ttk.Progressbar(bottom, variable=self.progress_var, maximum=100)
-        self.progress_bar.pack(fill="x", side="left", expand=True, padx=8)
-
+    def _build_status_and_log(self, bottom_side: bool = False) -> None:
+        # The log frame packs first (so it sits above the status strip), then
+        # the status strip. When bottom_side is True they pack from the bottom
+        # so the button bar (packed last from the bottom) ends up at the very
+        # bottom and is never squeezed off-screen.
         log_frame = ttk.LabelFrame(self.root, text="Log")
-        log_frame.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+        log_frame.pack(fill="both", expand=True, side=("bottom" if bottom_side else "top"), padx=8, pady=(0, 4))
         self.log_text = tk.Text(log_frame, height=8, state="disabled", wrap="word")
         self.log_text.pack(side="left", fill="both", expand=True)
         log_scroll = ttk.Scrollbar(log_frame, command=self.log_text.yview)
         log_scroll.pack(side="right", fill="y")
         self.log_text.configure(yscrollcommand=log_scroll.set)
 
-    def _build_bottom_buttons(self) -> None:
+        bottom = ttk.Frame(self.root)
+        bottom.pack(fill="x", side=("bottom" if bottom_side else "top"), padx=8, pady=(0, 4))
+        ttk.Label(bottom, text="Status:").pack(side="left")
+        ttk.Label(bottom, textvariable=self.status_var).pack(side="left", padx=(4, 12))
+        ttk.Label(bottom, textvariable=self.phase_var).pack(side="left")
+        self.progress_bar = ttk.Progressbar(bottom, variable=self.progress_var, maximum=100)
+        self.progress_bar.pack(fill="x", side="left", expand=True, padx=8)
+
+    def _build_bottom_buttons(self, bottom_side: bool = False) -> None:
         # Button bar matches the requested layout (left to right):
         # Start Processing | Stop | Open Outputs | Open Last | Copy Paths |
         # Copy Error | Copy Log | Close | Check Env | Quick Fix | Auto Fix |
@@ -553,7 +560,7 @@ class HimawariSimpleApp(h.HimawariProcessorApp):
         # approach clipped the buttons). Tk's grid wrapping handles narrow
         # windows gracefully.
         outer = ttk.Frame(self.root)
-        outer.pack(fill="x", padx=8, pady=(0, 8))
+        outer.pack(fill="x", side=("bottom" if bottom_side else "top"), padx=8, pady=(0, 8))
 
         # (label, command) in the exact requested order.
         button_specs = [
