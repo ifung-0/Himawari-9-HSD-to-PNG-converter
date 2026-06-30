@@ -244,6 +244,4 @@ if not errorlevel 1 (
 exit /b 1
 
 :end
-echo.
-pause
-exit /b %EXIT_CODE%
+exit /b 0
