@@ -148,7 +148,7 @@ class Field:
 def format_value(kind: str, value: Any) -> str:
     """Render a setting value for display."""
     if kind == "bool":
-        return "on" if bool(value) else "off"
+        return "\u25cf ON " if bool(value) else "\u25cb off"
     if value is None:
         return ""
     text = str(value)
@@ -418,6 +418,42 @@ def run_self_update(state: TuiState) -> None:
 # curses front-end. All curses calls live below this line so the rest of the
 # module can be imported and tested without a terminal.
 # ---------------------------------------------------------------------------
+
+# Color pair IDs (initialized in _init_colors)
+_CP_TITLE = 1
+_CP_HEADER = 2
+_CP_HIGHLIGHT = 3
+_CP_STATUS = 4
+_CP_DIM = 5
+_CP_ON = 6
+_CP_OFF = 7
+_CP_BORDER = 8
+_CP_SECTION = 9
+_CP_SELECTED = 10
+
+
+def _init_colors() -> None:
+    """Initialize the color palette. Safe to call even if the terminal has no
+    color support — all drawing degrades to attributes gracefully."""
+    import curses
+
+    if not curses.has_colors():
+        return
+    curses.start_color()
+    curses.use_default_colors()
+    #            ID              FG              BG
+    curses.init_pair(_CP_TITLE,     curses.COLOR_CYAN,    -1)
+    curses.init_pair(_CP_HEADER,    curses.COLOR_WHITE,   curses.COLOR_BLUE)
+    curses.init_pair(_CP_HIGHLIGHT, curses.COLOR_YELLOW,  -1)
+    curses.init_pair(_CP_STATUS,    curses.COLOR_GREEN,   -1)
+    curses.init_pair(_CP_DIM,       curses.COLOR_WHITE,   -1)
+    curses.init_pair(_CP_ON,        curses.COLOR_GREEN,   -1)
+    curses.init_pair(_CP_OFF,       curses.COLOR_WHITE,   -1)
+    curses.init_pair(_CP_BORDER,    curses.COLOR_CYAN,    -1)
+    curses.init_pair(_CP_SECTION,   curses.COLOR_MAGENTA, -1)
+    curses.init_pair(_CP_SELECTED,  curses.COLOR_BLACK,   curses.COLOR_CYAN)
+
+
 def _safe_addstr(win: Any, y: int, x: int, text: str, attr: int = 0) -> None:
     """addstr that never raises if the text would run past the window edge."""
     import curses
@@ -431,6 +467,72 @@ def _safe_addstr(win: Any, y: int, x: int, text: str, attr: int = 0) -> None:
         pass
 
 
+def _hline(stdscr: Any, y: int, width: int) -> None:
+    """Draw a horizontal line across the screen."""
+    import curses
+
+    max_y, max_x = stdscr.getmaxyx()
+    if y < 0 or y >= max_y:
+        return
+    line = "\u2500" * min(width, max_x)
+    _safe_addstr(stdscr, y, 0, line, curses.color_pair(_CP_BORDER))
+
+
+def _box(stdscr: Any, y: int, x: int, w: int, h: int) -> None:
+    """Draw a box with rounded/Unicode corners."""
+    import curses
+
+    max_y, max_x = stdscr.getmaxyx()
+    attr = curses.color_pair(_CP_BORDER)
+    if y < 0 or y >= max_y or x < 0 or x >= max_x:
+        return
+    # top
+    _safe_addstr(stdscr, y, x, "\u250c" + "\u2500" * (w - 2) + "\u2510", attr)
+    # sides
+    for row in range(1, h - 1):
+        if y + row >= max_y:
+            break
+        _safe_addstr(stdscr, y + row, x, "\u2502", attr)
+        if x + w - 1 < max_x:
+            _safe_addstr(stdscr, y + row, x + w - 1, "\u2502", attr)
+    # bottom
+    if y + h - 1 < max_y:
+        _safe_addstr(stdscr, y + h - 1, x, "\u2514" + "\u2500" * (w - 2) + "\u2518", attr)
+
+
+def _draw_header(stdscr: Any, title: str, subtitle: str = "") -> int:
+    """Draw a styled header bar. Returns the Y coordinate where content starts."""
+    import curses
+
+    max_y, max_x = stdscr.getmaxyx()
+    # Title bar (full width, inverse video)
+    _safe_addstr(stdscr, 0, 0, " " * max_x, curses.color_pair(_CP_HEADER))
+    padded = f" {title} "
+    start_x = max(0, (max_x - len(padded)) // 2)
+    _safe_addstr(stdscr, 0, start_x, padded[:max_x - 1], curses.color_pair(_CP_HEADER) | curses.A_BOLD)
+    if subtitle:
+        _safe_addstr(stdscr, 1, 0, " " * max_x, curses.color_pair(_CP_HEADER))
+        _safe_addstr(stdscr, 1, 0, f" {subtitle}"[:max_x - 1], curses.color_pair(_CP_HEADER) | curses.A_DIM)
+        return 3
+    return 2
+
+
+def _draw_statusbar(stdscr: Any, text: str, help_text: str = "") -> None:
+    """Draw a status bar at the bottom of the screen."""
+    import curses
+
+    max_y, max_x = stdscr.getmaxyx()
+    if max_y < 2:
+        return
+    # Status line
+    _safe_addstr(stdscr, max_y - 2, 0, " " * max_x, curses.color_pair(_CP_STATUS))
+    _safe_addstr(stdscr, max_y - 2, 0, f" {text}"[:max_x - 1], curses.color_pair(_CP_STATUS) | curses.A_BOLD)
+    # Help line
+    if help_text:
+        _safe_addstr(stdscr, max_y - 1, 0, " " * max_x, curses.color_pair(_CP_DIM))
+        _safe_addstr(stdscr, max_y - 1, 0, f" {help_text}"[:max_x - 1], curses.color_pair(_CP_DIM))
+
+
 def _menu(stdscr: Any, title: str, items: list[str], subtitle: str = "", start: int = 0) -> int:
     """Generic vertical menu. Returns the chosen index, or -1 to go back."""
     import curses
@@ -439,29 +541,37 @@ def _menu(stdscr: Any, title: str, items: list[str], subtitle: str = "", start: 
     while True:
         stdscr.erase()
         max_y, max_x = stdscr.getmaxyx()
-        _safe_addstr(stdscr, 0, 0, title, curses.A_BOLD)
-        if subtitle:
-            _safe_addstr(stdscr, 1, 0, subtitle, curses.A_DIM)
-        top = 3
-        # Scroll if the list is taller than the window.
-        visible = max(1, max_y - top - 2)
+
+        top = _draw_header(stdscr, title, subtitle)
+
+        # Calculate visible area
+        visible = max(1, max_y - top - 3)  # leave room for header + status
         first = 0
         if pos >= visible:
             first = pos - visible + 1
+
         for offset in range(visible):
             index = first + offset
             if index >= len(items):
                 break
-            marker = "> " if index == pos else "  "
-            attr = curses.A_REVERSE if index == pos else 0
-            _safe_addstr(stdscr, top + offset, 0, f"{marker}{items[index]}", attr)
-        _safe_addstr(
-            stdscr,
-            max_y - 1,
-            0,
-            "Up/Down move - Enter select - q/Esc back - ? help",
-            curses.A_DIM,
-        )
+            item = items[index]
+            is_selected = index == pos
+
+            if item == "-" or item == "\u2500" * len(item):
+                _hline(stdscr, top + offset, max_x)
+                continue
+
+            if is_selected:
+                attr = curses.color_pair(_CP_SELECTED) | curses.A_BOLD
+                prefix = " \u25b6 "
+            else:
+                attr = 0
+                prefix = "   "
+
+            text = f"{prefix}{item}"
+            _safe_addstr(stdscr, top + offset, 0, text[:max_x - 1], attr)
+
+        _draw_statusbar(stdscr, "Enter select | q/Esc back | ? help")
         stdscr.refresh()
 
         key = stdscr.getch()
@@ -485,26 +595,29 @@ def _show_help(stdscr: Any) -> None:
     import curses
 
     lines = [
-        "Himawari TUI - help",
-        "",
-        "Navigation",
-        "  Up / Down or k / j   move the selection",
-        "  Home / End           jump to first / last",
-        "  Enter or Space       select / toggle / edit",
-        "  q or Esc             go back / cancel",
-        "",
-        "Editing a setting",
-        "  on/off settings      Enter toggles them",
-        "  list settings        Left/Right cycle; Enter opens a picker",
-        "  text/number settings Enter opens a prompt; type, Backspace edits,",
-        "                       Enter confirms, Esc cancels",
-        "",
-        "Press any key to return.",
+        ("Himawari TUI - Keyboard Reference", _CP_TITLE),
+        ("", 0),
+        ("Navigation", _CP_SECTION),
+        ("  \u2191 / \u2193  or  k / j     move the selection", 0),
+        ("  Home / End             jump to first / last", 0),
+        ("  Enter or Space         select / toggle / edit", 0),
+        ("  q or Esc               go back / cancel", 0),
+        ("", 0),
+        ("Editing a setting", _CP_SECTION),
+        ("  \u25cf / \u25cb toggles      Enter toggles booleans", 0),
+        ("  List settings          Left/Right cycle values", 0),
+        ("  Text / number fields   Enter opens a prompt", 0),
+        ("                         Backspace edits, Enter confirms", 0),
+        ("", 0),
+        ("Press any key to return.", _CP_DIM),
     ]
     stdscr.erase()
-    for i, line in enumerate(lines):
-        attr = curses.A_BOLD if i == 0 else 0
-        _safe_addstr(stdscr, i, 0, line, attr)
+    max_y, max_x = stdscr.getmaxyx()
+    for i, (line, attr_id) in enumerate(lines):
+        if i >= max_y:
+            break
+        attr = curses.color_pair(attr_id) if attr_id else curses.A_BOLD if i == 0 else 0
+        _safe_addstr(stdscr, i, 0, line[:max_x - 1], attr)
     stdscr.refresh()
     stdscr.getch()
 
@@ -522,7 +635,7 @@ def _prompt_line(stdscr: Any, prompt: str, initial: str = "") -> str | None:
             stdscr.move(y, 0)
             stdscr.clrtoeol()
             shown = (prompt + "".join(buf))[: max_x - 1]
-            _safe_addstr(stdscr, y, 0, shown)
+            _safe_addstr(stdscr, y, 0, shown, curses.color_pair(_CP_HIGHLIGHT))
             cursor_x = min(len(prompt) + len(buf), max_x - 1)
             try:
                 stdscr.move(y, cursor_x)
@@ -558,14 +671,15 @@ def _flash(stdscr: Any, message: str) -> None:
     """Show a transient message on the second-to-last line."""
     import curses
 
-    max_y, _ = stdscr.getmaxyx()
-    _safe_addstr(stdscr, max_y - 2, 0, message, curses.A_BOLD)
+    max_y, max_x = stdscr.getmaxyx()
+    _safe_addstr(stdscr, max_y - 2, 0, " " * max_x, curses.color_pair(_CP_STATUS))
+    _safe_addstr(stdscr, max_y - 2, 0, message[: max_x - 1], curses.color_pair(_CP_STATUS) | curses.A_BOLD)
     stdscr.refresh()
 
 
 def _pick_choice(stdscr: Any, field: Field, current: Any) -> Any:
     start = field.choices.index(current) if current in field.choices else 0
-    index = _menu(stdscr, f"Choose: {field.label}", field.choices, start=start)
+    index = _menu(stdscr, f"Select: {field.label}", field.choices, start=start)
     if index < 0:
         return current
     return field.choices[index]
@@ -577,7 +691,8 @@ def _edit_field(stdscr: Any, state: TuiState, field: Field) -> str:
     if field.kind == "bool":
         state.values[field.attr] = not bool(current)
         state.dirty = True
-        return f"{field.label}: {format_value('bool', state.values[field.attr])}"
+        val = format_value("bool", state.values[field.attr])
+        return f"{field.label}: {val}"
     if field.kind == "choice":
         chosen = _pick_choice(stdscr, field, current)
         if chosen != current:
@@ -604,27 +719,50 @@ def _settings_screen(stdscr: Any, state: TuiState, title: str, fields: list[Fiel
     while True:
         stdscr.erase()
         max_y, max_x = stdscr.getmaxyx()
-        _safe_addstr(stdscr, 0, 0, title, curses.A_BOLD)
-        _safe_addstr(stdscr, 1, 0, "Enter edits - Left/Right cycle lists - q/Esc back", curses.A_DIM)
-        top = 3
-        visible = max(1, max_y - top - 2)
+
+        top = _draw_header(stdscr, title, "Enter edit | Left/Right cycle | q/Esc back")
+
+        visible = max(1, max_y - top - 3)
         first = 0
         if pos >= visible:
             first = pos - visible + 1
-        label_width = min(36, max(len(f.label) for f in fields) + 2)
+
+        # Calculate column widths
+        label_width = min(34, max(len(f.label) for f in fields) + 2)
         for offset in range(visible):
             index = first + offset
             if index >= len(fields):
                 break
             field = fields[index]
-            value = format_value(field.kind, state.values.get(field.attr))
-            line = f"{field.label:<{label_width}} {value}"
-            attr = curses.A_REVERSE if index == pos else 0
-            _safe_addstr(stdscr, top + offset, 0, line, attr)
+            raw_val = state.values.get(field.attr)
+            value = format_value(field.kind, raw_val)
+            is_selected = index == pos
+
+            if field.kind == "bool":
+                # Colorize boolean values
+                val_attr = curses.color_pair(_CP_ON) if raw_val else curses.color_pair(_CP_OFF)
+            elif field.kind == "choice":
+                val_attr = curses.color_pair(_CP_HIGHLIGHT)
+            else:
+                val_attr = 0
+
+            label_part = f"  {field.label:<{label_width}}"
+            value_part = f"{value}"
+
+            if is_selected:
+                line = f"\u25b6 {field.label:<{label_width}} {value_part}"
+                _safe_addstr(stdscr, top + offset, 0, f"\u25b6 ", curses.color_pair(_CP_SELECTED) | curses.A_BOLD)
+                _safe_addstr(stdscr, top + offset, 2, f"{field.label:<{label_width}}", curses.color_pair(_CP_SELECTED) | curses.A_BOLD)
+                _safe_addstr(stdscr, top + offset, label_width + 3, value_part, curses.color_pair(_CP_SELECTED) | val_attr)
+            else:
+                line = f"  {field.label:<{label_width}} {value_part}"
+                _safe_addstr(stdscr, top + offset, 0, f"  {field.label:<{label_width}}", 0)
+                _safe_addstr(stdscr, top + offset, label_width + 3, value_part, val_attr)
+
         if status:
-            _safe_addstr(stdscr, max_y - 2, 0, status[: max_x - 1], curses.A_BOLD)
-        hint = fields[pos].help
-        _safe_addstr(stdscr, max_y - 1, 0, (hint or "q/Esc to go back")[: max_x - 1], curses.A_DIM)
+            _draw_statusbar(stdscr, status, fields[pos].help or "q/Esc to go back")
+        else:
+            _draw_statusbar(stdscr, "", fields[pos].help or "q/Esc to go back")
         stdscr.refresh()
 
         key = stdscr.getch()
@@ -662,10 +800,11 @@ def _folders_screen(stdscr: Any, state: TuiState) -> None:
         items = [
             f"Output folder: {state.output_dir}",
             f"Temp folder:   {state.temp_dir}",
+            "\u2500" * 40,
             "Back",
         ]
         index = _menu(stdscr, "Output & temp folders", items, "Enter to change a folder")
-        if index in (-1, 2):
+        if index in (-1, 3):
             return
         if index == 0:
             raw = _prompt_line(stdscr, "Output folder = ", str(state.output_dir))
@@ -682,21 +821,42 @@ def _folders_screen(stdscr: Any, state: TuiState) -> None:
 def _review_screen(stdscr: Any, state: TuiState) -> None:
     import curses
 
-    lines: list[str] = [f"Output folder: {state.output_dir}", f"Temp folder:   {state.temp_dir}", ""]
+    lines: list[str] = [
+        f"  Output folder: {state.output_dir}",
+        f"  Temp folder:   {state.temp_dir}",
+        "",
+    ]
     for key in sorted(state.values.keys()):
-        lines.append(f"{key} = {state.values[key]}")
+        val = state.values[key]
+        if isinstance(val, bool):
+            display = format_value("bool", val)
+        else:
+            display = str(val)
+        lines.append(f"  {key} = {display}")
     pos = 0
     while True:
         stdscr.erase()
         max_y, max_x = stdscr.getmaxyx()
-        _safe_addstr(stdscr, 0, 0, "Current settings", curses.A_BOLD)
-        body = max_y - 3
+
+        top = _draw_header(stdscr, "All Settings", "Scroll with Up/Down | q/Esc back")
+
+        body = max_y - top - 3
         for offset in range(body):
             index = pos + offset
             if index >= len(lines):
                 break
-            _safe_addstr(stdscr, 2 + offset, 0, lines[index][: max_x - 1])
-        _safe_addstr(stdscr, max_y - 1, 0, "Up/Down scroll - q/Esc back", curses.A_DIM)
+            line = lines[index]
+            # Colorize bool values in review
+            if " = " in line:
+                key_part, val_part = line.split(" = ", 1)
+                if val_part.strip() in ("\u25cf ON ", "\u25cb off"):
+                    attr = curses.color_pair(_CP_ON) if "\u25cf" in val_part else curses.color_pair(_CP_OFF)
+                    _safe_addstr(stdscr, top + offset, 0, f"{key_part} = ", 0)
+                    _safe_addstr(stdscr, top + offset, len(key_part) + 3, val_part[:max_x - len(key_part) - 4], attr)
+                    continue
+            _safe_addstr(stdscr, top + offset, 0, line[:max_x - 1])
+
+        _draw_statusbar(stdscr, "Up/Down scroll | q/Esc back")
         stdscr.refresh()
         key = stdscr.getch()
         if key in (curses.KEY_UP, ord("k")):
@@ -741,26 +901,33 @@ def _main_loop(stdscr: Any, state: TuiState) -> None:
 
     curses.curs_set(0)
     stdscr.keypad(True)
-    title = f"{state.processor.app_version_label()} - Text Interface"
+    _init_colors()
+
+    title = state.processor.app_version_label()
+    subtitle = "Text Interface"
     status = ""
     while True:
-        unsaved = " (unsaved changes)" if state.dirty else ""
+        unsaved = " \u2022 unsaved" if state.dirty else ""
         items = [
             "Source & Output settings",
             "Map & Overlay settings",
             "Processing & Performance settings",
+            "\u2500" * 40,
             "Output & temp folders",
             "Review all settings",
             "Save settings",
+            "\u2500" * 40,
             "Check environment",
             "Run render",
-            "Render 3 true color styles (native / flat / Zoom Earth)",
-            "Update program (GitHub main branch)",
+            "Render 3 true color styles",
+            "Update program (GitHub)",
+            "\u2500" * 40,
             "Quit",
         ]
-        index = _menu(stdscr, title, items, (status or "Choose an action.") + unsaved)
+        display_status = status or "Choose an action." + unsaved
+        index = _menu(stdscr, title, items, display_status)
         status = ""
-        if index in (-1, 10):  # Esc/q or Quit
+        if index in (-1, 14):  # Esc/q or Quit
             if state.dirty and _confirm(stdscr, "Save changes before quitting?"):
                 status = state.save()
             return
@@ -770,24 +937,23 @@ def _main_loop(stdscr: Any, state: TuiState) -> None:
             _settings_screen(stdscr, state, "Map & Overlays", state.screens[1][1])
         elif index == 2:
             _settings_screen(stdscr, state, "Processing & Performance", state.screens[2][1])
-        elif index == 3:
-            _folders_screen(stdscr, state)
         elif index == 4:
-            _review_screen(stdscr, state)
+            _folders_screen(stdscr, state)
         elif index == 5:
-            status = state.save()
+            _review_screen(stdscr, state)
         elif index == 6:
+            status = state.save()
+        elif index == 8:
             _run_external(stdscr, lambda: run_environment_check(state))
-        elif index == 7:
+        elif index == 9:
             if state.dirty:
-                # Persist first so a crash mid-render doesn't lose edits.
                 state.save()
             _run_external(stdscr, lambda: run_processing(state))
-        elif index == 8:
+        elif index == 10:
             if state.dirty:
                 state.save()
             _run_external(stdscr, lambda: run_true_color_styles(state))
-        elif index == 9:
+        elif index == 11:
             if _confirm(stdscr, "Download and install the latest code from main?"):
                 _run_external(stdscr, lambda: run_self_update(state))
 
@@ -838,7 +1004,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     processor = load_processor()
-    if args.no_tui:
+    if args.no-tui:
         return _fallback_to_cli(processor)
     return launch_tui(processor)
 
