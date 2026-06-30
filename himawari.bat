@@ -61,17 +61,19 @@ echo   6. Run TUI
 echo.
 echo   0. Exit
 echo.
-choice /c 1234560 /n /m "Choose an option (0-6): "
+set /p "menu_choice=Choose an option (0-6): "
 
-if errorlevel 7 exit /b 0
-if errorlevel 6 goto run_tui
-if errorlevel 5 goto run_gui
-if errorlevel 4 goto run_cli
-if errorlevel 3 goto check_env
-if errorlevel 2 goto quick_fix
-if errorlevel 1 goto install_reqs
+if "%menu_choice%"=="0" exit /b 0
+if "%menu_choice%"=="6" goto run_tui
+if "%menu_choice%"=="5" goto run_gui
+if "%menu_choice%"=="4" goto run_cli
+if "%menu_choice%"=="3" goto check_env
+if "%menu_choice%"=="2" goto quick_fix
+if "%menu_choice%"=="1" goto install_reqs
 
-exit /b 0
+echo Invalid choice.
+pause
+goto menu
 
 :install_reqs
 echo Installing requirements...
@@ -82,7 +84,7 @@ if not "%EXIT_CODE%"=="0" (
     echo Install requirements exited with code %EXIT_CODE%.
     pause
 )
-exit /b %EXIT_CODE%
+goto :end
 
 :quick_fix
 if not "%ACTION_ARGS%"=="" (
@@ -96,7 +98,7 @@ if not "%EXIT_CODE%"=="0" (
     echo Quick fix exited with code %EXIT_CODE%.
     pause
 )
-exit /b %EXIT_CODE%
+goto :end
 
 :check_env
 %PYTHON_CMD% "%PROJECT_DIR%check_environment.py" %ACTION_ARGS%
@@ -104,7 +106,7 @@ set "EXIT_CODE=%ERRORLEVEL%"
 if not "%EXIT_CODE%"=="0" (
     pause
 )
-exit /b %EXIT_CODE%
+goto :end
 
 :run_cli
 set "SCRIPT=%PROJECT_DIR%himawari_cli.py"
@@ -125,7 +127,7 @@ if not "%EXIT_CODE%"=="0" (
     echo Run "himawari check-env" if this was an environment or package error.
     pause
 )
-exit /b %EXIT_CODE%
+goto :end
 
 :run_gui
 set "SCRIPT="
@@ -153,7 +155,7 @@ if not "%EXIT_CODE%"=="0" (
     echo Run "himawari check-env" if this was an environment or package error.
     pause
 )
-exit /b %EXIT_CODE%
+goto :end
 
 :run_tui
 set "SCRIPT=%PROJECT_DIR%himawari_tui.py"
@@ -174,7 +176,7 @@ if not "%EXIT_CODE%"=="0" (
     echo Run "himawari check-env" if this was an environment or package error.
     pause
 )
-exit /b %EXIT_CODE%
+goto :end
 
 :help_screen
 echo Usage: himawari ^<action^> [args...]
@@ -240,3 +242,8 @@ if not errorlevel 1 (
 )
 
 exit /b 1
+
+:end
+echo.
+pause
+exit /b %EXIT_CODE%
