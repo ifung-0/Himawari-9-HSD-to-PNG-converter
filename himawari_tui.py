@@ -1004,7 +1004,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     processor = load_processor()
-    if args.no-tui:
+    if args.no_tui:
         return _fallback_to_cli(processor)
     return launch_tui(processor)
 
