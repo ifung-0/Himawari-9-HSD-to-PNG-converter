@@ -17,14 +17,56 @@ import subprocess
 import sys
 import threading
 import time
-import tkinter as tk
 import warnings
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from tkinter import colorchooser, filedialog, messagebox, ttk
 from typing import Callable, Iterable
+
+
+# tkinter is only required by the graphical interface. The command-line
+# interface (himawari_cli.py) and the text interface (himawari_tui.py) import
+# this module too, and must keep working on headless systems that have no Tk
+# support. Import tkinter defensively: when it is missing, bind placeholders so
+# importing this module still succeeds, and only raise a clear, actionable error
+# if GUI widgets are actually used.
+class _MissingModule:
+    """Stand-in for an unavailable module that explains itself when touched."""
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def _fail(self, detail: str = "") -> "RuntimeError":
+        suffix = f" ({detail})" if detail else ""
+        return RuntimeError(
+            "The graphical interface needs tkinter, which is not available in this "
+            f"Python installation{suffix}. Install Tk support (Debian/Ubuntu: "
+            "'sudo apt install python3-tk'; Windows/macOS: reinstall Python with the "
+            "Tcl/Tk option), or use the command-line interface 'himawari_cli.py' or "
+            "the text interface 'himawari_tui.py' instead."
+        )
+
+    def __getattr__(self, attr: str):
+        raise self._fail(f"tried to use {self._name}.{attr}")
+
+    def __call__(self, *args, **kwargs):
+        raise self._fail(f"tried to call {self._name}")
+
+
+try:
+    import tkinter as tk
+    from tkinter import colorchooser, filedialog, messagebox, ttk
+
+    TKINTER_AVAILABLE = True
+except Exception:  # noqa: BLE001 - any failure means no usable Tk (headless, etc.)
+    tk = _MissingModule("tkinter")  # type: ignore[assignment]
+    ttk = _MissingModule("tkinter.ttk")  # type: ignore[assignment]
+    colorchooser = _MissingModule("tkinter.colorchooser")  # type: ignore[assignment]
+    filedialog = _MissingModule("tkinter.filedialog")  # type: ignore[assignment]
+    messagebox = _MissingModule("tkinter.messagebox")  # type: ignore[assignment]
+    TKINTER_AVAILABLE = False
+
 
 def configure_known_warning_filters() -> None:
     warnings.filterwarnings(
@@ -111,7 +153,7 @@ FLAT_MAP_LIMB_FADE_MIN_PX = 8
 FLAT_MAP_LIMB_FADE_MAX_PX = 240
 FLAT_MAP_ZOOM_OVERLAY_OPACITY = 200
 FLAT_MAP_ZOOM_CROSSHAIR_OPACITY_SCALE = 0.78
-SATELLITE_LAYER_BORDER_COLOR = "#d8dee8"
+SATELLITE_LAYER_BORDER_COLOR = "#00ff00"  # bright green border for the live/hd satellite layers
 FLAT_MAP_DIRECT_SAMPLE_CHUNK = 256
 GPU_CUSTOM_COMPOSITE_MAX_CHUNK_EDGE = 512
 GPU_CUSTOM_COMPOSITE_MAX_CHUNK_PIXELS = 262_144
@@ -302,11 +344,24 @@ AREA_PRESET_ORDER = (
 GITHUB_REPO = "ifung-0/Himawari-9-HSD-to-PNG-converter"
 GITHUB_API_BASE = "https://api.github.com"
 GITHUB_UPDATE_TIMEOUT_SECONDS = 60
+# Quick Fix always refreshes the code from this branch before repairing the
+# environment, so users on a broken build pick up the latest fixes first.
+GITHUB_QUICK_FIX_BRANCH = "main"
 # Files the updater is allowed to replace if they exist in the downloaded branch.
+# Only program code, launchers, requirements, and docs are listed. Runtime JSON
+# settings files (himawari_gui_settings.json, himawari_simple_settings.json,
+# recent runs, custom presets) are deliberately NOT here: they hold the user's
+# own data and must never be overwritten by an update.
 SELF_UPDATE_FILES = (
     "himawari_lowram_processor.py",
+    "himawari_lowram_simple.py",
+    "himawari_cli.py",
+    "himawari_tui.py",
     "check_environment.py",
-    "run_gui.bat",
+    "install_requirements.py",
+    "requirements.txt",
+    "requirements-gpu.txt",
+    "himawari.bat",
     "README.md",
 )
 
@@ -7798,6 +7853,75 @@ class SetupStatus:
         return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# "3 True Color styles" batch: render the True Color Reproduction product in the
+# three map styles (native round disk, standard flat map, Zoom Earth-style flat
+# map) from a single click / command / menu choice. Each style gets a distinct
+# filename suffix so the three outputs never overwrite one another.
+# ---------------------------------------------------------------------------
+TRUE_COLOR_REPRODUCTION_PRODUCT = "True Color Reproduction Image"
+TRUE_COLOR_STYLE_SET: tuple[tuple[str, str, dict[str, object]], ...] = (
+    ("Native (round disk)", "native", {"map_view": "native", "zoom_earth_style": False}),
+    ("Flat map (standard)", "flat_standard", {"map_view": "flat", "zoom_earth_style": False}),
+    ("Flat map (Zoom Earth style)", "flat_zoomearth", {"map_view": "flat", "zoom_earth_style": True}),
+)
+
+
+def true_color_style_base_config(config: ProcessorConfig | None = None) -> ProcessorConfig:
+    """Shared base config for the 3-style true-color set.
+
+    Forces the product to True Color Reproduction, a single image, and the
+    standard satellite layer so each style's own map_view / zoom_earth_style
+    overrides are honored (the live/hd layers would otherwise force their own
+    flat + zoom look).
+    """
+    base = config or default_config()
+    return replace(
+        base,
+        composite_choice=TRUE_COLOR_REPRODUCTION_PRODUCT,
+        satellite_layer_mode="standard",
+        mode="Single Image",
+    )
+
+
+def run_true_color_style_set(
+    config: ProcessorConfig | None = None,
+    progress: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
+) -> list[Path]:
+    """Render True Color Reproduction in all three map styles; return every path.
+
+    Styles: native (round disk), standard flat map, and Zoom Earth-style flat
+    map. Each render reuses the full low-RAM pipeline via ``run``, and a distinct
+    filename suffix per style keeps the three outputs separate. Cancellation is
+    checked between styles and is also honored inside each render.
+    """
+    base = true_color_style_base_config(config)
+    total = len(TRUE_COLOR_STYLE_SET)
+    all_outputs: list[Path] = []
+    for index, (label, suffix, overrides) in enumerate(TRUE_COLOR_STYLE_SET, start=1):
+        check_cancel(cancel_event)
+
+        def style_progress(
+            message: str,
+            current: int | None,
+            sub_total: int | None,
+            _label: str = label,
+            _index: int = index,
+        ) -> None:
+            if progress is not None:
+                progress(f"[{_index}/{total}] {_label}: {message}", current, sub_total)
+
+        if progress is not None:
+            progress(f"[{index}/{total}] {label}: starting", index - 1, total)
+        variant = replace(base, output_template=f"{base.output_template}_{suffix}", **overrides)
+        outputs = run(variant, progress=style_progress, cancel_event=cancel_event)
+        all_outputs.extend(outputs)
+    if progress is not None:
+        progress(f"All {total} true color styles complete", total, total)
+    return all_outputs
+
+
 def cloud_sync_marker(path: Path) -> str | None:
     for part in path.expanduser().resolve(strict=False).parts:
         normalized = part.lower()
@@ -8106,11 +8230,14 @@ def perform_self_update(
     project_dir: Path,
     log: Callable[[str], None] | None = None,
     repo: str = GITHUB_REPO,
+    branch: str | None = None,
 ) -> dict:
-    """Download the latest default branch and replace local files in place.
+    """Download the latest code and replace local files in place.
 
-    Returns a summary dict. Raises on any failure (with nothing replaced unless
-    the compile-check already passed). Every replaced file is backed up under
+    When ``branch`` is ``None`` the repository's default branch is used; pass a
+    name such as ``"main"`` to force a specific branch. Returns a summary dict.
+    Raises on any failure (with nothing replaced unless the compile-check
+    already passed). Every replaced file is backed up under
     project_dir/backups/pre_update_<timestamp>/ first.
     """
     import py_compile
@@ -8124,9 +8251,12 @@ def perform_self_update(
             except Exception:
                 pass
 
-    emit(f"Checking github.com/{repo} for the latest version...")
-    branch = github_default_branch(repo)
-    emit(f"Default branch is '{branch}'. Downloading...")
+    if branch is None:
+        emit(f"Checking github.com/{repo} for the latest version...")
+        branch = github_default_branch(repo)
+        emit(f"Default branch is '{branch}'. Downloading...")
+    else:
+        emit(f"Updating from github.com/{repo} (branch '{branch}'). Downloading...")
 
     with tempfile.TemporaryDirectory(prefix="himawari_update_") as temp_name:
         temp_dir = Path(temp_name)
@@ -8598,12 +8728,11 @@ class RegionPickerDialog:
 
 class HimawariProcessorApp:
     def __init__(self, root: tk.Tk) -> None:
-        loaded_settings = load_gui_settings()
-        initial_config = loaded_settings[0] if loaded_settings else default_config()
-        if loaded_settings:
+        initial_config, loaded_output_dir, loaded_temp_dir = self._load_initial_settings()
+        if loaded_output_dir is not None and loaded_temp_dir is not None:
             global OUTPUT_DIR, TEMP_DIR
-            OUTPUT_DIR = loaded_settings[1]
-            TEMP_DIR = loaded_settings[2]
+            OUTPUT_DIR = loaded_output_dir
+            TEMP_DIR = loaded_temp_dir
 
         self.root = root
         self.root.title(f"{APP_DISPLAY_NAME} v{APP_VERSION}")
@@ -8689,6 +8818,20 @@ class HimawariProcessorApp:
         self.root.after(100, self._poll_messages)
         # Save settings on close so unsaved Entry/color edits are not lost.
         self.root.protocol("WM_DELETE_WINDOW", self._on_close_window)
+
+    def _load_initial_settings(self) -> tuple[ProcessorConfig, Path | None, Path | None]:
+        """Return ``(config, output_dir, temp_dir)`` for the initial UI state.
+
+        This is the single seam every front-end uses to decide which settings
+        file it reads at startup. The full GUI reads ``himawari_gui_settings.json``;
+        subclasses (for example the Simple GUI) override this to read their own
+        file so the two interfaces never clobber each other's saved options. A
+        ``None`` output/temp dir means "keep the current module defaults".
+        """
+        loaded_settings = load_gui_settings()
+        if loaded_settings:
+            return loaded_settings[0], loaded_settings[1], loaded_settings[2]
+        return default_config(), None, None
 
     def _install_log_handler(self) -> None:
         configure_logging()
@@ -9348,6 +9491,10 @@ class HimawariProcessorApp:
         self.pick_region_button.grid(row=2, column=1, padx=(0, 8), pady=(8, 0))
         self.test_host_button = ttk.Button(buttons, text="Test Data Host", command=self._start_connectivity_check)
         self.test_host_button.grid(row=2, column=2, padx=(0, 8), pady=(8, 0))
+        self.true_color_set_button = ttk.Button(
+            buttons, text="3 TC Styles", command=self._start_true_color_set
+        )
+        self.true_color_set_button.grid(row=2, column=3, padx=(0, 8), pady=(8, 0))
         self._install_tooltips()
         self._refresh_mode_state()
         self._configure_main_split()
@@ -9976,6 +10123,7 @@ class HimawariProcessorApp:
             "preview_button": "Quick Look: render a fast, coarse flat-map preview so you can check framing and colour before a full run. It does not change your settings.",
             "pick_region_button": "Pick Region: open a clickable mini-map and drag a box to set the flat-map crop instead of typing latitude and longitude.",
             "test_host_button": "Test Data Host: check whether the satellite data server is reachable (DNS and a quick HTTP request). Use this to tell a failed run apart from a network problem.",
+            "true_color_set_button": "3 TC Styles: render the True Color Reproduction product three times in one go - native (round disk), standard flat map, and Zoom Earth-style flat map. Each image is saved with its style in the filename.",
             "area_preset_box": "Output Region: pick a region to frame the image. Regional presets and 'Full Disk (flat map)' switch to the flat map and fill the bounds; 'Full Disk (native)' uses the round-Earth view.",
             "satellite_layer_box": "Satellite Layer: 'standard' is normal; 'live' grabs the latest scan; 'hd' applies stronger enhancement. live/hd also turn on flat-map true-color styling.",
             "map_view_box": "Map View: 'native' is the round full-disk Earth; 'flat' is a rectangular Web Mercator map you can crop with the bounds.",
@@ -10006,7 +10154,7 @@ class HimawariProcessorApp:
         scroll.pack(side="right", fill="y")
         sections = [
             ("Run", ["start_button", "stop_button", "open_output_button", "open_last_button"]),
-            ("Tools", ["preview_button", "pick_region_button", "test_host_button", "overlay_check_button"]),
+            ("Tools", ["preview_button", "pick_region_button", "test_host_button", "true_color_set_button", "overlay_check_button"]),
             ("Clipboard", ["copy_paths_button", "copy_error_button", "copy_log_button", "copy_settings_button"]),
             ("Maintenance", ["update_app_button", "check_env_button", "quick_fix_button", "auto_fix_button", "help_button"]),
             ("Source", ["latest_url_button", "scan_browser_button", "local_files_button"]),
@@ -10204,6 +10352,7 @@ class HimawariProcessorApp:
             getattr(self, "preview_button", None),
             getattr(self, "pick_region_button", None),
             getattr(self, "test_host_button", None),
+            getattr(self, "true_color_set_button", None),
         ):
             if widget is not None:
                 widget.configure(state=mutable_state)
@@ -10367,7 +10516,81 @@ class HimawariProcessorApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def _open_environment_fix(self) -> None:
+        """Quick Fix: refresh the program from the main branch, then repair the
+        environment.
+
+        Previously this only launched ``check_environment.py --fix``. Now it
+        first pulls the newest code from the project's main branch (so a user on
+        a broken build gets the actual code fix), then runs the environment fix.
+        The environment fix uses the freshly downloaded ``check_environment.py``
+        because it runs as a separate process that reads the file from disk.
+        """
+        if self.is_running:
+            messagebox.showinfo(
+                "Quick Fix",
+                "Please wait until the current run finishes before running Quick Fix.",
+            )
+            return
+        message = (
+            "Quick Fix will:\n\n"
+            f"  1. Download the latest code from the '{GITHUB_QUICK_FIX_BRANCH}' branch of\n"
+            f"     github.com/{GITHUB_REPO} and replace the local program files\n"
+            "     (a backup of every replaced file is saved first), then\n"
+            "  2. Repair the Python environment in a separate console.\n\n"
+            "You will need to restart the app after it finishes. Continue?"
+        )
+        if not messagebox.askokcancel("Quick Fix", message):
+            self._append_log("Quick Fix canceled.")
+            return
+        quick_fix_button = getattr(self, "quick_fix_button", None)
+        if quick_fix_button is not None:
+            quick_fix_button.configure(state="disabled")
+        self._append_log(
+            f"Quick Fix: updating from the '{GITHUB_QUICK_FIX_BRANCH}' branch, then repairing the environment..."
+        )
+
+        def log_from_thread(text: str) -> None:
+            self.root.after(0, lambda: self._append_log(text))
+
+        def worker() -> None:
+            update_error: str | None = None
+            update_summary: object = None
+            try:
+                update_summary = perform_self_update(
+                    PROJECT_DIR, log=log_from_thread, branch=GITHUB_QUICK_FIX_BRANCH
+                )
+            except Exception as exc:
+                update_error = str(exc)
+            self.root.after(0, lambda: self._quick_fix_update_finished(update_summary, update_error))
+
+        threading.Thread(target=worker, name="himawari-quick-fix-update", daemon=True).start()
+
+    def _quick_fix_update_finished(self, summary: object, error: str | None) -> None:
+        quick_fix_button = getattr(self, "quick_fix_button", None)
+        if quick_fix_button is not None:
+            quick_fix_button.configure(state="normal")
+        if error is not None:
+            # The update failed (commonly: offline). Still repair the environment
+            # so Quick Fix remains useful without a network connection.
+            self._append_log(f"Quick Fix: code update skipped ({error}). Continuing with environment repair.")
+        else:
+            info = summary if isinstance(summary, dict) else {}
+            updated = ", ".join(info.get("updated", []) or []) or "(none)"
+            backup_dir = info.get("backup_dir", "")
+            self._append_log(
+                f"Quick Fix: code updated from '{GITHUB_QUICK_FIX_BRANCH}'. "
+                f"Updated: {updated}. Backup: {backup_dir}"
+            )
+        # Now run the environment repair using the (possibly freshly updated)
+        # check_environment.py on disk.
         self._open_environment_command(["--fix"], "Environment quick fix")
+        if error is None:
+            messagebox.showinfo(
+                "Quick Fix",
+                "The latest code was installed and the environment repair was started "
+                "in a separate console.\n\nPlease close and relaunch the app once the "
+                "repair finishes so the new code takes effect.",
+            )
 
     def _open_environment_auto_fix(self) -> None:
         self._open_environment_command(["--auto"], "Environment auto fix")
@@ -10523,7 +10746,7 @@ class HimawariProcessorApp:
             self._write_current_settings()
 
     def _choose_border_color(self) -> None:
-        self._choose_color(self.border_color_var, "Choose border line color", "#00ff00")
+        self._choose_color(self.border_color_var, "Choose border line color", SATELLITE_LAYER_BORDER_COLOR)
 
     def _choose_crosshair_color(self) -> None:
         self._choose_color(self.crosshair_color_var, "Choose crosshair color", CROSSHAIR_COLOR)
@@ -10654,6 +10877,73 @@ class HimawariProcessorApp:
             self.messages.put(("canceled", str(exc)))
         except Exception as exc:
             LOG.exception("Processing failed")
+            self.messages.put(("error", str(exc)))
+
+    def _start_true_color_set(self) -> None:
+        """Render the True Color Reproduction product in all three map styles
+        (native round disk, standard flat map, Zoom Earth-style flat map) from
+        the current settings, in one batch."""
+        if self.is_running:
+            messagebox.showinfo(
+                "3 True Color styles",
+                "A run is already in progress. Wait for it to finish first.",
+            )
+            return
+        try:
+            base = true_color_style_base_config(self._read_config())
+            validate_configuration(base)
+            setup_status = self._update_setup_status()
+            if not setup_status.ok:
+                raise ValueError("\n".join(setup_status.errors))
+        except Exception as exc:
+            self._append_log(f"Cannot start 3 True Color styles: {exc}")
+            messagebox.showerror("3 True Color styles", str(exc))
+            return
+
+        style_names = "\n".join(f"  - {label}" for label, _suffix, _overrides in TRUE_COLOR_STYLE_SET)
+        if not messagebox.askokcancel(
+            "3 True Color styles",
+            "This renders the True Color Reproduction product three times, once "
+            "per map style:\n\n"
+            f"{style_names}\n\n"
+            "Each image is saved with its style in the filename. Start now?",
+        ):
+            self._append_log("3 True Color styles canceled before processing.")
+            return
+
+        self.progress_var.set(0)
+        self.status_var.set("Starting")
+        self.phase_var.set("3 True Color styles")
+        self.progress_eta_estimator.reset()
+        self.cancel_event.clear()
+        self._set_running(True)
+        self.last_config = base
+        self.last_error_report = ""
+        self.run_started_at_utc = utc_timestamp()
+        self._write_current_settings()
+        self._append_log(
+            "Starting 3 True Color styles (native, standard flat, Zoom Earth-style flat)."
+        )
+
+        self.worker = threading.Thread(
+            target=self._run_true_color_worker, args=(base,), daemon=True
+        )
+        self.worker.start()
+
+    def _run_true_color_worker(self, config: ProcessorConfig) -> None:
+        def progress(message: str, current: int | None, total: int | None) -> None:
+            self.messages.put(("progress", (message, current, total)))
+
+        try:
+            outputs = run_true_color_style_set(
+                config, progress=progress, cancel_event=self.cancel_event
+            )
+            self.messages.put(("done", outputs))
+        except ProcessingCancelled as exc:
+            LOG.info("%s", exc)
+            self.messages.put(("canceled", str(exc)))
+        except Exception as exc:
+            LOG.exception("3 True Color styles failed")
             self.messages.put(("error", str(exc)))
 
     def _poll_messages(self) -> None:
@@ -10851,6 +11141,15 @@ class HimawariProcessorApp:
 
 
 def launch_gui() -> None:
+    if not TKINTER_AVAILABLE:
+        raise SystemExit(
+            "The graphical interface needs tkinter, which is not available in this "
+            "Python installation.\n"
+            "Install Tk support (Debian/Ubuntu: 'sudo apt install python3-tk'; "
+            "Windows/macOS: reinstall Python with the Tcl/Tk option),\n"
+            "or use the command-line interface:  python himawari_cli.py --menu\n"
+            "or the text interface:               python himawari_tui.py"
+        )
     try:
         from tkinterdnd2 import TkinterDnD  # type: ignore
 

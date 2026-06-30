@@ -41,71 +41,84 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, ttk
 
-# Locate the processor module (himawari_lowram_processor_claude.py). The simple
-# GUI is just a thin front-end that imports the full engine, so the two files
-# must sit together. Search a few likely locations so it still works if the
-# user keeps the simple script next to the processor, in a subfolder, or runs
-# it from the project directory.
+# Locate and import the processor engine. The canonical file is
+# ``himawari_lowram_processor.py``; some older/renamed installs ship it as
+# ``himawari_lowram_processor_claude.py``. The Simple GUI is a thin front-end
+# that imports the full engine, so the two files must sit together. We search a
+# few likely locations (next to this script, the parent folder, the working
+# directory, common Windows desktops) and accept whichever name is present.
+import importlib.util  # noqa: E402
+
 _HERE = Path(__file__).resolve().parent
-_PROCESSOR_FILENAME = "himawari_lowram_processor_claude.py"
+_PROCESSOR_IMPORT_NAME = "himawari_lowram_processor"
+# Preferred name first, then known alternates, so a renamed copy still works.
+_PROCESSOR_FILENAMES = (
+    "himawari_lowram_processor.py",
+    "himawari_lowram_processor_claude.py",
+)
+
+
+def _candidate_dirs() -> list[Path]:
+    """Folders to search for the processor file, most likely first."""
+    home = Path.home()
+    return [
+        _HERE,
+        _HERE.parent,
+        Path.cwd(),
+        home / "Downloads",
+        home / "Desktop",
+        home / "OneDrive" / "Desktop",
+        home / "OneDrive" / "Desktop" / "coding projects",
+        home / "Desktop" / "coding projects",
+    ]
 
 
 def _find_processor_module() -> Path | None:
-    """Search candidate folders for the processor .py and return its path."""
-    candidates: list[Path] = []
-    # 1. Same folder as this simple script.
-    candidates.append(_HERE / _PROCESSOR_FILENAME)
-    # 2. Parent folder (script in a subfolder).
-    candidates.append(_HERE.parent / _PROCESSOR_FILENAME)
-    # 3. Current working directory.
-    candidates.append(Path.cwd() / _PROCESSOR_FILENAME)
-    # 4. Common Windows locations (Downloads, Desktop, OneDrive Desktop).
-    home = Path.home()
-    candidates.extend(
-        [
-            home / "Downloads" / _PROCESSOR_FILENAME,
-            home / "Desktop" / _PROCESSOR_FILENAME,
-            home / "OneDrive" / "Desktop" / _PROCESSOR_FILENAME,
-            home / "OneDrive" / "Desktop" / "coding projects" / _PROCESSOR_FILENAME,
-            home / "Desktop" / "coding projects" / _PROCESSOR_FILENAME,
-        ]
-    )
-    for candidate in candidates:
-        try:
-            if candidate.is_file():
-                return candidate
-        except OSError:
-            continue
+    """Return the path to the processor .py (preferred name first)."""
+    for directory in _candidate_dirs():
+        for filename in _PROCESSOR_FILENAMES:
+            candidate = directory / filename
+            try:
+                if candidate.is_file():
+                    return candidate
+            except OSError:
+                continue
     return None
 
 
 _processor_path = _find_processor_module()
-if _processor_path is not None:
-    _processor_dir = str(_processor_path.parent)
-    if _processor_dir not in sys.path:
-        sys.path.insert(0, _processor_dir)
-else:
+if _processor_path is None:
+    searched = "\n".join(f"  - {d}" for d in _candidate_dirs())
     print(
-        "ERROR: could not find 'himawari_lowram_processor_claude.py'.\n"
+        "ERROR: could not find the processor engine "
+        f"('{_PROCESSOR_FILENAMES[0]}' or '{_PROCESSOR_FILENAMES[1]}').\n"
         "The Simple GUI is a front-end that needs the main processor file next to it.\n"
         "Please copy both files into the same folder and run again. Looked in:\n"
-        f"  - {_HERE}\n"
-        f"  - {_HERE.parent}\n"
-        f"  - {Path.cwd()}\n"
-        f"  - {Path.home() / 'Downloads'}\n"
-        f"  - {Path.home() / 'Desktop'}\n"
-        f"  - {Path.home() / 'OneDrive' / 'Desktop'}\n",
+        f"{searched}\n",
         file=sys.stderr,
     )
     raise SystemExit(1)
 
-import himawari_lowram_processor_claude as h  # noqa: E402
+# Make the processor importable under its canonical name no matter what the file
+# on disk is called, by loading it directly from the located path.
+_processor_dir = str(_processor_path.parent)
+if _processor_dir not in sys.path:
+    sys.path.insert(0, _processor_dir)
 
-from himawari_lowram_processor_claude import (  # noqa: E402
+if _PROCESSOR_IMPORT_NAME not in sys.modules:
+    _spec = importlib.util.spec_from_file_location(_PROCESSOR_IMPORT_NAME, _processor_path)
+    if _spec is None or _spec.loader is None:
+        print(f"ERROR: could not load the processor module from {_processor_path}.", file=sys.stderr)
+        raise SystemExit(1)
+    _module = importlib.util.module_from_spec(_spec)
+    sys.modules[_PROCESSOR_IMPORT_NAME] = _module
+    _spec.loader.exec_module(_module)
+
+import himawari_lowram_processor as h  # noqa: E402
+
+from himawari_lowram_processor import (  # noqa: E402
     APP_DISPLAY_NAME,
     APP_VERSION,
-    AREA_PRESET_CUSTOM,
-    AREA_PRESET_FULL_DISK,
     COMPOSITE_BANDS,
     DASK_CHUNK_CHOICES,
     FLAT_MAX_LAT,
@@ -115,13 +128,8 @@ from himawari_lowram_processor_claude import (  # noqa: E402
     FLAT_RESOLUTION_DEG,
     MAP_LABEL_COLOR,
     MAP_LABEL_SIZE,
-    OUTPUT_DIR,
-    TEMP_DIR,
     ProcessorConfig,
-    SATELLITE_LAYER_BORDER_COLOR,
     default_config,
-    load_gui_settings,
-    save_gui_settings,
 )
 
 # A separate settings file so the simple GUI never clobbers the full GUI's
@@ -217,6 +225,19 @@ class HimawariSimpleApp(h.HimawariProcessorApp):
     from ``HimawariProcessorApp``. Only the interface and the config-read path
     are overridden.
     """
+
+    # ---- initial settings: read the simple GUI's own file -------------------
+    def _load_initial_settings(self) -> tuple[ProcessorConfig, "Path | None", "Path | None"]:
+        # Read the Simple GUI's own settings file (not the full GUI's), so the
+        # two interfaces never clobber each other. Also stash whether the saved
+        # map style was the Zoom Earth look, so _build_setup_tab can preselect
+        # the right radio button (previously _initial_zoom was never set, so the
+        # chooser always defaulted to "native" even when "zoom" had been saved).
+        config = _load_simple_settings()
+        self._initial_zoom = bool(getattr(config, "zoom_earth_style", False))
+        # The simple GUI uses the safe default output/temp folders, so return
+        # None for both to keep the module defaults.
+        return config, None, None
 
     # ---- settings persistence (separate file) -------------------------------
     def _write_current_settings(self) -> None:
@@ -555,7 +576,7 @@ class HimawariSimpleApp(h.HimawariProcessorApp):
         # Copy Settings | Update App | Help (?) | Quick Look | Pick Region |
         # Test Data Host
         #
-        # The 17 buttons are split across two wrapped rows so they all stay
+        # The 18 buttons are split across two wrapped rows so they all stay
         # fully visible without a scrollbar (the previous single-row + canvas
         # approach clipped the buttons). Tk's grid wrapping handles narrow
         # windows gracefully.
@@ -581,24 +602,45 @@ class HimawariSimpleApp(h.HimawariProcessorApp):
             ("Quick Look", lambda: self._start_preview()),
             ("Pick Region", lambda: self._open_region_picker()),
             ("Test Data Host", lambda: self._start_connectivity_check()),
+            ("3 TC Styles", lambda: self._start_true_color_set()),
         ]
-        # Split into two rows: first 9 on row 1, remaining 8 on row 2.
+        # Split into two rows: 9 per row (18 buttons = two full rows of 9).
         per_row = 9
+        # Map each button label to the attribute name the inherited _set_running
+        # toggles, so every button (not just Start/Stop/Quick Look/Test Host) is
+        # disabled while a run is in progress. Close is intentionally omitted so
+        # the window can always be closed.
+        attr_by_label = {
+            "Start Processing": "start_button",
+            "Stop": "stop_button",
+            "Open Outputs": "open_output_button",
+            "Open Last": "open_last_button",
+            "Copy Paths": "copy_paths_button",
+            "Copy Error": "copy_error_button",
+            "Copy Log": "copy_log_button",
+            "Check Env": "check_env_button",
+            "Quick Fix": "quick_fix_button",
+            "Auto Fix": "auto_fix_button",
+            "Copy Settings": "copy_settings_button",
+            "Update App": "update_app_button",
+            "Help (?)": "help_button",
+            "Quick Look": "preview_button",
+            "Pick Region": "pick_region_button",
+            "Test Data Host": "test_host_button",
+            "3 TC Styles": "true_color_set_button",
+        }
         for index, (label, command) in enumerate(button_specs):
             r = index // per_row
             c = index % per_row
             btn = ttk.Button(outer, text=label, command=command)
             btn.grid(row=r, column=c, sticky="ew", padx=2, pady=2)
-            # Keep references to the ones other methods need to toggle.
-            if label == "Start Processing":
-                self.start_button = btn
-            elif label == "Stop":
+            # Stop starts disabled (no run in progress yet).
+            if label == "Stop":
                 btn.configure(state="disabled")
-                self.stop_button = btn
-            elif label == "Quick Look":
-                self.preview_button = btn
-            elif label == "Test Data Host":
-                self.test_host_button = btn
+            # Keep references under the names the parent's _set_running expects.
+            attr = attr_by_label.get(label)
+            if attr is not None:
+                setattr(self, attr, btn)
         # Make all columns equal-width so the bar looks even.
         total_cols = per_row
         for c in range(total_cols):

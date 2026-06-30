@@ -383,8 +383,8 @@ class EnvironmentCheckTests(unittest.TestCase):
 
         output = stdout.getvalue()
         self.assertIn("Environment looks ready", output)
-        self.assertIn("run_gui.bat", output)
-        self.assertIn("run_cli.bat", output)
+        self.assertIn("himawari gui", output)
+        self.assertIn("himawari cli", output)
         self.assertNotIn("run_dashboard.bat", output)
 
     def test_final_status_code_fails_only_for_critical_failures(self):
@@ -1300,17 +1300,13 @@ class EnvironmentCheckTests(unittest.TestCase):
     def test_launcher_helpers_warn_for_missing_or_bad_helpers(self):
         with TemporaryDirectory() as tmp_dir:
             project_dir = Path(tmp_dir)
-            (project_dir / "run_gui.bat").write_text("python wrong.py\n", encoding="utf-8")
-            (project_dir / "run_cli.bat").write_text("python himawari_cli.py\n", encoding="utf-8")
+            (project_dir / "himawari.bat").write_text("python wrong.py\n", encoding="utf-8")
 
             result = env.check_launcher_helpers(project_dir)
 
         self.assertFalse(result.ok)
         self.assertFalse(result.critical)
-        self.assertIn("run_gui.bat does not reference", result.detail)
-        self.assertIn("missing check_environment.bat", result.detail)
-        self.assertIn("missing checkenv.bat", result.detail)
-        self.assertIn("missing runcli.bat", result.detail)
+        self.assertIn("himawari.bat does not reference", result.detail)
 
     def test_check_writable_folder_target_accepts_missing_child_with_writable_parent(self):
         with TemporaryDirectory() as tmp_dir:

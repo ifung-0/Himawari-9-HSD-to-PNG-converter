@@ -47,11 +47,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--menu", action="store_true", help="Open the interactive CLI menu.")
     parser.add_argument("--run", action="store_true", help="Run once with the provided options.")
+    parser.add_argument(
+        "--true-color-set",
+        action="store_true",
+        help=(
+            "Render the True Color Reproduction product in all three map styles "
+            "(native, standard flat, and Zoom Earth-style flat), then exit."
+        ),
+    )
     parser.add_argument("--check-env", action="store_true", help="Run check_environment.py before any processing.")
     parser.add_argument(
         "--version",
         action="store_true",
         help="Show detailed app and CLI version information, then exit.",
+    )
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help=(
+            "Download the latest code from the project's main branch on GitHub, "
+            "back up and replace the local program files, then exit."
+        ),
     )
     parser.add_argument("--output-dir", help="Folder for final outputs.")
     parser.add_argument("--temp-dir", help="Folder for downloaded DAT files and temporary frame data.")
@@ -114,16 +130,42 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def format_version_report() -> str:
+    # The CLI is a thin front-end over the processor engine, so the single
+    # source of truth for the version is processor.APP_VERSION. Reporting it
+    # here (rather than a separate, drift-prone CLI constant) keeps the CLI and
+    # GUI versions identical.
     return "\n".join(
         [
             processor.APP_DISPLAY_NAME,
             "-" * len(processor.APP_DISPLAY_NAME),
-            f"Version: {processor.APP_VERSION}",
-            "CLI:     himawari_cli.py",
-            f"Python:  {sys.executable}",
-            f"Project: {PROJECT_DIR}",
+            f"App version: {processor.APP_VERSION}",
+            "CLI:         himawari_cli.py (matches the app version above)",
+            f"Engine:      himawari_lowram_processor.py",
+            f"Python:      {sys.executable}",
+            f"Project:     {PROJECT_DIR}",
         ]
     )
+
+
+def run_self_update() -> int:
+    """Update the local program files from the project's main branch on GitHub."""
+    branch = getattr(processor, "GITHUB_QUICK_FIX_BRANCH", "main")
+    print(f"Updating from the '{branch}' branch of github.com/{processor.GITHUB_REPO} ...")
+    try:
+        summary = processor.perform_self_update(PROJECT_DIR, log=print, branch=branch)
+    except Exception as exc:  # noqa: BLE001 - surface any failure to the user
+        print(f"Update failed: {exc}")
+        return 1
+    info = summary if isinstance(summary, dict) else {}
+    updated = ", ".join(info.get("updated", []) or []) or "(none)"
+    backup_dir = info.get("backup_dir", "")
+    print()
+    print("Update complete.")
+    print(f"  Updated files: {updated}")
+    if backup_dir:
+        print(f"  Backup saved to: {backup_dir}")
+    print("  Please re-run the program to use the new version.")
+    return 0
 
 
 def config_from_args(args: argparse.Namespace) -> processor.ProcessorConfig:
@@ -343,6 +385,28 @@ def run_processor(config: processor.ProcessorConfig) -> list[Path]:
     return outputs
 
 
+def run_true_color_styles(config: processor.ProcessorConfig) -> list[Path]:
+    """Render True Color Reproduction in all three map styles (native, standard
+    flat, Zoom Earth-style flat)."""
+    eta_estimator = processor.ProgressEtaEstimator()
+
+    def progress(message: str, current: int | None, total: int | None) -> None:
+        eta_text = eta_estimator.update(message, current, total)
+        if current is not None and total:
+            suffix = f" ({eta_text})" if eta_text else ""
+            print(f"[{current}/{total}] {message}{suffix}")
+        else:
+            print(message)
+
+    print("Rendering True Color Reproduction in 3 map styles: native, standard flat, Zoom Earth-style flat.\n")
+    outputs = processor.run_true_color_style_set(config, progress=progress)
+    print()
+    print("Finished. Outputs:")
+    for output in outputs:
+        print(f"  {output}")
+    return outputs
+
+
 def interactive_menu(config: processor.ProcessorConfig) -> int:
     while True:
         print()
@@ -353,7 +417,9 @@ def interactive_menu(config: processor.ProcessorConfig) -> int:
         print("3. Edit advanced settings")
         print("4. Check environment")
         print("5. Run processor")
-        print("6. Exit")
+        print("6. Render 3 true color styles (native / flat / Zoom Earth)")
+        print("7. Update program (from GitHub main branch)")
+        print("8. Exit")
         choice = input("Choose an option: ").strip()
         if choice == "1":
             print_config(config)
@@ -371,9 +437,13 @@ def interactive_menu(config: processor.ProcessorConfig) -> int:
             if confirm in {"y", "yes"}:
                 run_processor(config)
         elif choice == "6":
+            run_true_color_styles(config)
+        elif choice == "7":
+            run_self_update()
+        elif choice == "8":
             return 0
         else:
-            print("Choose a number from 1 to 6.")
+            print("Choose a number from 1 to 8.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -384,6 +454,9 @@ def main(argv: list[str] | None = None) -> int:
         print(format_version_report())
         return 0
 
+    if args.update:
+        return run_self_update()
+
     set_output_dir(args.output_dir)
     set_temp_dir(args.temp_dir)
     config = config_from_args(args)
@@ -392,6 +465,10 @@ def main(argv: list[str] | None = None) -> int:
         code = run_environment_check()
         if code != 0 and not args.run and not args.menu:
             return code
+
+    if args.true_color_set:
+        run_true_color_styles(config)
+        return 0
 
     if args.run:
         run_processor(config)
@@ -403,7 +480,10 @@ def main(argv: list[str] | None = None) -> int:
 
     print_config(config)
     print()
-    print("No processing started. Use --run to run once, or --menu for the guided CLI.")
+    print(
+        "No processing started. Use --run to run once, --true-color-set for the "
+        "3 map-style true-color batch, or --menu for the guided CLI."
+    )
     return 0
 
 

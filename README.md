@@ -5,29 +5,100 @@ AWS S3, processes them with Satpy, and writes either a single PNG or a GIF/MP4
 timelapse. The pipeline is designed for a conservative 10 GiB memory budget,
 with defaults that favor lower peak RAM over speed.
 
-> **Current build:** `2026.06.17.07` — see [What's New](#whats-new) at the
+> **Current build:** `2026.06.17.08` — see [What's New](#whats-new) at the
 > bottom of this file for the latest changes.
 
 ---
 
 ## Which Entry Point Should I Use?
 
-- **GUI:** `himawari_lowram_processor_claude.py` (launch with `python
-  himawari_lowram_processor_claude.py`). Use this for normal Himawari-8/9 AHI
+- **GUI:** `himawari_lowram_processor.py` (launch with `python
+  himawari_lowram_processor.py`). Use this for normal Himawari-8/9 AHI
   HSD downloads, true color, B13 infrared, flat-map output, overlays, single
   images, and timelapses.
+- **Simple GUI:** `himawari_lowram_simple.py` (launch with `python
+  himawari_lowram_simple.py`). A stripped-down window for when you just want a
+  picture. See [Simple Version](#simple-version-himawari_lowram_simplepy) below.
 - **CLI:** `himawari_cli.py` (launch with `python himawari_cli.py --help`). The
   terminal interface for the same HSD processor. Use this for repeatable
   commands or scripted runs.
+- **TUI:** `himawari_tui.py` (launch with `python himawari_tui.py`). A
+  keyboard-driven, full-screen *text* interface for systems with no graphical
+  display (for example a server over SSH). It uses the same engine and shares
+  settings with the GUI. If your terminal cannot run it, it automatically falls
+  back to the CLI menu.
 
-> **Note on this distribution:** the consolidated processor module is
-> `himawari_lowram_processor_claude.py`. If your scripts import
-> `himawari_lowram_processor`, alias it (the test bootstrap in this repo does
-> this automatically). The companion modules `himawari_cli.py`,
-> `check_environment.py`, and `install_requirements.py` are referenced
-> throughout this README; if you are using the single-file distribution, those
-> helpers are not included and the relevant commands only apply to the full
-> multi-file release.
+> **Note on file names:** the processor engine is `himawari_lowram_processor.py`.
+> Older or renamed copies sometimes ship it as
+> `himawari_lowram_processor_claude.py`; the Simple GUI, the TUI, and
+> `check_environment.py` all detect either name automatically, and Python code
+> can `import himawari_lowram_processor` in both cases. The companion modules
+> `himawari_cli.py`, `himawari_tui.py`, `check_environment.py`, and
+> `install_requirements.py` are referenced throughout this README; if you are
+> using a single-file distribution, those helpers are not included and the
+> relevant commands only apply to the full multi-file release.
+
+---
+
+## Download, Install & Update
+
+### Get the program
+
+**Option A — clone with git (recommended; makes updating trivial):**
+
+```bash
+git clone https://github.com/ifung-0/Himawari-9-HSD-to-PNG-converter.git
+cd Himawari-9-HSD-to-PNG-converter
+```
+
+**Option B — download a ZIP:** open
+<https://github.com/ifung-0/Himawari-9-HSD-to-PNG-converter>, click **Code →
+Download ZIP**, then unzip it and `cd` into the folder.
+
+### Install the dependencies
+
+```bash
+# (optional but recommended) create and activate a virtual environment
+python -m venv .venv
+# Windows:        .venv\Scripts\activate
+# macOS / Linux:  source .venv/bin/activate
+
+# install everything the processor needs
+python -m pip install -r requirements.txt
+
+# optional: GPU extras (only if you have a CUDA GPU and want the GPU path)
+python -m pip install -r requirements-gpu.txt
+```
+
+Then confirm the environment is ready:
+
+```bash
+python check_environment.py
+```
+
+### Update to the latest version
+
+Pick whichever matches how you installed:
+
+```bash
+# If you cloned with git:
+git pull
+
+# From the command-line interface (downloads the latest 'main', backs up, replaces):
+python himawari_cli.py --update
+
+# From the text interface: launch it and choose "Update program"
+python himawari_tui.py
+
+# From either GUI: click "Update App", or click "Quick Fix" to update AND repair
+#   the Python environment in one step.
+```
+
+The in-app updaters (`--update`, **Update App**, **Quick Fix**) pull the latest
+code from the project's **main** branch, save a timestamped backup of every
+replaced file under a `backups/` folder, verify the download compiles, and only
+then replace your local files. Your settings files are never touched. Restart
+the program after an update so the new code takes effect.
 
 ---
 
@@ -168,7 +239,7 @@ python check_environment.py --auto
 checkenv.bat
 ```
 
-Expected current version: **`2026.06.17.06`**. If `--version` shows an older
+Expected current version: **`2026.06.17.08`**. If `--version` shows an older
 value, the machine is not running the latest update. If `--plain` reports a
 different Python than the one used to launch the GUI, use `run_gui.bat`,
 `run_cli.bat`, `runcli.bat`, `check_environment.bat`, or `checkenv.bat` so the
@@ -177,7 +248,7 @@ same Python environment is selected.
 ### Launch the GUI
 
 ```powershell
-python himawari_lowram_processor_claude.py
+python himawari_lowram_processor.py
 run_gui.bat
 ```
 
@@ -278,9 +349,11 @@ unavailable because this app does not include those external data feeds.
 
 Native disk output remains the low-RAM default. Use **Stop Processing** to
 cancel the current run, including active segment downloads and pending frames.
-**Check Env** runs the diagnostic checker inline; **Quick Fix** repairs the
-current Python in a separate console; **Auto Fix** uses the stronger `.venv`
-repair path for wrong or unsupported Python installs. **Advanced →
+**Check Env** runs the diagnostic checker inline; **Quick Fix** first downloads
+the latest code from the project's **main** branch (backing up and replacing the
+local files) and then repairs the current Python in a separate console, so a
+broken build gets both the newest code and a working environment; **Auto Fix**
+uses the stronger `.venv` repair path for wrong or unsupported Python installs. **Advanced →
 Performance** also has **Use GPU (Experimental)** and **GPU Fix**; the button
 installs optional packages from `requirements-gpu.txt` instead of the normal
 CPU requirements file.
@@ -331,6 +404,57 @@ products, leave `--gpu-acceleration no` so the normal CPU low-RAM path is used.
 Windows helper launchers prefer `.venv\Scripts\python.exe` when it exists, then
 `py -3.13`, `py -3.12`, and finally `python`.
 
+### Launch the Text Interface (TUI)
+
+For a full-screen, keyboard-driven interface in the terminal — ideal for
+servers over SSH or any machine without a graphical display:
+
+```bash
+python himawari_tui.py
+```
+
+Move with the arrow keys (or `j`/`k`), press **Enter** to select, toggle, or
+edit a setting, **Left/Right** to cycle through list options, **q** or **Esc**
+to go back, and **?** for help. It groups every setting into *Source & Output*,
+*Map & Overlays*, and *Processing & Performance* screens, and offers **Check
+environment**, **Run render**, and **Update program** actions. The TUI shares
+`himawari_gui_settings.json` with the GUI, so a configuration made in one opens
+in the other. If your terminal can't run curses (for example a bare Windows
+Python without the `windows-curses` package), it falls back to the CLI menu;
+you can force that with `python himawari_tui.py --no-tui`.
+
+### Generate 3 True Color styles at once
+
+Sometimes you want the same scene in every map style for comparison. The
+**3 TC Styles** action renders the *True Color Reproduction* product three
+times from your current source and settings, once per map style, and saves each
+image with its style in the filename:
+
+1. **Native** — the round full-disk Earth (`map_view = native`).
+2. **Standard flat map** — the rectangular flat map (`map_view = flat`,
+   Zoom Earth styling off).
+3. **Zoom Earth-style flat map** — the same flat map with the Zoom Earth look
+   (`map_view = flat`, Zoom Earth styling on).
+
+It forces the product to True Color Reproduction, a single image, and the
+standard satellite layer, but keeps the rest of your settings (source URL, flat
+bounds, performance, overlays). Output files are suffixed `_native`,
+`_flat_standard`, and `_flat_zoomearth` so they never overwrite each other.
+
+How to run it:
+
+```bash
+# GUI (full or simple): click the "3 TC Styles" button on the bottom button row.
+
+# CLI: one command (combine with --url, bounds, etc. as usual)
+python himawari_cli.py --true-color-set
+python himawari_cli.py --true-color-set --flat-min-lat -45 --flat-max-lat 45 --flat-min-lon 90 --flat-max-lon 180
+
+# CLI menu: choose "Render 3 true color styles (native / flat / Zoom Earth)".
+
+# TUI: choose "Render 3 true color styles (native / flat / Zoom Earth)".
+```
+
 ### Verify the Installed App Version
 
 ```powershell
@@ -338,10 +462,10 @@ python himawari_cli.py --version
 python check_environment.py --plain
 ```
 
-Current fixed build: **`2026.06.17.06`**. Processing logs should include:
+Current fixed build: **`2026.06.17.08`**. Processing logs should include:
 
 ```
-App version: 2026.06.17.06
+App version: 2026.06.17.08
 ```
 
 This build accepts Himawari-8 and Himawari-9 raw HSD file names and NOAA S3
@@ -365,7 +489,7 @@ installs it from `requirements.txt`.
 ### Changing Default Settings
 
 You can still change the default values near the top of
-`himawari_lowram_processor_claude.py` if you want the GUI to open with
+`himawari_lowram_processor.py` if you want the GUI to open with
 different initial settings:
 
 ```python
@@ -436,7 +560,7 @@ executable shown by the checker when installing or launching the app.
 ### Wrong version or old files
 
 **Symptom:** a friend says the fix is installed, but logs do not show
-`App version: 2026.06.17.06`.
+`App version: 2026.06.17.08`.
 
 **Likely cause:** their folder is still on an old commit, or they downloaded a
 ZIP before the latest push.
@@ -533,7 +657,7 @@ python check_environment.py --fix
 ```
 
 If it still fails, check that the reported Python executable is the same one
-used to launch `himawari_lowram_processor_claude.py`.
+used to launch `himawari_lowram_processor.py`.
 
 ### Satpy true_color_reproduction unavailable; using custom low-RAM fallback
 
@@ -566,7 +690,7 @@ python check_environment.py --fix
 ```
 
 If it still fails, check that the reported Python executable is the same one
-used to launch `himawari_lowram_processor_claude.py`. Python 3.12 or 3.13 is
+used to launch `himawari_lowram_processor.py`. Python 3.12 or 3.13 is
 recommended; if the checker reports Python 3.14, use `--auto` to create a
 supported `.venv` when Python 3.12/3.13 is installed.
 
@@ -819,7 +943,10 @@ pick saves immediately. If you are on an older build, update.
 Run the local checks:
 
 ```powershell
-python -m py_compile himawari_lowram_processor_claude.py
+python -m py_compile himawari_lowram_processor.py
+python -m py_compile himawari_lowram_simple.py
+python -m py_compile himawari_cli.py
+python -m py_compile himawari_tui.py
 python -m pytest tests/
 python -c "import himawari_lowram_processor as h; print(len(h.BAND_RESOLUTION))"
 ```
@@ -830,6 +957,43 @@ reader dependencies.
 ---
 
 ## What's New
+
+### 2026.06.17.08 — Text interface (TUI), smarter Quick Fix, and reliability fixes
+
+- **New "3 TC Styles" action.** A single button (full and simple GUIs), CLI flag
+  (`--true-color-set`), and TUI/CLI menu item renders the True Color
+  Reproduction product in all three map styles at once — native (round disk),
+  standard flat map, and Zoom Earth-style flat map — each saved with its style in
+  the filename (`_native`, `_flat_standard`, `_flat_zoomearth`).
+
+- **New text interface (`himawari_tui.py`).** A full-screen, keyboard-driven
+  terminal interface for machines with no graphical display (for example a
+  server over SSH). It uses the same engine and shares settings with the GUI,
+  and falls back to the CLI menu when curses is unavailable. See **Launch the
+  Text Interface (TUI)** above.
+- **Quick Fix now updates first, then repairs.** The **Quick Fix** button (in
+  both GUIs) now downloads the latest code from the project's **main** branch —
+  backing up and replacing your local files — *before* repairing the Python
+  environment, so a broken build picks up the actual code fix. If the download
+  fails (for example offline), it still repairs the environment. Your settings
+  files are never overwritten by any updater.
+- **New update commands.** `python himawari_cli.py --update` updates from the
+  command line, and the TUI and CLI menus both offer an **Update program**
+  option. See **Download, Install & Update** above.
+- **Simple GUI now starts reliably.** It imports the processor under its real
+  name (`himawari_lowram_processor.py`) and also detects a renamed
+  `himawari_lowram_processor_claude.py` copy, so the previous "could not find"
+  startup failure is gone. It also loads its own settings file (not the full
+  GUI's), correctly restores the saved **Map style**, and disables every helper
+  button while a render is running.
+- **The CLI and TUI now run on headless systems.** tkinter (a GUI-only
+  dependency) is imported lazily, so importing the engine for command-line or
+  text use no longer requires a display toolkit.
+- **Consistent live/hd border colour.** The live/hd satellite layers and the
+  border-colour picker now use the same bright green (`#00ff00`).
+- **Wider self-update coverage.** Updates now also refresh
+  `himawari_lowram_simple.py`, `himawari_cli.py`, `himawari_tui.py`, the
+  requirements files, and the Windows launchers.
 
 ### 2026.06.17.07 — Simple version (`himawari_lowram_simple.py`)
 

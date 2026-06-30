@@ -15,3 +15,4 @@ aggdraw>=1.3
 rasterio>=1.3
 imageio-ffmpeg>=0.4; platform_system != "Emscripten"
 tkinterdnd2>=0.4.4
+windows-curses>=2.3; platform_system == "Windows"
