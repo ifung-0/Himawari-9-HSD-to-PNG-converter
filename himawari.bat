@@ -11,8 +11,9 @@ cd /d "%PROJECT_DIR%" || (
     exit /b 1
 )
 
+set "PYTHON_CMD="
 call :detect_python
-if not defined PYTHON_CMD (
+if "%PYTHON_CMD%"=="" (
     echo ERROR: No Python executable found.
     echo Install Python 3.13 (or 3.12), or run "himawari check-env" for repair help.
     pause
@@ -84,7 +85,7 @@ if not "%EXIT_CODE%"=="0" (
 exit /b %EXIT_CODE%
 
 :quick_fix
-if defined ACTION_ARGS (
+if not "%ACTION_ARGS%"=="" (
     %PYTHON_CMD% "%PROJECT_DIR%check_environment.py" --fix %ACTION_ARGS%
 ) else (
     %PYTHON_CMD% "%PROJECT_DIR%check_environment.py" --fix
@@ -202,8 +203,6 @@ pause
 exit /b 0
 
 :detect_python
-set "PYTHON_CMD="
-
 if defined HIMAWARI_PYTHON (
     "%HIMAWARI_PYTHON%" --version >nul 2>&1
     if not errorlevel 1 (
