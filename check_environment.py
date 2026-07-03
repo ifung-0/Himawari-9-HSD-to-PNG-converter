@@ -54,6 +54,14 @@ class _ProjectModuleAliasFinder:
 
 sys.meta_path.append(_ProjectModuleAliasFinder())
 MIN_SATPY_VERSION = (0, 60)
+# NOTE: A few small constants below (OVERLAY_RESOLUTION, OVERLAY_LEVEL,
+# CLOUD_SYNC_PREFIXES, CLOUD_SYNC_EXACT) mirror values in
+# himawari_lowram_processor.py *on purpose*. This module is the environment
+# doctor and must import and run on a machine where numpy/dask/xarray/satpy
+# are not yet installed; importing himawari_lowram_processor to share the
+# constants would pull in those heavy packages at module load and defeat the
+# whole point of the checker. The duplication is a handful of literals and is
+# the deliberate cost of keeping this file dependency-free.
 OVERLAY_RESOLUTION = "l"
 OVERLAY_LEVEL = 1
 GSHHG_SHAPEFILE_ARCHIVE = "gshhg-shp-2.3.7.zip"
@@ -98,6 +106,8 @@ CORE_ROOT_FILES = {
     "himawari_cli.py",
     "himawari_lowram_processor.py",
     "himawari_lowram_processor_claude.py",
+    "himawari_lowram_simple.py",
+    "himawari_tui.py",
     "install_requirements.py",
     "LICENSE",
     "README.md",
@@ -1036,6 +1046,11 @@ def root_cleanup_candidates(project_dir: Path = PROJECT_DIR) -> list[CleanupCand
     for path in sorted(project_dir.iterdir(), key=lambda item: item.name.lower()):
         name = path.name
         if path.is_dir() or name in CORE_ROOT_FILES:
+            continue
+        # Root-level pytest files (test_*.py, *_test.py, conftest.py) are a normal
+        # project layout, not stray program files, so never flag them for cleanup.
+        lowered = name.lower()
+        if lowered == "conftest.py" or lowered.startswith("test_") or lowered.endswith("_test.py"):
             continue
         reason = KNOWN_UNUSED_ROOT_FILES.get(name)
         if reason is not None:

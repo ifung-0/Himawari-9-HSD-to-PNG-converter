@@ -5,7 +5,7 @@ AWS S3, processes them with Satpy, and writes either a single PNG or a GIF/MP4
 timelapse. The pipeline is designed for a conservative 10 GiB memory budget,
 with defaults that favor lower peak RAM over speed.
 
-> **Current build:** `2026.06.17.08` — see [What's New](#whats-new) at the
+> **Current build:** `2026.07.02.01` — see [What's New](#whats-new) at the
 > bottom of this file for the latest changes.
 
 ---
@@ -957,6 +957,35 @@ reader dependencies.
 ---
 
 ## What's New
+
+### 2026.07.02.01 — 9-cell True Color matrix, typhoon tracks, and bug fixes
+
+- **"3 TC Styles" is now "9 TC Styles".** The batch action now renders
+  **3 satellite layers × 3 map styles = 9** True-Color images. The layers are
+  **Standard** (raw TCR), **Live** (latest scan + HD tone), and **HD** (HD tone).
+  The styles are **Native** (round disk), **Flat map** (faithful), and
+  **Zoom Earth flat** (cosmetic). Each cell writes a distinct
+  `…_<layer>_<style>` filename so nothing overwrites. The button in both GUIs
+  now reads **"9 TC Styles"**; the CLI flag `--true-color-set` and the TUI/CLI
+  menu item work the same.
+- **New typhoon track overlay.** When enabled, the app draws a storm's past
+  track (solid line + dots), current position (intensity-coloured cyclone
+  marker + ring), forecast track (dashed), and name/category label over the
+  image. Track data comes from a local `himawari_typhoon_tracks.json` file or
+  an external feed. See the new `himawari_typhoon_tracks.example.json` for the
+  documented schema. Enabled via GUI checkbox, CLI `--typhoon-tracks`, and TUI.
+- **Bug fixes and clean-ups:**
+  - `himawari.bat` now correctly quotes `%PYTHON_CMD%` on every launch line,
+    fixing paths-with-spaces issues while keeping the `py` launcher working.
+  - Archive misclassification fixed: `himawari_tui.py` and
+    `himawari_lowram_simple.py` are no longer flagged as obsolete during cleanup.
+  - CLI `edit_advanced_settings` now builds `ProcessorConfig` before mutating
+    global output/temp folders, preventing half-changed state on abort.
+  - Root `test_processor.py` removed (broken, stale version assertion);
+    replaced by `test_new_features.py` (24 tests, self-contained).
+  - Colour science verified: no yellow/brown disk bug, no hue skew. The
+    enhancement chain stays neutral on grey patches, keeps ocean blue, and
+    preserves clean white clouds. These properties are now locked in by tests.
 
 ### 2026.06.17.08 — Text interface (TUI), smarter Quick Fix, and reliability fixes
 

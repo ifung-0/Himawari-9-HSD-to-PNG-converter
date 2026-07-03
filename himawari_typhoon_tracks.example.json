@@ -1,0 +1,48 @@
+{
+  "_comment": "Example typhoon/tropical-cyclone track file for the Himawari processor. To use it: (1) enable 'Typhoon tracks' in the GUI/CLI/TUI (or pass --typhoon-tracks yes), and (2) either rename this file to 'himawari_typhoon_tracks.json' (auto-loaded from the project folder), point 'Typhoon Data' at this file/folder, or give an http(s) URL that returns this same JSON shape. Only storms with a fix within a few hours of the image's scan time are drawn, so keep it current. The processor also accepts a GeoJSON FeatureCollection (e.g. a GDACS tropical-cyclone feed) in the same setting.",
+  "_schema": {
+    "storms": [
+      {
+        "name": "storm display name (required)",
+        "id": "optional storm identifier, e.g. wp0226",
+        "basin": "optional basin code, e.g. WP / EP / IO",
+        "track": "list of OBSERVED fixes (past + current), time-ordered",
+        "forecast": "optional list of FORECAST fixes, drawn as a dashed line",
+        "_point_fields": {
+          "time": "ISO-8601 UTC time (e.g. 2026-07-02T06:00:00Z); optional but recommended so the current fix tracks the scan time",
+          "lat": "latitude in degrees (required)",
+          "lon": "longitude in degrees, positive east (required)",
+          "wind_kt": "optional 1-min sustained wind in knots; sets the marker colour",
+          "pressure_hpa": "optional central pressure in hPa",
+          "category": "optional label, e.g. 'TD', 'TS', 'STS', 'TY', 'Cat 3'"
+        }
+      }
+    ]
+  },
+  "storms": [
+    {
+      "name": "Example-Alpha",
+      "id": "wp0299",
+      "basin": "WP",
+      "track": [
+        {"time": "2026-07-01T18:00:00Z", "lat": 11.8, "lon": 135.6, "wind_kt": 40, "pressure_hpa": 998, "category": "TS"},
+        {"time": "2026-07-02T00:00:00Z", "lat": 13.0, "lon": 133.9, "wind_kt": 65, "pressure_hpa": 985, "category": "TY"},
+        {"time": "2026-07-02T06:00:00Z", "lat": 14.4, "lon": 132.2, "wind_kt": 105, "pressure_hpa": 955, "category": "Cat 3"}
+      ],
+      "forecast": [
+        {"time": "2026-07-02T12:00:00Z", "lat": 16.1, "lon": 130.6, "wind_kt": 115, "category": "Cat 4"},
+        {"time": "2026-07-02T18:00:00Z", "lat": 18.0, "lon": 129.1, "wind_kt": 100, "category": "Cat 3"},
+        {"time": "2026-07-03T00:00:00Z", "lat": 20.2, "lon": 127.8, "wind_kt": 80, "category": "Cat 1"}
+      ]
+    },
+    {
+      "name": "Example-Bravo",
+      "id": "wp0300",
+      "basin": "WP",
+      "track": [
+        {"time": "2026-07-02T00:00:00Z", "lat": 22.5, "lon": 141.0, "wind_kt": 35, "category": "TS"},
+        {"time": "2026-07-02T06:00:00Z", "lat": 23.4, "lon": 140.1, "wind_kt": 45, "category": "STS"}
+      ]
+    }
+  ]
+}

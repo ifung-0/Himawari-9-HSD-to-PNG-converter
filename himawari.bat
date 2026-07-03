@@ -3,9 +3,16 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 set "PROJECT_DIR=%~dp0"
 
-REM Find Python
+REM Find Python.
+REM PYTHON_CMD holds the executable (a full path, or a bare command like "py"
+REM or "python" that is resolved via PATH). PYTHON_ARGS holds any launcher flags
+REM (e.g. "-3.13" for the py launcher). Keeping them separate lets every launch
+REM quote "%PYTHON_CMD%" (so paths with spaces work) while still passing the
+REM version flag - quoting the whole "py -3.13" string would look for a program
+REM literally named "py -3.13" and fail.
 set "PYTHON313=%LOCALAPPDATA%\Programs\Python\Python313\python.exe"
 set "PYTHON_CMD="
+set "PYTHON_ARGS="
 
 if defined HIMAWARI_PYTHON (
     "%HIMAWARI_PYTHON%" --version >nul 2>&1
@@ -22,12 +29,18 @@ if not defined PYTHON_CMD (
 
 if not defined PYTHON_CMD (
     py -3.13 --version >nul 2>&1
-    if not errorlevel 1 set "PYTHON_CMD=py -3.13"
+    if not errorlevel 1 (
+        set "PYTHON_CMD=py"
+        set "PYTHON_ARGS=-3.13"
+    )
 )
 
 if not defined PYTHON_CMD (
     py -3.12 --version >nul 2>&1
-    if not errorlevel 1 set "PYTHON_CMD=py -3.12"
+    if not errorlevel 1 (
+        set "PYTHON_CMD=py"
+        set "PYTHON_ARGS=-3.12"
+    )
 )
 
 if not defined PYTHON_CMD (
@@ -91,19 +104,19 @@ goto menu
 
 :install_reqs
 echo Installing requirements...
-%PYTHON_CMD% "%PROJECT_DIR%install_requirements.py"
+"%PYTHON_CMD%" %PYTHON_ARGS% "%PROJECT_DIR%install_requirements.py"
 pause
 goto menu
 
 :quick_fix
 echo Running Quick Fix...
-%PYTHON_CMD% "%PROJECT_DIR%check_environment.py" --fix
+"%PYTHON_CMD%" %PYTHON_ARGS% "%PROJECT_DIR%check_environment.py" --fix
 pause
 goto menu
 
 :check_env
 echo Checking environment...
-%PYTHON_CMD% "%PROJECT_DIR%check_environment.py"
+"%PYTHON_CMD%" %PYTHON_ARGS% "%PROJECT_DIR%check_environment.py"
 pause
 goto menu
 
@@ -114,7 +127,7 @@ if not exist "%PROJECT_DIR%himawari_cli.py" (
     goto menu
 )
 echo Launching CLI...
-%PYTHON_CMD% "%PROJECT_DIR%himawari_cli.py"
+"%PYTHON_CMD%" %PYTHON_ARGS% "%PROJECT_DIR%himawari_cli.py"
 pause
 goto menu
 
@@ -122,20 +135,25 @@ goto menu
 if defined HIMAWARI_SCRIPT (
     if exist "%HIMAWARI_SCRIPT%" (
         echo Launching GUI...
-        %PYTHON_CMD% "%HIMAWARI_SCRIPT%"
+        "%PYTHON_CMD%" %PYTHON_ARGS% "%HIMAWARI_SCRIPT%"
         pause
         goto menu
     )
 )
 if exist "%PROJECT_DIR%himawari_lowram_processor.py" (
     echo Launching GUI...
-    %PYTHON_CMD% "%PROJECT_DIR%himawari_lowram_processor.py"
+    "%PYTHON_CMD%" %PYTHON_ARGS% "%PROJECT_DIR%himawari_lowram_processor.py"
     pause
     goto menu
 )
+REM Fallback for a renamed working copy. The Python modules already accept a
+REM himawari_lowram_processor_claude.py copy (see the _ALTERNATES lists in
+REM check_environment.py / himawari_tui.py / himawari_lowram_simple.py); this
+REM branch lets the launcher start that same renamed copy when the canonical
+REM filename is absent, so it is intentionally kept, not dead code.
 if exist "%PROJECT_DIR%himawari_lowram_processor_claude.py" (
     echo Launching GUI...
-    %PYTHON_CMD% "%PROJECT_DIR%himawari_lowram_processor_claude.py"
+    "%PYTHON_CMD%" %PYTHON_ARGS% "%PROJECT_DIR%himawari_lowram_processor_claude.py"
     pause
     goto menu
 )
@@ -150,7 +168,7 @@ if not exist "%PROJECT_DIR%himawari_tui.py" (
     goto menu
 )
 echo Launching TUI...
-%PYTHON_CMD% "%PROJECT_DIR%himawari_tui.py"
+"%PYTHON_CMD%" %PYTHON_ARGS% "%PROJECT_DIR%himawari_tui.py"
 pause
 goto menu
 

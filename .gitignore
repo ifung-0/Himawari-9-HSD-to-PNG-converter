@@ -12,6 +12,8 @@ cleanup_archive/
 himawari_gui_settings.json
 himawari_recent_runs.json
 himawari_custom_presets.json
+himawari_simple_settings.json
+himawari_typhoon_tracks.json
 
 .pytest_cache/
 .mypy_cache/

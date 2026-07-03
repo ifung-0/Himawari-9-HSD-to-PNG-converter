@@ -178,6 +178,9 @@ def _load_simple_settings() -> ProcessorConfig:
         "map_label_size",
         "add_border_lines",
         "border_line_color",
+        "add_typhoon_tracks",
+        "typhoon_track_color",
+        "typhoon_data_source",
         "download_workers",
         "dask_num_workers",
         "dask_chunk_size",
@@ -329,6 +332,9 @@ class HimawariSimpleApp(h.HimawariProcessorApp):
             overlay_theme="Custom (keep my colors)",
             map_label_color=self.map_label_color_var.get(),
             night_boundary_color=h.NIGHT_BOUNDARY_COLOR,
+            add_typhoon_tracks=self.typhoon_tracks_var.get(),
+            typhoon_track_color=self.typhoon_color_var.get(),
+            typhoon_data_source=self.typhoon_source_var.get().strip() or h.TYPHOON_DATA_SOURCE,
         )
         return config
 
@@ -470,6 +476,20 @@ class HimawariSimpleApp(h.HimawariProcessorApp):
             row=2, column=3, padx=4, pady=4
         )
 
+        # Typhoon tracks + colour chooser (drawn only when track data is found).
+        ttk.Checkbutton(
+            options_frame, text="Typhoon tracks", variable=self.typhoon_tracks_var
+        ).grid(row=3, column=0, padx=4, pady=4, sticky="w")
+        ttk.Label(options_frame, text="Track colour:").grid(row=3, column=1, sticky="w", padx=4, pady=4)
+        ttk.Entry(options_frame, textvariable=self.typhoon_color_var, width=10).grid(
+            row=3, column=2, padx=4, pady=4, sticky="w"
+        )
+        ttk.Button(
+            options_frame,
+            text="Choose...",
+            command=lambda: self._choose_color(self.typhoon_color_var, "Choose typhoon track colour", h.TYPHOON_TRACK_COLOR),
+        ).grid(row=3, column=3, padx=4, pady=4)
+
         # Flat-map region (kept simple: just the four bound fields + Pick Region).
         region_frame = ttk.LabelFrame(parent, text="Flat-map region (latitude / longitude bounds)")
         region_frame.pack(fill="x", padx=8, pady=4)
@@ -602,7 +622,7 @@ class HimawariSimpleApp(h.HimawariProcessorApp):
             ("Quick Look", lambda: self._start_preview()),
             ("Pick Region", lambda: self._open_region_picker()),
             ("Test Data Host", lambda: self._start_connectivity_check()),
-            ("3 TC Styles", lambda: self._start_true_color_set()),
+            ("9 TC Styles", lambda: self._start_true_color_set()),
         ]
         # Split into two rows: 9 per row (18 buttons = two full rows of 9).
         per_row = 9
@@ -627,7 +647,7 @@ class HimawariSimpleApp(h.HimawariProcessorApp):
             "Quick Look": "preview_button",
             "Pick Region": "pick_region_button",
             "Test Data Host": "test_host_button",
-            "3 TC Styles": "true_color_set_button",
+            "9 TC Styles": "true_color_set_button",
         }
         for index, (label, command) in enumerate(button_specs):
             r = index // per_row

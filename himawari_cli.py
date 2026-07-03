@@ -51,8 +51,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--true-color-set",
         action="store_true",
         help=(
-            "Render the True Color Reproduction product in all three map styles "
-            "(native, standard flat, and Zoom Earth-style flat), then exit."
+            "Render the True Color Reproduction product across all nine cells "
+            "(standard/live/HD satellite layers x native/flat/Zoom Earth map "
+            "styles), then exit."
         ),
     )
     parser.add_argument("--check-env", action="store_true", help="Run check_environment.py before any processing.")
@@ -126,6 +127,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--crosshair-type", choices=processor.CROSSHAIR_TYPES, default=None)
     parser.add_argument("--crosshair-color", default=None)
     parser.add_argument("--zoom-earth-style", dest="zoom_earth_style", type=parse_bool, default=None)
+    parser.add_argument("--typhoon-tracks", dest="add_typhoon_tracks", type=parse_bool, default=None,
+                        help="Draw typhoon/tropical-cyclone tracks when track data is available.")
+    parser.add_argument("--typhoon-color", dest="typhoon_track_color", default=None,
+                        help="Typhoon track/label color (name, #RRGGBB, or R,G,B).")
+    parser.add_argument("--typhoon-source", dest="typhoon_data_source", default=None,
+                        help="Typhoon data source: 'auto', a JSON file/folder path, or an http(s) URL.")
     return parser
 
 
@@ -222,6 +229,8 @@ def print_config(config: processor.ProcessorConfig) -> None:
     print(f"Crosshair:          {yes_no(config.add_crosshair)}")
     print(f"Crosshair style:    {config.crosshair_type} / {config.crosshair_color}")
     print(f"Zoom Earth style:   {yes_no(config.zoom_earth_style)}")
+    print(f"Typhoon tracks:     {yes_no(config.add_typhoon_tracks)}")
+    print(f"Typhoon color/src:  {config.typhoon_track_color} / {config.typhoon_data_source}")
     print(f"Download workers:   {config.download_workers}")
     print(f"Dask workers:       {config.dask_num_workers}")
     print(f"Dask chunk size:    {config.dask_chunk_size}")
@@ -353,11 +362,22 @@ def edit_advanced_settings(config: processor.ProcessorConfig) -> processor.Proce
     values["crosshair_type"] = prompt_choice("Crosshair type", config.crosshair_type, processor.CROSSHAIR_TYPES)
     values["crosshair_color"] = prompt_text("Crosshair color", config.crosshair_color)
     values["zoom_earth_style"] = prompt_bool("Zoom Earth-style flat map", config.zoom_earth_style)
+    values["add_typhoon_tracks"] = prompt_bool("Draw typhoon tracks (when data available)", config.add_typhoon_tracks)
+    if values["add_typhoon_tracks"]:
+        values["typhoon_track_color"] = prompt_text("Typhoon track color", config.typhoon_track_color)
+        values["typhoon_data_source"] = prompt_text(
+            "Typhoon data source (auto / file / URL)", config.typhoon_data_source
+        )
     output_dir = prompt_text("Output folder", str(processor.OUTPUT_DIR))
     temp_dir = prompt_text("Temp folder", str(processor.TEMP_DIR))
+    # Build the config first so a validation error while constructing it never
+    # leaves the global OUTPUT_DIR/TEMP_DIR half-updated (the previous order
+    # mutated the globals before this could fail, so a failed edit changed the
+    # output folders as a side effect).
+    updated = processor.ProcessorConfig(**values)
     set_output_dir(output_dir)
     set_temp_dir(temp_dir)
-    return processor.ProcessorConfig(**values)
+    return updated
 
 
 def run_environment_check() -> int:
@@ -386,8 +406,8 @@ def run_processor(config: processor.ProcessorConfig) -> list[Path]:
 
 
 def run_true_color_styles(config: processor.ProcessorConfig) -> list[Path]:
-    """Render True Color Reproduction in all three map styles (native, standard
-    flat, Zoom Earth-style flat)."""
+    """Render True Color Reproduction across all nine layer/style cells
+    (standard/live/HD satellite layers x native/flat/Zoom Earth map styles)."""
     eta_estimator = processor.ProgressEtaEstimator()
 
     def progress(message: str, current: int | None, total: int | None) -> None:
@@ -398,7 +418,11 @@ def run_true_color_styles(config: processor.ProcessorConfig) -> list[Path]:
         else:
             print(message)
 
-    print("Rendering True Color Reproduction in 3 map styles: native, standard flat, Zoom Earth-style flat.\n")
+    count = len(processor.TRUE_COLOR_STYLE_SET)
+    print(
+        f"Rendering True Color Reproduction in {count} cells: the standard, live "
+        "and HD satellite layers, each as native / flat / Zoom Earth-style.\n"
+    )
     outputs = processor.run_true_color_style_set(config, progress=progress)
     print()
     print("Finished. Outputs:")
@@ -417,7 +441,7 @@ def interactive_menu(config: processor.ProcessorConfig) -> int:
         print("3. Edit advanced settings")
         print("4. Check environment")
         print("5. Run processor")
-        print("6. Render 3 true color styles (native / flat / Zoom Earth)")
+        print("6. Render 9 true color styles (standard/live/HD x native/flat/Zoom Earth)")
         print("7. Update program (from GitHub main branch)")
         print("8. Exit")
         choice = input("Choose an option: ").strip()
@@ -482,7 +506,7 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print(
         "No processing started. Use --run to run once, --true-color-set for the "
-        "3 map-style true-color batch, or --menu for the guided CLI."
+        "9-cell (layer x style) true-color batch, or --menu for the guided CLI."
     )
     return 0
 

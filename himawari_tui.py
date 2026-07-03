@@ -241,6 +241,9 @@ def build_screens(processor: Any) -> list[tuple[str, list[Field]]]:
             Field("add_crosshair", "Crosshair", "bool"),
             Field("crosshair_type", "Crosshair type", "choice", crosshair_types),
             Field("crosshair_color", "Crosshair colour", "text"),
+            Field("add_typhoon_tracks", "Typhoon tracks (when data available)", "bool"),
+            Field("typhoon_track_color", "Typhoon track colour", "text"),
+            Field("typhoon_data_source", "Typhoon data (auto/file/URL)", "text"),
             Field("overlay_theme", "Overlay theme", "choice", overlay_themes),
         ],
     )
@@ -343,8 +346,8 @@ def run_processing(state: TuiState) -> None:
 
 
 def run_true_color_styles(state: TuiState) -> None:
-    """Render True Color Reproduction in all three map styles (native, standard
-    flat, Zoom Earth-style flat)."""
+    """Render True Color Reproduction across all nine layer/style cells
+    (standard/live/HD satellite layers x native/flat/Zoom Earth map styles)."""
     processor = state.processor
     state.apply_output_temp()
     try:
@@ -365,8 +368,9 @@ def run_true_color_styles(state: TuiState) -> None:
             print(message)
 
     print(
-        "Rendering True Color Reproduction in 3 map styles: native, standard "
-        "flat, Zoom Earth-style flat.\nPress Ctrl+C to cancel.\n"
+        f"Rendering True Color Reproduction in {len(processor.TRUE_COLOR_STYLE_SET)} "
+        "cells: standard/live/HD satellite layers, each as native / flat / Zoom "
+        "Earth-style.\nPress Ctrl+C to cancel.\n"
     )
     try:
         outputs = processor.run_true_color_style_set(config, progress=progress)
@@ -919,7 +923,7 @@ def _main_loop(stdscr: Any, state: TuiState) -> None:
             "\u2500" * 40,
             "Check environment",
             "Run render",
-            "Render 3 true color styles",
+            "Render 9 true color styles",
             "Update program (GitHub)",
             "\u2500" * 40,
             "Quit",

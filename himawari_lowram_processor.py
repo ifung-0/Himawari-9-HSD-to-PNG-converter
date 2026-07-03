@@ -107,7 +107,7 @@ except KeyboardInterrupt:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-APP_VERSION = "2026.06.17.08"
+APP_VERSION = "2026.07.02.01"
 APP_DISPLAY_NAME = "Himawari-8/9 Low-RAM Processor"
 USER_URL = "https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/2024/07/25/0400/HS_H09_20240725_0400_B01_FLDK_R10_S0110.DAT.bz2"
 MODE = "Single Image"  # "Single Image" or "Timelapse"
@@ -154,6 +154,36 @@ FLAT_MAP_LIMB_FADE_MAX_PX = 240
 FLAT_MAP_ZOOM_OVERLAY_OPACITY = 200
 FLAT_MAP_ZOOM_CROSSHAIR_OPACITY_SCALE = 0.78
 SATELLITE_LAYER_BORDER_COLOR = "#00ff00"  # bright green border for the live/hd satellite layers
+# Typhoon / tropical-cyclone track overlay. Off by default; when enabled the
+# processor draws the past track, current position and forecast track for any
+# active storm whose data falls inside the rendered map (see draw_typhoon_tracks).
+ADD_TYPHOON_TRACKS = False
+TYPHOON_TRACK_COLOR = "#ff3b3b"  # default track/label colour (bright red)
+# "auto"  -> look for a local himawari_typhoon_tracks.json, then (best effort) a
+#            public feed. Set to a file path, a folder, or an http(s) URL to
+#            override. Empty string behaves like "auto".
+TYPHOON_DATA_SOURCE = "auto"
+TYPHOON_TRACKS_FILENAME = "himawari_typhoon_tracks.json"
+# A track point counts as "current" for a scan when it is within this many hours
+# of the scan time; storms with no point inside the window are not drawn.
+TYPHOON_MATCH_WINDOW_HOURS = 9.0
+# Best-effort public feed used only when typhoon_data_source is "auto"/empty and
+# no local file is present. Network failures are swallowed (the overlay simply
+# does not draw), so a missing/blocked feed never breaks a render.
+TYPHOON_REMOTE_FEED_URL = "https://www.gdacs.org/gdacsapi/api/events/geteventlist/MAP?eventtypes=TC"
+TYPHOON_REMOTE_TIMEOUT_SECONDS = 12
+# Saffir-Simpson-style intensity colours keyed by 1-min sustained wind (knots).
+# Used to tint the current-position marker so stronger storms read as "hotter".
+TYPHOON_INTENSITY_COLORS = (
+    (137, "#c800ff"),  # >= 137 kt: violent typhoon / Cat 5
+    (113, "#ff2b2b"),  # 113-136 kt: very strong typhoon / Cat 4
+    (96, "#ff7f0e"),   # 96-112 kt: Cat 3
+    (83, "#ffb000"),   # 83-95 kt: Cat 2
+    (64, "#ffd21e"),   # 64-82 kt: Cat 1 / typhoon
+    (48, "#4cd964"),   # 48-63 kt: severe tropical storm
+    (34, "#34c7d6"),   # 34-47 kt: tropical storm
+    (0, "#9aa7b4"),    # < 34 kt: tropical depression
+)
 FLAT_MAP_DIRECT_SAMPLE_CHUNK = 256
 GPU_CUSTOM_COMPOSITE_MAX_CHUNK_EDGE = 512
 GPU_CUSTOM_COMPOSITE_MAX_CHUNK_PIXELS = 262_144
@@ -739,6 +769,14 @@ class ProcessorConfig:
     overlay_theme: str = OVERLAY_THEME
     map_label_color: str = MAP_LABEL_COLOR
     night_boundary_color: str = NIGHT_BOUNDARY_COLOR
+    # When True (default) the "live"/"hd" satellite layers force their own
+    # flat + Zoom Earth look (see layer_defaults_config). The multi-style batch
+    # sets this False so each cell can pick its own projection while still using
+    # the layer's enhancement + live data source.
+    layer_style_presets: bool = True
+    add_typhoon_tracks: bool = ADD_TYPHOON_TRACKS
+    typhoon_track_color: str = TYPHOON_TRACK_COLOR
+    typhoon_data_source: str = TYPHOON_DATA_SOURCE
 
 
 ProgressCallback = Callable[[str, int | None, int | None], None]
@@ -3443,14 +3481,16 @@ def satellite_layer_map_label_size(value: object) -> int:
 
 def layer_defaults_config(config: ProcessorConfig) -> ProcessorConfig:
     mode = normalized_satellite_layer_mode(config.satellite_layer_mode)
-    if mode == "standard":
-        if config.satellite_layer_mode == mode:
-            return config
-        return replace(config, satellite_layer_mode=mode)
-    if mode not in SATELLITE_LAYER_MODES:
-        return config
+    normalized = config if config.satellite_layer_mode == mode else replace(config, satellite_layer_mode=mode)
+    if mode == "standard" or mode not in SATELLITE_LAYER_MODES:
+        return normalized
+    if not getattr(config, "layer_style_presets", True):
+        # The multi-style batch (and any advanced caller) manages projection and
+        # overlay styling itself. Only the enhancement + live data-source
+        # semantics still follow the satellite-layer mode; nothing else is forced.
+        return normalized
     return replace(
-        config,
+        normalized,
         satellite_layer_mode=mode,
         composite_choice="True Color Reproduction Image",
         map_view="flat",
@@ -3892,7 +3932,13 @@ def parse_rgb_color(value: str) -> tuple[int, int, int]:
 
 
 def functional_map_overlay_enabled(config: ProcessorConfig) -> bool:
-    return bool(config.add_border_lines or config.add_map_labels or config.add_night_boundary or config.add_crosshair)
+    return bool(
+        config.add_border_lines
+        or config.add_map_labels
+        or config.add_night_boundary
+        or config.add_crosshair
+        or getattr(config, "add_typhoon_tracks", False)
+    )
 
 
 def flat_map_visual_style_enabled(config: ProcessorConfig) -> bool:
@@ -4040,6 +4086,494 @@ def draw_zoom_earth_labels(
             # Keep the land/water opacity difference but use the themed colour.
             fill = (*label_color, 235) if kind == "land" else (*label_color, 210)
         draw_text_with_halo(draw, point, label, font, fill, halo_width=halo_width)
+
+
+# ---------------------------------------------------------------------------
+# Typhoon / tropical-cyclone track overlay
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class TyphoonTrackPoint:
+    """A single fix (observed or forecast) on a tropical-cyclone track."""
+
+    time: datetime | None
+    lat: float
+    lon: float
+    wind_kt: float | None = None
+    pressure_hpa: float | None = None
+    category: str | None = None
+    forecast: bool = False
+
+
+@dataclass(frozen=True)
+class TyphoonTrack:
+    """A storm's full track: past fixes, the current fix, and forecast fixes."""
+
+    name: str
+    identifier: str
+    basin: str
+    points: tuple[TyphoonTrackPoint, ...]
+
+
+def _typhoon_parse_time(value: object) -> datetime | None:
+    """Parse a variety of timestamp encodings into an aware UTC datetime."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    if isinstance(value, (int, float)):
+        # Epoch seconds (GDACS and several feeds emit milliseconds).
+        seconds = float(value)
+        if seconds > 1.0e11:
+            seconds /= 1000.0
+        try:
+            return datetime.fromtimestamp(seconds, tz=UTC)
+        except (OverflowError, OSError, ValueError):
+            return None
+    text = str(value).strip()
+    if not text:
+        return None
+    normalized = text.replace("Z", "+00:00")
+    for candidate in (normalized, text):
+        try:
+            parsed = datetime.fromisoformat(candidate)
+            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+        except ValueError:
+            continue
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y%m%d%H%M", "%Y%m%d%H", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=UTC)
+        except ValueError:
+            continue
+    return None
+
+
+def _typhoon_float(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def typhoon_intensity_color(wind_kt: float | None, category: str | None = None) -> tuple[int, int, int]:
+    """Pick a Saffir-Simpson-style marker colour from sustained wind (knots).
+
+    Falls back to a coarse category-name lookup when wind speed is unavailable,
+    and to the tropical-depression colour when nothing is known.
+    """
+    wind = _typhoon_float(wind_kt)
+    if wind is not None:
+        for threshold, hex_color in TYPHOON_INTENSITY_COLORS:
+            if wind >= threshold:
+                return parse_rgb_color(hex_color)
+    if category:
+        text = str(category).strip().lower()
+        keyword_colors = (
+            (("violent", "super"), "#c800ff"),
+            (("very strong", "cat 4", "category 4"), "#ff2b2b"),
+            (("cat 3", "category 3"), "#ff7f0e"),
+            (("cat 2", "category 2"), "#ffb000"),
+            (("typhoon", "hurricane", "cat 1", "category 1"), "#ffd21e"),
+            (("severe tropical storm", "sts"), "#4cd964"),
+            (("tropical storm", "ts"), "#34c7d6"),
+            (("depression", "td", "low", "remnant"), "#9aa7b4"),
+        )
+        for keywords, hex_color in keyword_colors:
+            if any(word in text for word in keywords):
+                return parse_rgb_color(hex_color)
+    return parse_rgb_color(TYPHOON_INTENSITY_COLORS[-1][1])
+
+
+def _typhoon_points_from_list(raw_points: object, forecast: bool) -> list[TyphoonTrackPoint]:
+    points: list[TyphoonTrackPoint] = []
+    if not isinstance(raw_points, list):
+        return points
+    for entry in raw_points:
+        if not isinstance(entry, dict):
+            continue
+        lat = _typhoon_float(entry.get("lat", entry.get("latitude")))
+        lon = _typhoon_float(entry.get("lon", entry.get("lng", entry.get("longitude"))))
+        if lat is None or lon is None:
+            continue
+        points.append(
+            TyphoonTrackPoint(
+                time=_typhoon_parse_time(entry.get("time", entry.get("timestamp", entry.get("date")))),
+                lat=lat,
+                lon=lon,
+                wind_kt=_typhoon_float(entry.get("wind_kt", entry.get("wind", entry.get("max_wind")))),
+                pressure_hpa=_typhoon_float(entry.get("pressure_hpa", entry.get("pressure", entry.get("mslp")))),
+                category=(str(entry.get("category")).strip() if entry.get("category") else None),
+                forecast=bool(entry.get("forecast", forecast)),
+            )
+        )
+    return points
+
+
+def _typhoon_track_from_storm(storm: dict) -> TyphoonTrack | None:
+    if not isinstance(storm, dict):
+        return None
+    points = _typhoon_points_from_list(storm.get("track", storm.get("past", storm.get("history"))), forecast=False)
+    points += _typhoon_points_from_list(storm.get("forecast", storm.get("forecast_track")), forecast=True)
+    if not points:
+        return None
+    points.sort(key=lambda pt: (pt.forecast, pt.time or datetime.min.replace(tzinfo=UTC)))
+    name = str(storm.get("name") or storm.get("storm_name") or storm.get("id") or "STORM").strip() or "STORM"
+    identifier = str(storm.get("id") or storm.get("identifier") or name).strip()
+    basin = str(storm.get("basin") or storm.get("region") or "").strip()
+    return TyphoonTrack(name=name, identifier=identifier, basin=basin, points=tuple(points))
+
+
+def _typhoon_tracks_from_geojson(payload: dict) -> list[TyphoonTrack]:
+    """Best-effort GeoJSON FeatureCollection parser (e.g. GDACS TC tracks).
+
+    Groups point features by storm name, treats LineString geometries as track
+    polylines, and tags features whose properties mark them as forecast.
+    """
+    features = payload.get("features")
+    if not isinstance(features, list):
+        return []
+    grouped: dict[str, dict[str, object]] = {}
+    for feature in features:
+        if not isinstance(feature, dict):
+            continue
+        props = feature.get("properties") if isinstance(feature.get("properties"), dict) else {}
+        geometry = feature.get("geometry") if isinstance(feature.get("geometry"), dict) else {}
+        name = str(
+            props.get("eventname")
+            or props.get("name")
+            or props.get("stormname")
+            or props.get("title")
+            or "STORM"
+        ).strip() or "STORM"
+        bucket = grouped.setdefault(name, {"points": [], "id": props.get("eventid") or name})
+        forecast = bool(
+            props.get("forecast")
+            or str(props.get("class", "")).lower().startswith("forecast")
+            or str(props.get("tracktype", "")).lower() == "forecast"
+        )
+        wind = _typhoon_float(props.get("wind") or props.get("windspeed") or props.get("usa_wind"))
+        pressure = _typhoon_float(props.get("pressure") or props.get("mslp"))
+        category = props.get("category") or props.get("class") or props.get("alertlevel")
+        when = _typhoon_parse_time(props.get("date") or props.get("time") or props.get("datetime"))
+        gtype = str(geometry.get("type", "")).lower()
+        coords = geometry.get("coordinates")
+        coord_list: list[tuple[float, float]] = []
+        if gtype == "point" and isinstance(coords, list) and len(coords) >= 2:
+            coord_list = [(coords[0], coords[1])]
+        elif gtype == "linestring" and isinstance(coords, list):
+            coord_list = [(pt[0], pt[1]) for pt in coords if isinstance(pt, list) and len(pt) >= 2]
+        for lon_raw, lat_raw in coord_list:
+            lon = _typhoon_float(lon_raw)
+            lat = _typhoon_float(lat_raw)
+            if lon is None or lat is None:
+                continue
+            bucket["points"].append(  # type: ignore[union-attr]
+                TyphoonTrackPoint(
+                    time=when,
+                    lat=lat,
+                    lon=lon,
+                    wind_kt=wind,
+                    pressure_hpa=pressure,
+                    category=(str(category).strip() if category else None),
+                    forecast=forecast,
+                )
+            )
+    tracks: list[TyphoonTrack] = []
+    for name, bucket in grouped.items():
+        points = list(bucket["points"])  # type: ignore[arg-type]
+        if not points:
+            continue
+        points.sort(key=lambda pt: (pt.forecast, pt.time or datetime.min.replace(tzinfo=UTC)))
+        tracks.append(
+            TyphoonTrack(
+                name=name,
+                identifier=str(bucket.get("id") or name),
+                basin="",
+                points=tuple(points),
+            )
+        )
+    return tracks
+
+
+def parse_typhoon_tracks(payload: object) -> list[TyphoonTrack]:
+    """Parse either the native ``{"storms": [...]}`` schema or a GeoJSON feed."""
+    if isinstance(payload, list):
+        payload = {"storms": payload}
+    if not isinstance(payload, dict):
+        return []
+    if payload.get("type") == "FeatureCollection" or "features" in payload:
+        tracks = _typhoon_tracks_from_geojson(payload)
+        if tracks:
+            return tracks
+    storms = payload.get("storms", payload.get("cyclones", payload.get("data")))
+    if not isinstance(storms, list):
+        return []
+    tracks = []
+    for storm in storms:
+        track = _typhoon_track_from_storm(storm)
+        if track is not None:
+            tracks.append(track)
+    return tracks
+
+
+def _load_typhoon_payload(source: str | None, project_dir: Path = PROJECT_DIR) -> object | None:
+    """Resolve the typhoon-data source into a parsed JSON payload.
+
+    Accepts a local file, a folder (uses the default filename inside it), an
+    http(s) URL, or the "auto"/empty sentinel (local file first, then the public
+    feed). Every failure is swallowed and logged so the overlay is best-effort.
+    """
+    raw = (source or "").strip()
+    default_file = project_dir / TYPHOON_TRACKS_FILENAME
+
+    def _read_json_file(path: Path) -> object | None:
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except Exception as exc:  # noqa: BLE001 - best effort overlay
+            LOG.warning("Could not read typhoon track file %s: %s", path, exc)
+            return None
+
+    def _fetch_json_url(url: str) -> object | None:
+        try:
+            response = requests.get(url, timeout=TYPHOON_REMOTE_TIMEOUT_SECONDS)
+            response.raise_for_status()
+            return response.json()
+        except Exception as exc:  # noqa: BLE001 - network is optional
+            LOG.info("Typhoon track feed unavailable (%s): %s", url, exc)
+            return None
+
+    if raw and raw.lower() not in {"auto", "default"}:
+        if raw.lower().startswith(("http://", "https://")):
+            return _fetch_json_url(raw)
+        candidate = Path(raw).expanduser()
+        if candidate.is_dir():
+            candidate = candidate / TYPHOON_TRACKS_FILENAME
+        if candidate.is_file():
+            return _read_json_file(candidate)
+        LOG.warning("Typhoon data source %s not found; drawing no tracks.", raw)
+        return None
+
+    if default_file.is_file():
+        return _read_json_file(default_file)
+    return _fetch_json_url(TYPHOON_REMOTE_FEED_URL)
+
+
+def track_current_point_index(track: TyphoonTrack, scan_time: datetime, window_hours: float) -> int | None:
+    """Index of the observed fix closest to ``scan_time`` within ``window_hours``.
+
+    Untimed tracks fall back to the last observed (non-forecast) fix so a static
+    user-supplied track still draws a marker. Returns None when the storm has no
+    fix near the scan time (so stale storms are skipped).
+    """
+    if scan_time.tzinfo is None:
+        scan_time = scan_time.replace(tzinfo=UTC)
+    observed = [(idx, pt) for idx, pt in enumerate(track.points) if not pt.forecast]
+    timed = [(idx, pt) for idx, pt in observed if pt.time is not None]
+    if not timed:
+        if observed:
+            return observed[-1][0]
+        return len(track.points) - 1 if track.points else None
+    best_idx: int | None = None
+    best_delta = float("inf")
+    for idx, pt in timed:
+        delta = abs((pt.time - scan_time).total_seconds())
+        if delta < best_delta:
+            best_delta = delta
+            best_idx = idx
+    if best_idx is None or best_delta > window_hours * 3600.0:
+        return None
+    return best_idx
+
+
+def active_typhoon_tracks(
+    tracks: Iterable[TyphoonTrack],
+    scan_time: datetime,
+    window_hours: float = TYPHOON_MATCH_WINDOW_HOURS,
+) -> list[tuple[TyphoonTrack, int]]:
+    """Keep only storms with a fix near the scan time, paired with that index."""
+    active: list[tuple[TyphoonTrack, int]] = []
+    for track in tracks:
+        idx = track_current_point_index(track, scan_time, window_hours)
+        if idx is not None:
+            active.append((track, idx))
+    return active
+
+
+def load_typhoon_tracks_for_scan(
+    config: ProcessorConfig,
+    scan_time: datetime,
+    project_dir: Path = PROJECT_DIR,
+) -> list[tuple[TyphoonTrack, int]]:
+    """Load, parse and filter typhoon tracks for one scan (never raises)."""
+    try:
+        payload = _load_typhoon_payload(getattr(config, "typhoon_data_source", TYPHOON_DATA_SOURCE), project_dir)
+        if payload is None:
+            return []
+        tracks = parse_typhoon_tracks(payload)
+        return active_typhoon_tracks(tracks, scan_time)
+    except Exception as exc:  # noqa: BLE001 - overlay must never break a render
+        LOG.warning("Typhoon track overlay skipped (%s).", exc)
+        return []
+
+
+def _typhoon_marker_radius(label_size: int) -> float:
+    return max(4.0, float(label_size) * 0.55)
+
+
+def draw_typhoon_track(
+    draw,
+    area: AreaDefinition,
+    track: TyphoonTrack,
+    current_index: int,
+    font,
+    label_color: tuple[int, int, int],
+    label_size: int,
+) -> None:
+    """Draw one storm's past track, forecast track, current marker and label."""
+    projected: list[tuple[int, tuple[float, float]]] = []
+    for idx, point in enumerate(track.points):
+        pixel = lonlat_to_area_pixel(area, point.lon, point.lat)
+        if pixel is not None:
+            projected.append((idx, pixel))
+    if not projected:
+        return
+
+    halo = (0, 0, 0, 190)
+    past_line = (*label_color, 235)
+    forecast_line = (*label_color, 170)
+
+    def segments(kind: str) -> list[list[tuple[float, float]]]:
+        runs: list[list[tuple[float, float]]] = []
+        current: list[tuple[float, float]] = []
+        for idx, pixel in projected:
+            is_forecast = track.points[idx].forecast
+            include = (kind == "forecast") if is_forecast else (kind == "past")
+            # The current fix joins BOTH the past and forecast polylines so the
+            # track reads as one continuous line through the marker.
+            if idx == current_index:
+                include = True
+            if include:
+                current.append(pixel)
+            elif current:
+                runs.append(current)
+                current = []
+        if current:
+            runs.append(current)
+        return runs
+
+    line_width = max(1, int(round(label_size / 8.0)))
+    for run in segments("past"):
+        if len(run) >= 2:
+            draw.line(run, fill=past_line, width=line_width, joint="curve")
+    for run in segments("forecast"):
+        if len(run) < 2:
+            continue
+        # Manual dashed polyline for the forecast leg.
+        for start, end in zip(run[:-1], run[1:]):
+            _draw_dashed_segment(draw, start, end, forecast_line, line_width)
+
+    # Past observation dots.
+    dot_r = max(1.5, line_width * 1.3)
+    for idx, (px, py) in projected:
+        if idx == current_index:
+            continue
+        if track.points[idx].forecast:
+            draw.ellipse((px - dot_r, py - dot_r, px + dot_r, py + dot_r), outline=forecast_line, width=1)
+        else:
+            draw.ellipse((px - dot_r, py - dot_r, px + dot_r, py + dot_r), fill=past_line)
+
+    current_pixel = next((pixel for idx, pixel in projected if idx == current_index), None)
+    if current_pixel is None:
+        current_pixel = projected[-1][1]
+    cx, cy = current_pixel
+    current_point = track.points[current_index]
+    marker_color = typhoon_intensity_color(current_point.wind_kt, current_point.category)
+    radius = _typhoon_marker_radius(label_size)
+    # A filled disk with a bright ring reads as a cyclone marker at any size.
+    draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), fill=(*marker_color, 235), outline=halo, width=1)
+    ring = radius * 1.7
+    draw.ellipse((cx - ring, cy - ring, cx + ring, cy + ring), outline=(*marker_color, 205), width=max(1, line_width))
+
+    label_bits = [track.name.upper()]
+    if current_point.category:
+        label_bits.append(str(current_point.category))
+    elif current_point.wind_kt:
+        label_bits.append(f"{int(round(current_point.wind_kt))} kt")
+    label = "  ".join(label_bits)
+    offset = ring + max(4.0, label_size * 0.4)
+    draw_text_with_halo(
+        draw,
+        (cx, cy - offset),
+        label,
+        font,
+        (*label_color, 240),
+        halo=halo,
+        halo_width=max(1, int(round(label_size / 7.0))),
+    )
+
+
+def _draw_dashed_segment(draw, start, end, fill, width, dash: float = 9.0, gap: float = 6.0) -> None:
+    x0, y0 = start
+    x1, y1 = end
+    length = math.hypot(x1 - x0, y1 - y0)
+    if length <= 0:
+        return
+    ux, uy = (x1 - x0) / length, (y1 - y0) / length
+    position = 0.0
+    while position < length:
+        seg_end = min(position + dash, length)
+        draw.line(
+            [(x0 + ux * position, y0 + uy * position), (x0 + ux * seg_end, y0 + uy * seg_end)],
+            fill=fill,
+            width=width,
+        )
+        position += dash + gap
+
+
+def draw_typhoon_tracks(
+    image,
+    area: AreaDefinition,
+    config: ProcessorConfig,
+    scan_time: datetime,
+    project_dir: Path = PROJECT_DIR,
+    active: list[tuple[TyphoonTrack, int]] | None = None,
+) -> int:
+    """Draw all active storms onto ``image``; return how many were drawn.
+
+    Safe to call unconditionally: it loads its own data, does nothing when the
+    feature is disabled or no storm is near the scan time, and never raises.
+    """
+    from PIL import ImageDraw
+
+    if not getattr(config, "add_typhoon_tracks", False):
+        return 0
+    if active is None:
+        active = load_typhoon_tracks_for_scan(config, scan_time, project_dir)
+    if not active:
+        return 0
+    try:
+        label_color = parse_rgb_color(getattr(config, "typhoon_track_color", TYPHOON_TRACK_COLOR))
+    except ValueError:
+        label_color = parse_rgb_color(TYPHOON_TRACK_COLOR)
+    try:
+        label_size = validated_map_label_size(config.map_label_size)
+    except ValueError:
+        label_size = MAP_LABEL_SIZE
+    font = map_label_font(label_size)
+    draw = ImageDraw.Draw(image, "RGBA")
+    drawn = 0
+    for track, current_index in active:
+        try:
+            draw_typhoon_track(draw, area, track, current_index, font, label_color, label_size)
+            drawn += 1
+        except Exception as exc:  # noqa: BLE001 - one bad track must not abort the rest
+            LOG.warning("Could not draw typhoon track %s: %s", track.name, exc)
+    if drawn:
+        LOG.info("Drew %d typhoon track(s) on the map.", drawn)
+    return drawn
 
 
 def solar_declination_and_subsolar_lon(scan_time: datetime) -> tuple[float, float]:
@@ -4970,6 +5504,16 @@ def apply_flat_map_style_to_image(
                 cleanup_true_color_chroma_speckles(working, aggressive=True)
         if is_zoom_true_color:
             composite_flat_map_basemap(working, area, valid_mask)
+    elif is_true_color and is_enhanced_satellite_layer(config):
+        # Native (round-disk) output is normally the raw True Color Reproduction
+        # product. The multi-style batch can now request the "live"/"hd" layer on
+        # a native disk; give those the same HD tone the flat HD layer uses so the
+        # standard-vs-hd native disks are visibly different. Standard native output
+        # is untouched (this branch only runs for the enhanced layers, which could
+        # not previously be paired with a native projection).
+        working = apply_zoom_earth_true_color_enhancement(working, hd=True)
+        working = finish_zoom_earth_true_color_quality(working, hd=True)
+        cleanup_true_color_chroma_speckles(working, aggressive=True)
     try:
         direct_overlay_to_image(
             working,
@@ -4992,6 +5536,11 @@ def apply_flat_map_style_to_image(
         except Exception:
             label_color = None
         draw_zoom_earth_labels(working, area, config.map_label_size, label_color=label_color)
+    if getattr(config, "add_typhoon_tracks", False):
+        try:
+            draw_typhoon_tracks(working, area, config, scan_time)
+        except Exception as exc:  # noqa: BLE001 - overlay must not break a render
+            LOG.warning("Typhoon track overlay failed (%s). Continuing without it.", exc)
     if config.add_crosshair:
         draw_crosshair(
             working,
@@ -6883,6 +7432,11 @@ def validate_configuration(config: ProcessorConfig | None = None) -> None:
             parse_rgb_color(getattr(config, "night_boundary_color", NIGHT_BOUNDARY_COLOR))
         except ValueError as exc:
             raise ValueError("Night boundary color must be a name, #RRGGBB, or R,G,B values.") from exc
+    if getattr(config, "add_typhoon_tracks", False):
+        try:
+            parse_rgb_color(getattr(config, "typhoon_track_color", TYPHOON_TRACK_COLOR))
+        except ValueError as exc:
+            raise ValueError("Typhoon track color must be a name, #RRGGBB, or R,G,B values.") from exc
     theme = getattr(config, "overlay_theme", OVERLAY_THEME)
     if theme not in OVERLAY_THEME_ORDER:
         raise ValueError(f"Overlay theme must be one of: {', '.join(OVERLAY_THEME_ORDER)}.")
@@ -7854,33 +8408,54 @@ class SetupStatus:
 
 
 # ---------------------------------------------------------------------------
-# "3 True Color styles" batch: render the True Color Reproduction product in the
-# three map styles (native round disk, standard flat map, Zoom Earth-style flat
-# map) from a single click / command / menu choice. Each style gets a distinct
-# filename suffix so the three outputs never overwrite one another.
+# "9 True Color styles" batch: render the True Color Reproduction product for
+# every combination of the three satellite layers (standard, live, HD - the same
+# layers Zoom Earth exposes) and the three map styles (native round disk,
+# standard flat map, Zoom Earth-style flat map) from a single click / command /
+# menu choice. Each of the nine cells gets a distinct filename suffix
+# (``<layer>_<style>``) so the outputs never overwrite one another.
 # ---------------------------------------------------------------------------
 TRUE_COLOR_REPRODUCTION_PRODUCT = "True Color Reproduction Image"
-TRUE_COLOR_STYLE_SET: tuple[tuple[str, str, dict[str, object]], ...] = (
+# The three map projections/looks. Suffixes stay stable for downstream tooling.
+TRUE_COLOR_MAP_STYLES: tuple[tuple[str, str, dict[str, object]], ...] = (
     ("Native (round disk)", "native", {"map_view": "native", "zoom_earth_style": False}),
-    ("Flat map (standard)", "flat_standard", {"map_view": "flat", "zoom_earth_style": False}),
-    ("Flat map (Zoom Earth style)", "flat_zoomearth", {"map_view": "flat", "zoom_earth_style": True}),
+    ("Flat map", "flat", {"map_view": "flat", "zoom_earth_style": False}),
+    ("Zoom Earth flat", "zoomearth", {"map_view": "flat", "zoom_earth_style": True}),
+)
+# The three satellite layers. "live" resolves the latest scan; "live"/"hd" apply
+# the HD true-color enhancement (see is_enhanced_satellite_layer).
+TRUE_COLOR_SATELLITE_LAYERS: tuple[tuple[str, str, dict[str, object]], ...] = (
+    ("Standard", "standard", {"satellite_layer_mode": "standard"}),
+    ("Live", "live", {"satellite_layer_mode": "live"}),
+    ("HD", "hd", {"satellite_layer_mode": "hd"}),
+)
+# Full 9-cell matrix, ordered layer-major so the three styles of each layer stay
+# together. Kept under the historical name so existing callers still work.
+TRUE_COLOR_STYLE_SET: tuple[tuple[str, str, dict[str, object]], ...] = tuple(
+    (
+        f"{layer_label} - {style_label}",
+        f"{layer_suffix}_{style_suffix}",
+        {**layer_overrides, **style_overrides},
+    )
+    for layer_label, layer_suffix, layer_overrides in TRUE_COLOR_SATELLITE_LAYERS
+    for style_label, style_suffix, style_overrides in TRUE_COLOR_MAP_STYLES
 )
 
 
 def true_color_style_base_config(config: ProcessorConfig | None = None) -> ProcessorConfig:
-    """Shared base config for the 3-style true-color set.
+    """Shared base config for the 9-style true-color set.
 
-    Forces the product to True Color Reproduction, a single image, and the
-    standard satellite layer so each style's own map_view / zoom_earth_style
-    overrides are honored (the live/hd layers would otherwise force their own
-    flat + zoom look).
+    Forces the product to True Color Reproduction and a single image, and turns
+    off the satellite-layer style presets so each cell keeps its own map_view /
+    zoom_earth_style while still getting the layer's enhancement + live data
+    source. Each cell sets its own satellite_layer_mode.
     """
     base = config or default_config()
     return replace(
         base,
         composite_choice=TRUE_COLOR_REPRODUCTION_PRODUCT,
-        satellite_layer_mode="standard",
         mode="Single Image",
+        layer_style_presets=False,
     )
 
 
@@ -7889,12 +8464,13 @@ def run_true_color_style_set(
     progress: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
 ) -> list[Path]:
-    """Render True Color Reproduction in all three map styles; return every path.
+    """Render True Color Reproduction across all nine layer/style cells.
 
-    Styles: native (round disk), standard flat map, and Zoom Earth-style flat
-    map. Each render reuses the full low-RAM pipeline via ``run``, and a distinct
-    filename suffix per style keeps the three outputs separate. Cancellation is
-    checked between styles and is also honored inside each render.
+    Cells: the three satellite layers (standard, live, HD) each rendered in the
+    three map styles (native round disk, standard flat map, Zoom Earth-style flat
+    map). Each render reuses the full low-RAM pipeline via ``run``, and a distinct
+    ``<layer>_<style>`` filename suffix keeps every output separate. Cancellation
+    is checked between cells and is also honored inside each render.
     """
     base = true_color_style_base_config(config)
     total = len(TRUE_COLOR_STYLE_SET)
@@ -8800,6 +9376,9 @@ class HimawariProcessorApp:
         self.overlay_theme_var = tk.StringVar(value=initial_config.overlay_theme)
         self.map_label_color_var = tk.StringVar(value=initial_config.map_label_color)
         self.night_boundary_color_var = tk.StringVar(value=initial_config.night_boundary_color)
+        self.typhoon_tracks_var = tk.BooleanVar(value=initial_config.add_typhoon_tracks)
+        self.typhoon_color_var = tk.StringVar(value=initial_config.typhoon_track_color)
+        self.typhoon_source_var = tk.StringVar(value=initial_config.typhoon_data_source)
         self.status_var = tk.StringVar(value="Ready")
         self.progress_var = tk.DoubleVar(value=0)
         self.setup_status_var = tk.StringVar(value="")
@@ -9200,6 +9779,28 @@ class HimawariProcessorApp:
             text="Write a metadata sidecar (.json + world file) next to each image",
             variable=self.write_sidecar_var,
         ).grid(row=15, column=0, columnspan=2, sticky="w", pady=(2, 2))
+        ttk.Separator(options_frame, orient="horizontal").grid(
+            row=16, column=0, columnspan=2, sticky="ew", pady=(8, 6)
+        )
+        ttk.Checkbutton(
+            options_frame,
+            text="Typhoon tracks (draw storm track + forecast when data is available)",
+            variable=self.typhoon_tracks_var,
+        ).grid(row=17, column=0, columnspan=2, sticky="w", pady=(2, 2))
+        ttk.Label(options_frame, text="Typhoon Color").grid(row=18, column=0, sticky="w", pady=(2, 4))
+        typhoon_color_row = ttk.Frame(options_frame)
+        typhoon_color_row.grid(row=19, column=0, sticky="ew", pady=(0, 4))
+        typhoon_color_row.columnconfigure(0, weight=1)
+        ttk.Entry(typhoon_color_row, textvariable=self.typhoon_color_var, width=14).grid(row=0, column=0, sticky="ew")
+        ttk.Button(
+            typhoon_color_row,
+            text="Pick",
+            command=lambda: self._choose_color(self.typhoon_color_var, "Typhoon track color", TYPHOON_TRACK_COLOR),
+        ).grid(row=0, column=1, padx=(8, 0))
+        ttk.Label(options_frame, text="Typhoon Data").grid(row=18, column=1, sticky="w", padx=(0, 8), pady=(2, 4))
+        ttk.Entry(options_frame, textvariable=self.typhoon_source_var, width=22).grid(
+            row=19, column=1, sticky="ew", pady=(0, 4)
+        )
 
         simple_frame = ttk.LabelFrame(settings, text="Simple View", style="Section.TLabelframe")
         simple_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
@@ -9492,7 +10093,7 @@ class HimawariProcessorApp:
         self.test_host_button = ttk.Button(buttons, text="Test Data Host", command=self._start_connectivity_check)
         self.test_host_button.grid(row=2, column=2, padx=(0, 8), pady=(8, 0))
         self.true_color_set_button = ttk.Button(
-            buttons, text="3 TC Styles", command=self._start_true_color_set
+            buttons, text="9 TC Styles", command=self._start_true_color_set
         )
         self.true_color_set_button.grid(row=2, column=3, padx=(0, 8), pady=(8, 0))
         self._install_tooltips()
@@ -10005,6 +10606,9 @@ class HimawariProcessorApp:
         self.overlay_theme_var.set(config.overlay_theme)
         self.map_label_color_var.set(config.map_label_color)
         self.night_boundary_color_var.set(config.night_boundary_color)
+        self.typhoon_tracks_var.set(config.add_typhoon_tracks)
+        self.typhoon_color_var.set(config.typhoon_track_color)
+        self.typhoon_source_var.set(config.typhoon_data_source)
         self._refresh_mode_state()
         self._update_setup_status()
 
@@ -10123,7 +10727,7 @@ class HimawariProcessorApp:
             "preview_button": "Quick Look: render a fast, coarse flat-map preview so you can check framing and colour before a full run. It does not change your settings.",
             "pick_region_button": "Pick Region: open a clickable mini-map and drag a box to set the flat-map crop instead of typing latitude and longitude.",
             "test_host_button": "Test Data Host: check whether the satellite data server is reachable (DNS and a quick HTTP request). Use this to tell a failed run apart from a network problem.",
-            "true_color_set_button": "3 TC Styles: render the True Color Reproduction product three times in one go - native (round disk), standard flat map, and Zoom Earth-style flat map. Each image is saved with its style in the filename.",
+            "true_color_set_button": "9 TC Styles: render the True Color Reproduction product nine times in one go - the standard, live and HD satellite layers, each as a native round disk, a standard flat map, and a Zoom Earth-style flat map. Each image is saved with its layer + style in the filename; live layers use the latest scan.",
             "area_preset_box": "Output Region: pick a region to frame the image. Regional presets and 'Full Disk (flat map)' switch to the flat map and fill the bounds; 'Full Disk (native)' uses the round-Earth view.",
             "satellite_layer_box": "Satellite Layer: 'standard' is normal; 'live' grabs the latest scan; 'hd' applies stronger enhancement. live/hd also turn on flat-map true-color styling.",
             "map_view_box": "Map View: 'native' is the round full-disk Earth; 'flat' is a rectangular Web Mercator map you can crop with the bounds.",
@@ -10799,6 +11403,9 @@ class HimawariProcessorApp:
             overlay_theme=self.overlay_theme_var.get(),
             map_label_color=self.map_label_color_var.get(),
             night_boundary_color=self.night_boundary_color_var.get(),
+            add_typhoon_tracks=self.typhoon_tracks_var.get(),
+            typhoon_track_color=self.typhoon_color_var.get(),
+            typhoon_data_source=self.typhoon_source_var.get().strip() or TYPHOON_DATA_SOURCE,
         )
 
     def _start(self) -> None:
@@ -10880,12 +11487,14 @@ class HimawariProcessorApp:
             self.messages.put(("error", str(exc)))
 
     def _start_true_color_set(self) -> None:
-        """Render the True Color Reproduction product in all three map styles
-        (native round disk, standard flat map, Zoom Earth-style flat map) from
-        the current settings, in one batch."""
+        """Render True Color Reproduction across all nine layer/style cells
+        (standard/live/HD satellite layers x native/flat/Zoom Earth map styles)
+        from the current settings, in one batch."""
+        count = len(TRUE_COLOR_STYLE_SET)
+        title = f"{count} True Color styles"
         if self.is_running:
             messagebox.showinfo(
-                "3 True Color styles",
+                title,
                 "A run is already in progress. Wait for it to finish first.",
             )
             return
@@ -10896,24 +11505,26 @@ class HimawariProcessorApp:
             if not setup_status.ok:
                 raise ValueError("\n".join(setup_status.errors))
         except Exception as exc:
-            self._append_log(f"Cannot start 3 True Color styles: {exc}")
-            messagebox.showerror("3 True Color styles", str(exc))
+            self._append_log(f"Cannot start {title}: {exc}")
+            messagebox.showerror(title, str(exc))
             return
 
         style_names = "\n".join(f"  - {label}" for label, _suffix, _overrides in TRUE_COLOR_STYLE_SET)
         if not messagebox.askokcancel(
-            "3 True Color styles",
-            "This renders the True Color Reproduction product three times, once "
-            "per map style:\n\n"
+            title,
+            f"This renders the True Color Reproduction product {count} times - the "
+            "standard, live and HD satellite layers, each in the native, flat and "
+            "Zoom Earth-style map views:\n\n"
             f"{style_names}\n\n"
-            "Each image is saved with its style in the filename. Start now?",
+            "Each image is saved with its layer + style in the filename. Live "
+            "layers use the latest available scan. Start now?",
         ):
-            self._append_log("3 True Color styles canceled before processing.")
+            self._append_log(f"{title} canceled before processing.")
             return
 
         self.progress_var.set(0)
         self.status_var.set("Starting")
-        self.phase_var.set("3 True Color styles")
+        self.phase_var.set(title)
         self.progress_eta_estimator.reset()
         self.cancel_event.clear()
         self._set_running(True)
@@ -10922,7 +11533,7 @@ class HimawariProcessorApp:
         self.run_started_at_utc = utc_timestamp()
         self._write_current_settings()
         self._append_log(
-            "Starting 3 True Color styles (native, standard flat, Zoom Earth-style flat)."
+            f"Starting {title} (standard/live/HD x native/flat/Zoom Earth)."
         )
 
         self.worker = threading.Thread(
@@ -10943,7 +11554,7 @@ class HimawariProcessorApp:
             LOG.info("%s", exc)
             self.messages.put(("canceled", str(exc)))
         except Exception as exc:
-            LOG.exception("3 True Color styles failed")
+            LOG.exception("True Color styles batch failed")
             self.messages.put(("error", str(exc)))
 
     def _poll_messages(self) -> None:
