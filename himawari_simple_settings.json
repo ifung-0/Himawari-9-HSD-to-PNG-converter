@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "app_version": "2026.06.17.08",
+  "app_version": "2026.07.04.01",
   "config": {
     "user_url": "https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/2024/07/25/0400/HS_H09_20240725_0400_B01_FLDK_R10_S0110.DAT.bz2",
     "mode": "Single Image",
@@ -36,6 +36,7 @@
     "flat_min_lon": 80.0,
     "flat_max_lon": 200.0,
     "flat_resolution_deg": 0.05,
+    "output_quality": "Standard",
     "max_safe_png_pixels": 41000000,
     "ram_limit_gb": 4.0,
     "dask_chunk_size": "32MiB",
@@ -44,6 +45,10 @@
     "write_metadata_sidecar": false,
     "overlay_theme": "Custom (keep my colors)",
     "map_label_color": "#ebeef2",
-    "night_boundary_color": "#91b4d7"
+    "night_boundary_color": "#91b4d7",
+    "layer_style_presets": true,
+    "add_typhoon_tracks": false,
+    "typhoon_track_color": "#ff3b3b",
+    "typhoon_data_source": "auto"
   }
 }

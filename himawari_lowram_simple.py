@@ -143,7 +143,10 @@ def _simple_default_config() -> ProcessorConfig:
     cfg = h.replace(cfg, satellite_layer_mode="standard")
     cfg = h.replace(cfg, auto_download=True)
     cfg = h.replace(cfg, write_metadata_sidecar=False)
-    cfg = h.replace(cfg, map_view="flat")
+    # Default to the native round full-disk satellite image (the original
+    # geostationary disk). The flat map is still selectable via the Map style
+    # radio in the Options frame.
+    cfg = h.replace(cfg, map_view="native")
     cfg = h.replace(cfg, zoom_earth_style=False)
     return cfg
 
@@ -239,6 +242,13 @@ class HimawariSimpleApp(h.HimawariProcessorApp):
         # chooser always defaulted to "native" even when "zoom" had been saved).
         config = _load_simple_settings()
         self._initial_zoom = bool(getattr(config, "zoom_earth_style", False))
+        # Track whether the saved map view was the native round full-disk image
+        # so _build_setup_tab can preselect the right Map style radio. The
+        # simple GUI used to force map_view="flat" and only looked at
+        # zoom_earth_style; now that native is exposed we need both signals.
+        self._initial_native = (
+            h.normalized_map_view(getattr(config, "map_view", "native")) == "native"
+        )
         # The simple GUI uses the safe default output/temp folders, so return
         # None for both to keep the module defaults.
         return config, None, None
@@ -303,9 +313,14 @@ class HimawariSimpleApp(h.HimawariProcessorApp):
         except Exception:
             max_png = h.MAX_SAFE_PNG_PIXELS
 
-        # Map style chooser: "native" = plain flat map, "zoom" = zoom-earth style.
+        # Map style chooser:
+        # - "disk"      -> native round full-disk (map_view="native", zoom_earth_style=False)
+        # - "flat"      -> standard flat map (map_view="flat", zoom_earth_style=False)
+        # - "zoom"      -> Zoom Earth-style flat map (map_view="flat", zoom_earth_style=True)
+        # zoom_earth_style=True is rejected by the processor when map_view="native",
+        # so we force it False for the "disk" case.
         map_style = self._map_style_var.get()
-        map_view = "flat"
+        map_view = "native" if map_style == "disk" else "flat"
         zoom_earth = map_style == "zoom"
 
         config = ProcessorConfig(
@@ -452,24 +467,43 @@ class HimawariSimpleApp(h.HimawariProcessorApp):
         options_frame = ttk.LabelFrame(parent, text="Options")
         options_frame.pack(fill="x", padx=8, pady=4)
 
-        # Map style: native flat map vs zoom earth style flat map.
-        self._map_style_var = tk.StringVar(value="native")
-        # If loaded settings had zoom_earth_style on, reflect it.
-        if getattr(self, "_initial_zoom", False):
+        # Map style: native round disk (original full-disk satellite image),
+        # standard flat map, or Zoom Earth-style flat map. The radio value
+        # "disk" maps to map_view="native" + zoom_earth_style=False; "flat" and
+        # "zoom" both use map_view="flat" and differ only in zoom_earth_style.
+        # (zoom_earth_style=True is rejected by the processor for native view,
+        # so "disk" always forces zoom_earth_style=False — see _read_config.)
+        self._map_style_var = tk.StringVar(value="disk")
+        # Reflect loaded settings: native disk wins over zoom styling (the two
+        # are mutually exclusive in a valid config).
+        if getattr(self, "_initial_native", False):
+            self._map_style_var.set("disk")
+        elif getattr(self, "_initial_zoom", False):
             self._map_style_var.set("zoom")
+        else:
+            self._map_style_var.set("flat")
         ttk.Label(options_frame, text="Map style:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
         ttk.Radiobutton(
             options_frame,
-            text="Native flat map",
+            text="Native round disk",
             variable=self._map_style_var,
-            value="native",
+            value="disk",
+            command=self._refresh_map_style_state,
         ).grid(row=0, column=1, padx=4, pady=4, sticky="w")
+        ttk.Radiobutton(
+            options_frame,
+            text="Standard flat map",
+            variable=self._map_style_var,
+            value="flat",
+            command=self._refresh_map_style_state,
+        ).grid(row=0, column=2, padx=4, pady=4, sticky="w")
         ttk.Radiobutton(
             options_frame,
             text="Zoom Earth style flat map",
             variable=self._map_style_var,
             value="zoom",
-        ).grid(row=0, column=2, padx=4, pady=4, sticky="w")
+            command=self._refresh_map_style_state,
+        ).grid(row=0, column=3, padx=4, pady=4, sticky="w")
 
         # Labels + colour chooser.
         ttk.Checkbutton(options_frame, text="Labels", variable=self.map_labels_var).grid(
@@ -503,8 +537,11 @@ class HimawariSimpleApp(h.HimawariProcessorApp):
         ).grid(row=2, column=5, padx=4, pady=4, sticky="w")
 
         # Output quality (flat-map resolution): higher = higher resolution.
+        # Kept as an attribute so _refresh_map_style_state can disable it when
+        # the native round disk view is selected (quality only affects the flat
+        # map's resolution, never the native disk).
         ttk.Label(options_frame, text="Output quality:").grid(row=3, column=0, sticky="w", padx=4, pady=4)
-        ttk.Combobox(
+        self.output_quality_combo = ttk.Combobox(
             options_frame,
             textvariable=self.output_quality_var,
             # Only the named levels: the simple GUI has no manual deg/px field, so
@@ -512,7 +549,8 @@ class HimawariSimpleApp(h.HimawariProcessorApp):
             values=[name for name, _deg in h.OUTPUT_QUALITY_LEVELS],
             state="readonly",
             width=16,
-        ).grid(row=3, column=1, columnspan=2, padx=4, pady=4, sticky="w")
+        )
+        self.output_quality_combo.grid(row=3, column=1, columnspan=2, padx=4, pady=4, sticky="w")
         ttk.Label(
             options_frame,
             text="Higher = higher resolution (larger, slower).",
@@ -533,19 +571,31 @@ class HimawariSimpleApp(h.HimawariProcessorApp):
         ).grid(row=3, column=3, padx=4, pady=4)
 
         # Flat-map region (kept simple: just the four bound fields + Pick Region).
+        # The entries and button are kept as attributes so
+        # _refresh_map_style_state can disable them for the native round disk
+        # view (region bounds only apply to the flat map).
         region_frame = ttk.LabelFrame(parent, text="Flat-map region (latitude / longitude bounds)")
         region_frame.pack(fill="x", padx=8, pady=4)
         ttk.Label(region_frame, text="Min lat:").grid(row=0, column=0, padx=4, pady=4)
-        ttk.Entry(region_frame, textvariable=self.flat_min_lat_var, width=8).grid(row=0, column=1, padx=4, pady=4)
+        self.flat_min_lat_entry = ttk.Entry(region_frame, textvariable=self.flat_min_lat_var, width=8)
+        self.flat_min_lat_entry.grid(row=0, column=1, padx=4, pady=4)
         ttk.Label(region_frame, text="Max lat:").grid(row=0, column=2, padx=4, pady=4)
-        ttk.Entry(region_frame, textvariable=self.flat_max_lat_var, width=8).grid(row=0, column=3, padx=4, pady=4)
+        self.flat_max_lat_entry = ttk.Entry(region_frame, textvariable=self.flat_max_lat_var, width=8)
+        self.flat_max_lat_entry.grid(row=0, column=3, padx=4, pady=4)
         ttk.Label(region_frame, text="Min lon:").grid(row=0, column=4, padx=4, pady=4)
-        ttk.Entry(region_frame, textvariable=self.flat_min_lon_var, width=8).grid(row=0, column=5, padx=4, pady=4)
+        self.flat_min_lon_entry = ttk.Entry(region_frame, textvariable=self.flat_min_lon_var, width=8)
+        self.flat_min_lon_entry.grid(row=0, column=5, padx=4, pady=4)
         ttk.Label(region_frame, text="Max lon:").grid(row=0, column=6, padx=4, pady=4)
-        ttk.Entry(region_frame, textvariable=self.flat_max_lon_var, width=8).grid(row=0, column=7, padx=4, pady=4)
-        ttk.Button(region_frame, text="Pick Region (map)", command=self._open_region_picker).grid(
-            row=0, column=8, padx=4, pady=4
+        self.flat_max_lon_entry = ttk.Entry(region_frame, textvariable=self.flat_max_lon_var, width=8)
+        self.flat_max_lon_entry.grid(row=0, column=7, padx=4, pady=4)
+        self.region_pick_button = ttk.Button(
+            region_frame, text="Pick Region (map)", command=self._open_region_picker
         )
+        self.region_pick_button.grid(row=0, column=8, padx=4, pady=4)
+
+        # Apply the initial enabled/disabled state for the flat-map-only controls
+        # based on the preselected Map style (native disk disables them).
+        self._refresh_map_style_state()
 
         # Setup status (Start/Stop live in the bottom button bar).
         status_frame = ttk.LabelFrame(parent, text="Status")
@@ -553,6 +603,32 @@ class HimawariSimpleApp(h.HimawariProcessorApp):
         ttk.Label(status_frame, textvariable=self.setup_status_var, wraplength=900, justify="left").pack(
             anchor="w", padx=8, pady=4
         )
+
+    # ---- map style state refresh -----------------------------------------------
+    def _refresh_map_style_state(self) -> None:
+        """Enable/disable flat-map-only controls based on Map style radio.
+
+        The native round disk view ignores region bounds, output quality, and
+        the Pick Region button, so we disable those widgets when 'disk' is
+        selected. For 'flat' or 'zoom' (both flat map), we re-enable them.
+        """
+        is_disk = self._map_style_var.get() == "disk"
+        state = "disabled" if is_disk else "normal"
+        # Region entries
+        for entry in (
+            self.flat_min_lat_entry,
+            self.flat_max_lat_entry,
+            self.flat_min_lon_entry,
+            self.flat_max_lon_entry,
+        ):
+            entry.configure(state=state)
+        # Output quality combobox
+        self.output_quality_combo.configure(state=state)
+        # In-tab Pick Region button
+        self.region_pick_button.configure(state=state)
+        # Bottom-bar Pick Region button (created in _build_bottom_buttons)
+        if hasattr(self, "pick_region_button"):
+            self.pick_region_button.configure(state=state)
 
     # ---- Advanced tab: performance only -------------------------------------
     def _build_advanced_tab(self, parent: ttk.Frame) -> None:
