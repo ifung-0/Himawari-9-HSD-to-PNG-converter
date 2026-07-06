@@ -195,7 +195,7 @@ def cycle_choice(choices: list[str], current: Any, direction: int) -> Any:
 def build_screens(processor: Any) -> list[tuple[str, list[Field]]]:
     """Build the grouped settings screens using the engine's live choice lists."""
     composites = sorted(processor.COMPOSITE_BANDS.keys())
-    layer_modes = list(processor.SATELLITE_LAYER_MODES)
+    quality_levels = list(processor.output_quality_names())
     chunk_choices = list(processor.DASK_CHUNK_CHOICES)
     crosshair_types = list(processor.CROSSHAIR_TYPES)
     overlay_themes = list(processor.OVERLAY_THEMES.keys())
@@ -209,8 +209,6 @@ def build_screens(processor: Any) -> list[tuple[str, list[Field]]]:
             Field("user_url", "Source URL", "text", help="NOAA AWS Himawari AHI folder URL (blank = latest)."),
             Field("mode", "Mode", "choice", ["Single Image", "Timelapse"]),
             Field("composite_choice", "Product / band", "choice", composites),
-            Field("satellite_layer_mode", "Satellite layer", "choice", layer_modes,
-                  help="standard, live (latest scan), or hd (Zoom Earth style)."),
             Field("hours_back", "Timelapse hours back", "int"),
             Field("interval_minutes", "Timelapse interval (min)", "int"),
             Field("fps", "Timelapse fps", "int"),
@@ -229,7 +227,10 @@ def build_screens(processor: Any) -> list[tuple[str, list[Field]]]:
             Field("flat_max_lat", "Flat map max latitude", "float"),
             Field("flat_min_lon", "Flat map min longitude", "float"),
             Field("flat_max_lon", "Flat map max longitude", "float"),
-            Field("flat_resolution_deg", "Flat map resolution (deg/px)", "float"),
+            Field("output_quality", "Output quality", "choice", quality_levels,
+                  help="Higher = higher resolution flat maps. Sets deg/px; native is always full res."),
+            Field("flat_resolution_deg", "Flat map resolution (deg/px)", "float",
+                  help="Advanced: set directly. Editing this switches quality to Custom."),
             Field("add_border_lines", "Coastlines & borders", "bool"),
             Field("border_line_color", "Border colour", "text"),
             Field("border_line_width", "Border width", "float"),
@@ -346,8 +347,8 @@ def run_processing(state: TuiState) -> None:
 
 
 def run_true_color_styles(state: TuiState) -> None:
-    """Render True Color Reproduction across all nine layer/style cells
-    (standard/live/HD satellite layers x native/flat/Zoom Earth map styles)."""
+    """Render True Color Reproduction across all three map-style cells
+    (native round disk / standard flat map / Zoom Earth-style flat map)."""
     processor = state.processor
     state.apply_output_temp()
     try:
@@ -369,8 +370,8 @@ def run_true_color_styles(state: TuiState) -> None:
 
     print(
         f"Rendering True Color Reproduction in {len(processor.TRUE_COLOR_STYLE_SET)} "
-        "cells: standard/live/HD satellite layers, each as native / flat / Zoom "
-        "Earth-style.\nPress Ctrl+C to cancel.\n"
+        "cells: native round disk, standard flat map, and Zoom Earth-style flat "
+        "map.\nPress Ctrl+C to cancel.\n"
     )
     try:
         outputs = processor.run_true_color_style_set(config, progress=progress)
@@ -689,6 +690,37 @@ def _pick_choice(stdscr: Any, field: Field, current: Any) -> Any:
     return field.choices[index]
 
 
+def _reconcile_output_quality(state: "TuiState", attr: str) -> None:
+    """Keep output_quality and flat_resolution_deg in sync after an edit.
+
+    Choosing a quality level fills the resolution; editing the resolution by hand
+    switches the quality label to "Custom". Higher quality == higher resolution.
+    A chosen quality is coarsened if the current region would exceed the safe
+    flat-map pixel budget, so it stays runnable.
+    """
+    proc = state.processor
+    if attr == "output_quality":
+        deg = proc.output_quality_resolution_deg(state.values.get("output_quality"))
+        if deg is not None:
+            if proc.normalized_map_view(state.values.get("map_view", proc.MAP_VIEW)) == "flat":
+                try:
+                    deg, _adjusted = proc.flat_resolution_for_budget(
+                        float(state.values.get("flat_min_lat", proc.FLAT_MIN_LAT)),
+                        float(state.values.get("flat_max_lat", proc.FLAT_MAX_LAT)),
+                        float(state.values.get("flat_min_lon", proc.FLAT_MIN_LON)),
+                        float(state.values.get("flat_max_lon", proc.FLAT_MAX_LON)),
+                        deg,
+                    )
+                except Exception:
+                    pass
+            state.values["flat_resolution_deg"] = deg
+            state.values["output_quality"] = proc.output_quality_for_resolution(deg)
+    elif attr == "flat_resolution_deg":
+        state.values["output_quality"] = proc.output_quality_for_resolution(
+            state.values.get("flat_resolution_deg")
+        )
+
+
 def _edit_field(stdscr: Any, state: TuiState, field: Field) -> str:
     """Edit one field in place. Returns a short status message."""
     current = state.values.get(field.attr)
@@ -702,6 +734,7 @@ def _edit_field(stdscr: Any, state: TuiState, field: Field) -> str:
         if chosen != current:
             state.values[field.attr] = chosen
             state.dirty = True
+            _reconcile_output_quality(state, field.attr)
         return f"{field.label}: {chosen}"
     # text / int / float
     raw = _prompt_line(stdscr, f"{field.label} = ", "" if current is None else str(current))
@@ -712,6 +745,7 @@ def _edit_field(stdscr: Any, state: TuiState, field: Field) -> str:
         return error
     state.values[field.attr] = value
     state.dirty = True
+    _reconcile_output_quality(state, field.attr)
     return f"{field.label}: {format_value(field.kind, value)}"
 
 
@@ -790,6 +824,7 @@ def _settings_screen(stdscr: Any, state: TuiState, title: str, fields: list[Fiel
                 direction = 1 if key == curses.KEY_RIGHT else -1
                 state.values[field.attr] = cycle_choice(field.choices, state.values.get(field.attr), direction)
                 state.dirty = True
+                _reconcile_output_quality(state, field.attr)
                 status = f"{field.label}: {state.values[field.attr]}"
         elif key in (curses.KEY_ENTER, ord("\n"), ord("\r"), ord(" ")):
             status = _edit_field(stdscr, state, fields[pos])
@@ -923,7 +958,7 @@ def _main_loop(stdscr: Any, state: TuiState) -> None:
             "\u2500" * 40,
             "Check environment",
             "Run render",
-            "Render 9 true color styles",
+            "Render 3 true color styles",
             "Update program (GitHub)",
             "\u2500" * 40,
             "Quit",

@@ -107,13 +107,17 @@ except KeyboardInterrupt:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-APP_VERSION = "2026.07.02.01"
+APP_VERSION = "2026.07.04.01"
 APP_DISPLAY_NAME = "Himawari-8/9 Low-RAM Processor"
 USER_URL = "https://noaa-himawari9.s3.amazonaws.com/AHI-L1b-FLDK/2024/07/25/0400/HS_H09_20240725_0400_B01_FLDK_R10_S0110.DAT.bz2"
 MODE = "Single Image"  # "Single Image" or "Timelapse"
 COMPOSITE_CHOICE = "True Color Reproduction Image"
 SATELLITE_LAYER_MODE = "standard"
-SATELLITE_LAYER_MODES = ("standard", "live", "hd")
+# The optional "live" and "hd" satellite layers were removed. Only the standard
+# layer remains, so this is a single-item tuple. The satellite_layer_mode config
+# field is kept (for backward-compatible loading of old settings/presets) but any
+# legacy value is collapsed to "standard" by normalized_satellite_layer_mode.
+SATELLITE_LAYER_MODES = ("standard",)
 
 HOURS_BACK = 72
 INTERVAL_MINUTES = 20
@@ -143,17 +147,29 @@ ADD_CROSSHAIR = False
 CROSSHAIR_TYPE = "target"
 CROSSHAIR_COLOR = "#7c3cff"
 ZOOM_EARTH_STYLE = False
-FLAT_MAP_INVALID_FILL = (30, 34, 40)  # neutral mid-dark gray: bright enough to read as "ocean" not "black" against the disk
+# Overlay drawing is resolution-aware: the user's border width and label size are
+# treated as a "visual weight" defined at OVERLAY_REFERENCE_DIM pixels and scaled
+# up for larger images, so a 16 px label / 1 px border is not invisibly small on a
+# 22000 px native full-disk. Images at or below the reference are left unchanged
+# (scale clamped to >= 1.0), so existing flat-map output looks the same.
+OVERLAY_REFERENCE_DIM = 3000
+OVERLAY_MAX_RENDER_SCALE = 24.0
+FLAT_MAP_INVALID_FILL = (18, 42, 66)  # deep ocean blue: off-disk pixels read as sea, not dead gray
 FLAT_MAP_SOURCE_VALID_MIN = 1.0e-6
-FLAT_MAP_BASEMAP_OCEAN = (30, 34, 40)  # neutral mid-dark gray-blue basemap: recedes but doesn't look black; minimal blue cast
-FLAT_MAP_BASEMAP_LAND = (60, 72, 60)
-FLAT_MAP_BASEMAP_COAST = (122, 134, 126)
+# Zoom Earth-style basemap. These are used for the areas the satellite cannot see
+# (outside the disk / beyond the useful limb). They are a natural, coloured world
+# map - deep blue ocean and green/tan land - so those regions look like a real map
+# instead of a dull gray patch ("some places have no colour"). Kept a touch muted
+# so the live satellite footprint still visibly pops against them.
+FLAT_MAP_BASEMAP_OCEAN = (16, 40, 64)  # deep blue ocean
+FLAT_MAP_BASEMAP_LAND = (74, 96, 58)  # muted green land
+FLAT_MAP_BASEMAP_COAST = (140, 150, 120)  # soft sandy coastline
 FLAT_MAP_LIMB_FADE_FRACTION = 0.05
 FLAT_MAP_LIMB_FADE_MIN_PX = 8
 FLAT_MAP_LIMB_FADE_MAX_PX = 240
 FLAT_MAP_ZOOM_OVERLAY_OPACITY = 200
 FLAT_MAP_ZOOM_CROSSHAIR_OPACITY_SCALE = 0.78
-SATELLITE_LAYER_BORDER_COLOR = "#00ff00"  # bright green border for the live/hd satellite layers
+SATELLITE_LAYER_BORDER_COLOR = "#00ff00"  # default green used by the border-colour picker (the live/HD layers that also used it were removed)
 # Typhoon / tropical-cyclone track overlay. Off by default; when enabled the
 # processor draws the past track, current position and forecast track for any
 # active storm whose data falls inside the rendered map (see draw_typhoon_tracks).
@@ -366,6 +382,58 @@ AREA_PRESET_ORDER = (
     AREA_PRESET_FULL_DISK,
     *[name for name in AREA_PRESETS if name != AREA_PRESET_FULL_DISK_FLAT],
 )
+
+# ---------------------------------------------------------------------------
+# Output quality (flat-map resolution) presets. A friendly, front-of-house
+# control: higher quality -> higher resolution (finer degrees-per-pixel -> more
+# detail, larger file, slower). It drives flat_resolution_deg, which is still the
+# single source of truth the pipeline reads, so picking a quality simply fills the
+# resolution and editing the resolution by hand switches quality to "Custom".
+# Native (round-disk) output is always at the satellite's full sensor resolution
+# (already the highest quality), so this control affects flat / Zoom Earth maps.
+# ---------------------------------------------------------------------------
+OUTPUT_QUALITY_CUSTOM = "Custom (manual deg)"
+# (label, flat_resolution_deg). Ordered low -> high quality.
+OUTPUT_QUALITY_LEVELS: tuple[tuple[str, float], ...] = (
+    ("Draft (fastest)", 0.16),
+    ("Low", 0.10),
+    ("Standard", 0.05),
+    ("High", 0.03),
+    ("Ultra (slowest)", 0.02),
+)
+OUTPUT_QUALITY_DEFAULT = "Standard"
+OUTPUT_QUALITY_DEG = {name: deg for name, deg in OUTPUT_QUALITY_LEVELS}
+
+
+def output_quality_names() -> tuple[str, ...]:
+    """Ordered names shown in the Output Quality dropdown (Custom last)."""
+    return (*[name for name, _deg in OUTPUT_QUALITY_LEVELS], OUTPUT_QUALITY_CUSTOM)
+
+
+def output_quality_resolution_deg(name: str) -> float | None:
+    """Flat-map degrees-per-pixel for a quality level, or None for Custom/unknown."""
+    return OUTPUT_QUALITY_DEG.get(str(name).strip())
+
+
+def output_quality_for_resolution(resolution_deg: float) -> str:
+    """Nearest quality label for a resolution, so the dropdown reflects a manual deg.
+
+    Returns Custom when the value does not match a preset closely.
+    """
+    try:
+        value = float(resolution_deg)
+    except (TypeError, ValueError):
+        return OUTPUT_QUALITY_CUSTOM
+    for name, deg in OUTPUT_QUALITY_LEVELS:
+        if abs(deg - value) <= 1.0e-6:
+            return name
+    return OUTPUT_QUALITY_CUSTOM
+
+
+def _format_resolution_deg(resolution_deg: float) -> str:
+    """Compact string for a degrees-per-pixel value (no trailing float noise)."""
+    return f"{float(resolution_deg):g}"
+
 
 # ---------------------------------------------------------------------------
 # In-app updater. Pulls the default branch of the public GitHub repository,
@@ -760,6 +828,9 @@ class ProcessorConfig:
     flat_min_lon: float = FLAT_MIN_LON
     flat_max_lon: float = FLAT_MAX_LON
     flat_resolution_deg: float = FLAT_RESOLUTION_DEG
+    # Friendly flat-map quality selector; drives flat_resolution_deg in the UIs.
+    # "Custom (manual deg)" means the user set the resolution by hand.
+    output_quality: str = OUTPUT_QUALITY_DEFAULT
     max_safe_png_pixels: int = MAX_SAFE_PNG_PIXELS
     ram_limit_gb: float = RAM_LIMIT_GB
     dask_chunk_size: str = DASK_CHUNK_SIZE
@@ -3429,21 +3500,10 @@ def normalized_map_view(value: str | None) -> str:
 
 
 def normalized_satellite_layer_mode(value: str | None) -> str:
-    raw_value = SATELLITE_LAYER_MODE if value is None else str(value)
-    normalized = raw_value.strip().lower().replace("-", "_").replace(" ", "_")
-    aliases = {
-        "normal": "standard",
-        "default": "standard",
-        "realtime": "live",
-        "real_time": "live",
-        "latest": "live",
-        "latest_himawari": "live",
-        "high_definition": "hd",
-        "high_def": "hd",
-        "zoom_earth": "hd",
-        "zoom_earth_style": "hd",
-    }
-    return aliases.get(normalized, normalized)
+    # The live/HD satellite layers were removed; only the standard layer remains.
+    # Any value (including legacy "live"/"hd"/"zoom_earth" from an old saved config
+    # or preset) collapses to "standard" so those files still load and run.
+    return "standard"
 
 
 def is_live_satellite_layer(config: ProcessorConfig) -> bool:
@@ -3646,6 +3706,42 @@ def flat_map_shape(
 
 def flat_map_resolution_meters(resolution_deg: float) -> float:
     return finite_float(resolution_deg, "Flat map resolution") * WEB_MERCATOR_METERS_PER_DEGREE
+
+
+def flat_resolution_for_budget(
+    min_lat: float,
+    max_lat: float,
+    min_lon: float,
+    max_lon: float,
+    resolution_deg: float,
+    max_pixels: int = MAX_FLAT_MAP_PIXELS,
+) -> tuple[float, bool]:
+    """Coarsen ``resolution_deg`` until the flat map fits ``max_pixels``.
+
+    Returns ``(effective_deg, was_adjusted)``. Used by the friendly Output
+    Quality control (GUI/CLI/TUI) so a chosen quality level never produces an
+    over-budget, unrunnable flat map for the current region. A manually typed
+    resolution is intentionally *not* passed through this (the user gets a clear
+    error instead), matching the GUI behaviour.
+    """
+    try:
+        deg = float(resolution_deg)
+    except (TypeError, ValueError):
+        return resolution_deg, False
+    if deg <= 0:
+        return deg, False
+    original = deg
+    try:
+        for _ in range(24):
+            height, width = flat_map_shape(min_lat, max_lat, min_lon, max_lon, deg)
+            if width * height <= max_pixels:
+                break
+            deg *= 1.25
+        else:
+            return deg, deg != original
+    except Exception:
+        return resolution_deg, False
+    return deg, abs(deg - original) > 1.0e-12
 
 
 def web_mercator_extent(min_lat: float, max_lat: float, min_lon: float, max_lon: float) -> tuple[float, float, float, float]:
@@ -4038,10 +4134,51 @@ def draw_text_with_halo(
     draw.multiline_text((x, y), text, font=font, fill=fill, align="center", anchor="mm", spacing=spacing)
 
 
+def overlay_render_scale(area) -> float:
+    """Resolution-aware multiplier for overlay line widths and label sizes.
+
+    The user's border width / label size are visual weights defined at
+    OVERLAY_REFERENCE_DIM pixels. On a much larger raster (e.g. the 22000 px native
+    full disk) a raw 1 px line or 16 px label is sub-pixel once the image is viewed
+    scaled down, which is why labels/borders looked "missing". Scaling by
+    max(width, height) / OVERLAY_REFERENCE_DIM keeps them visible at any output
+    size. Clamped to >= 1.0 so images at/under the reference are unchanged.
+    """
+    try:
+        longest = max(int(area.width), int(area.height))
+    except Exception:
+        return 1.0
+    if longest <= 0:
+        return 1.0
+    scale = longest / float(OVERLAY_REFERENCE_DIM)
+    return float(min(OVERLAY_MAX_RENDER_SCALE, max(1.0, scale)))
+
+
+def scaled_label_size(base_size: int, area) -> int:
+    """User label size scaled for the output resolution (see overlay_render_scale)."""
+    try:
+        base = validated_map_label_size(base_size)
+    except ValueError:
+        base = MAP_LABEL_SIZE
+    return max(MAP_LABEL_SIZE_MIN, int(round(base * overlay_render_scale(area))))
+
+
+def scaled_border_width(base_width: float, area) -> float:
+    """User border width scaled for the output resolution (see overlay_render_scale)."""
+    try:
+        base = positive_finite_float(base_width, "Border line width")
+    except ValueError:
+        base = BORDER_LINE_WIDTH
+    return float(base * overlay_render_scale(area))
+
+
 def map_label_font(size: int):
     from PIL import ImageFont
 
-    font_size = max(MAP_LABEL_SIZE_MIN, min(MAP_LABEL_SIZE_MAX, int(size)))
+    # The UI caps the *chosen* size at MAP_LABEL_SIZE_MAX, but the resolution-scaled
+    # size passed here can legitimately be much larger on a big raster, so only clamp
+    # to a sane absolute ceiling that the font engine can render.
+    font_size = max(MAP_LABEL_SIZE_MIN, min(4000, int(size)))
     font_candidates = (
         "arial.ttf",
         "Arial.ttf",
@@ -4070,10 +4207,9 @@ def draw_zoom_earth_labels(
     from PIL import ImageDraw, ImageFont
 
     draw = ImageDraw.Draw(image, "RGBA")
-    try:
-        size = validated_map_label_size(label_size)
-    except ValueError:
-        size = MAP_LABEL_SIZE
+    # Scale the chosen size for the output resolution so labels stay legible on a
+    # huge native full-disk raster (where a raw 16 px label would be sub-pixel).
+    size = scaled_label_size(label_size, area)
     font = map_label_font(size)
     halo_width = max(1, int(round(size / 7.0)))
     for label, lat, lon, kind in ZOOM_EARTH_LABEL_POINTS:
@@ -5074,7 +5210,7 @@ def apply_direct_overlay_to_image_file(output_path: Path, area: AreaDefinition, 
                 original_mode = image.mode
                 working = image.convert("RGBA")
                 color = tuple(overlay["color"])
-                width = float(overlay["width"])
+                width = scaled_border_width(overlay["width"], area)
                 resolution = str(overlay["resolution"])
                 writer.add_coastlines(
                     working,
@@ -5137,7 +5273,7 @@ def direct_overlay_to_image(
 
     writer = direct_overlay_writer(str(overlay["coast_dir"]))
     color = tuple(overlay["color"])
-    width = float(overlay["width"])
+    width = scaled_border_width(overlay["width"], area)
     resolution = str(overlay["resolution"])
     target = image
     if opacity < 255 or valid_mask is not None:
@@ -5485,16 +5621,16 @@ def apply_flat_map_style_to_image(
             # borders, labels and the crosshair are drawn on top of the cleaned image
             # and are never removed by the speckle cleanup.
             #
-            # Cosmetic modes (Zoom Earth style, or the enhanced "live"/"hd" satellite
-            # layers) get the punchy stylised look. A plain standard flat map instead
-            # gets a gentle, faithful correction so it matches the native True Color
-            # Reproduction image (deep-blue ocean, neutral white clouds) rather than
-            # the old washed-out, yellow-tinted result.
-            hd = is_enhanced_satellite_layer(config)
-            cosmetic_true_color = config.zoom_earth_style or hd
-            if cosmetic_true_color:
-                working = apply_zoom_earth_true_color_enhancement(working, hd=hd)
-                working = finish_zoom_earth_true_color_quality(working, hd=hd)
+            # A Zoom Earth-style flat map gets the punchy stylised look; a plain
+            # standard flat map instead gets a gentle, faithful correction so it
+            # matches the native True Color Reproduction image (deep-blue ocean,
+            # neutral white clouds) rather than the old washed-out, yellow-tinted
+            # result. (The live/HD satellite layers that used to force the stylised
+            # look on their own were removed; zoom_earth_style is now the only
+            # switch.)
+            if config.zoom_earth_style:
+                working = apply_zoom_earth_true_color_enhancement(working, hd=False)
+                working = finish_zoom_earth_true_color_quality(working, hd=False)
                 # Chroma speckle cleanup runs LAST so it also catches any red/
                 # magenta specks re-emphasised by the final saturation + sharpen
                 # pass in finish_zoom_earth_true_color_quality.
@@ -5504,16 +5640,9 @@ def apply_flat_map_style_to_image(
                 cleanup_true_color_chroma_speckles(working, aggressive=True)
         if is_zoom_true_color:
             composite_flat_map_basemap(working, area, valid_mask)
-    elif is_true_color and is_enhanced_satellite_layer(config):
-        # Native (round-disk) output is normally the raw True Color Reproduction
-        # product. The multi-style batch can now request the "live"/"hd" layer on
-        # a native disk; give those the same HD tone the flat HD layer uses so the
-        # standard-vs-hd native disks are visibly different. Standard native output
-        # is untouched (this branch only runs for the enhanced layers, which could
-        # not previously be paired with a native projection).
-        working = apply_zoom_earth_true_color_enhancement(working, hd=True)
-        working = finish_zoom_earth_true_color_quality(working, hd=True)
-        cleanup_true_color_chroma_speckles(working, aggressive=True)
+    # Native (round-disk) output is always the raw True Color Reproduction product
+    # with overlays drawn on top; the only per-layer HD tone path here belonged to
+    # the removed live/HD layers, so there is no native enhancement branch now.
     try:
         direct_overlay_to_image(
             working,
@@ -8408,47 +8537,42 @@ class SetupStatus:
 
 
 # ---------------------------------------------------------------------------
-# "9 True Color styles" batch: render the True Color Reproduction product for
-# every combination of the three satellite layers (standard, live, HD - the same
-# layers Zoom Earth exposes) and the three map styles (native round disk,
-# standard flat map, Zoom Earth-style flat map) from a single click / command /
-# menu choice. Each of the nine cells gets a distinct filename suffix
-# (``<layer>_<style>``) so the outputs never overwrite one another.
+# "3 True Color styles" batch: render the True Color Reproduction product in each
+# of the three map styles (native round disk, standard flat map, Zoom Earth-style
+# flat map) from a single click / command / menu choice. The live and HD satellite
+# layers were removed, so only the standard layer is used; each of the three cells
+# gets a distinct filename suffix so the outputs never overwrite one another.
 # ---------------------------------------------------------------------------
 TRUE_COLOR_REPRODUCTION_PRODUCT = "True Color Reproduction Image"
 # The three map projections/looks. Suffixes stay stable for downstream tooling.
 TRUE_COLOR_MAP_STYLES: tuple[tuple[str, str, dict[str, object]], ...] = (
-    ("Native (round disk)", "native", {"map_view": "native", "zoom_earth_style": False}),
-    ("Flat map", "flat", {"map_view": "flat", "zoom_earth_style": False}),
-    ("Zoom Earth flat", "zoomearth", {"map_view": "flat", "zoom_earth_style": True}),
+    ("Native", "native", {"map_view": "native", "zoom_earth_style": False}),
+    ("Standard flat map", "flat_standard", {"map_view": "flat", "zoom_earth_style": False}),
+    ("Zoom Earth-style flat map", "flat_zoomearth", {"map_view": "flat", "zoom_earth_style": True}),
 )
-# The three satellite layers. "live" resolves the latest scan; "live"/"hd" apply
-# the HD true-color enhancement (see is_enhanced_satellite_layer).
+# Only the standard satellite layer remains (live/HD were removed). Kept as a
+# single-item tuple so any downstream tooling that iterated layers still works.
 TRUE_COLOR_SATELLITE_LAYERS: tuple[tuple[str, str, dict[str, object]], ...] = (
     ("Standard", "standard", {"satellite_layer_mode": "standard"}),
-    ("Live", "live", {"satellite_layer_mode": "live"}),
-    ("HD", "hd", {"satellite_layer_mode": "hd"}),
 )
-# Full 9-cell matrix, ordered layer-major so the three styles of each layer stay
-# together. Kept under the historical name so existing callers still work.
+# 3-cell set: the standard layer in each of the three map styles. Labels/suffixes
+# are just the map style (the single layer needs no prefix).
 TRUE_COLOR_STYLE_SET: tuple[tuple[str, str, dict[str, object]], ...] = tuple(
     (
-        f"{layer_label} - {style_label}",
-        f"{layer_suffix}_{style_suffix}",
-        {**layer_overrides, **style_overrides},
+        style_label,
+        style_suffix,
+        {"satellite_layer_mode": "standard", **style_overrides},
     )
-    for layer_label, layer_suffix, layer_overrides in TRUE_COLOR_SATELLITE_LAYERS
     for style_label, style_suffix, style_overrides in TRUE_COLOR_MAP_STYLES
 )
 
 
 def true_color_style_base_config(config: ProcessorConfig | None = None) -> ProcessorConfig:
-    """Shared base config for the 9-style true-color set.
+    """Shared base config for the 3-style true-color set.
 
-    Forces the product to True Color Reproduction and a single image, and turns
-    off the satellite-layer style presets so each cell keeps its own map_view /
-    zoom_earth_style while still getting the layer's enhancement + live data
-    source. Each cell sets its own satellite_layer_mode.
+    Forces the product to True Color Reproduction and a single image. Each cell
+    then applies its own map_view / zoom_earth_style. Only the standard satellite
+    layer is used (live/HD were removed).
     """
     base = config or default_config()
     return replace(
@@ -8464,13 +8588,13 @@ def run_true_color_style_set(
     progress: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
 ) -> list[Path]:
-    """Render True Color Reproduction across all nine layer/style cells.
+    """Render True Color Reproduction across all three map-style cells.
 
-    Cells: the three satellite layers (standard, live, HD) each rendered in the
-    three map styles (native round disk, standard flat map, Zoom Earth-style flat
-    map). Each render reuses the full low-RAM pipeline via ``run``, and a distinct
-    ``<layer>_<style>`` filename suffix keeps every output separate. Cancellation
-    is checked between cells and is also honored inside each render.
+    Cells: the standard satellite layer rendered in the three map styles (native
+    round disk, standard flat map, Zoom Earth-style flat map). Each render reuses
+    the full low-RAM pipeline via ``run``, and a distinct ``<style>`` filename
+    suffix keeps every output separate. Cancellation is checked between cells and
+    is also honored inside each render.
     """
     base = true_color_style_base_config(config)
     total = len(TRUE_COLOR_STYLE_SET)
@@ -9294,6 +9418,7 @@ class RegionPickerDialog:
         self.app.flat_max_lon_var.set(str(max_lon))
         self.app.map_view_var.set("flat")
         self.app.area_preset_var.set(AREA_PRESET_CUSTOM)
+        self.app._refit_resolution_to_region()
         self.app._append_log(
             f"Region picker set flat map bounds: lat {min_lat:g}..{max_lat:g}, lon {min_lon:g}..{max_lon:g}."
         )
@@ -9332,7 +9457,7 @@ class HimawariProcessorApp:
         self.url_var = tk.StringVar(value=initial_config.user_url)
         self.mode_var = tk.StringVar(value=initial_config.mode)
         self.composite_var = tk.StringVar(value=initial_config.composite_choice)
-        self.satellite_layer_var = tk.StringVar(value=initial_config.satellite_layer_mode)
+        self.satellite_layer_var = tk.StringVar(value="standard")
         self.hours_var = tk.StringVar(value=str(initial_config.hours_back))
         self.interval_var = tk.StringVar(value=str(initial_config.interval_minutes))
         self.fps_var = tk.StringVar(value=str(initial_config.fps))
@@ -9355,6 +9480,9 @@ class HimawariProcessorApp:
         self.flat_min_lon_var = tk.StringVar(value=str(initial_config.flat_min_lon))
         self.flat_max_lon_var = tk.StringVar(value=str(initial_config.flat_max_lon))
         self.flat_resolution_var = tk.StringVar(value=str(initial_config.flat_resolution_deg))
+        self.output_quality_var = tk.StringVar(
+            value=output_quality_for_resolution(initial_config.flat_resolution_deg)
+        )
         self.timelapse_format_var = tk.StringVar(value=initial_config.timelapse_format)
         self.auto_download_var = tk.BooleanVar(value=initial_config.auto_download)
         self.gpu_acceleration_var = tk.BooleanVar(value=initial_config.gpu_acceleration)
@@ -9555,15 +9683,10 @@ class HimawariProcessorApp:
             style="Status.TLabel",
         )
         self.local_drop_label.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
-        ttk.Label(source_frame, text="Satellite Layer").grid(row=3, column=0, sticky="w", pady=(8, 0))
-        self.satellite_layer_box = ttk.Combobox(
-            source_frame,
-            textvariable=self.satellite_layer_var,
-            values=SATELLITE_LAYER_MODES,
-            state="readonly",
-        )
-        self.satellite_layer_box.grid(row=4, column=0, sticky="ew", pady=(2, 0))
-        self.satellite_layer_box.bind("<<ComboboxSelected>>", lambda _event: self._apply_satellite_layer_defaults())
+        # The live/HD satellite layers were removed; only the standard layer remains,
+        # so there is no Satellite Layer selector any more. self.satellite_layer_var
+        # is kept (pinned to "standard") purely so older code paths and saved-config
+        # round-tripping keep working.
         self._setup_optional_local_drop_target()
 
         product_frame = ttk.LabelFrame(settings, text="Product", style="Section.TLabelframe")
@@ -9921,10 +10044,24 @@ class HimawariProcessorApp:
             state="readonly",
         )
         self.map_view_box.grid(row=3, column=0, sticky="ew", padx=(0, 8), pady=(2, 8))
-        ttk.Label(paths_frame, text="Flat Resolution Deg").grid(row=2, column=1, sticky="w")
-        ttk.Entry(paths_frame, textvariable=self.flat_resolution_var).grid(
-            row=3, column=1, sticky="ew", pady=(2, 8)
+        ttk.Label(paths_frame, text="Output Quality (flat maps)").grid(row=2, column=1, sticky="w")
+        quality_row = ttk.Frame(paths_frame)
+        quality_row.grid(row=3, column=1, sticky="ew", pady=(2, 8))
+        quality_row.columnconfigure(0, weight=1)
+        self.output_quality_box = ttk.Combobox(
+            quality_row,
+            textvariable=self.output_quality_var,
+            values=output_quality_names(),
+            state="readonly",
+            width=16,
         )
+        self.output_quality_box.grid(row=0, column=0, sticky="ew")
+        self.output_quality_box.bind("<<ComboboxSelected>>", lambda _event: self._apply_output_quality())
+        ttk.Label(quality_row, text="deg/px").grid(row=0, column=1, sticky="w", padx=(8, 2))
+        self.flat_resolution_entry = ttk.Entry(quality_row, textvariable=self.flat_resolution_var, width=8)
+        self.flat_resolution_entry.grid(row=0, column=2, sticky="w")
+        # A manual resolution edit flips the quality dropdown to "Custom".
+        self.flat_resolution_var.trace_add("write", lambda *_a: self._on_flat_resolution_edited())
 
         ttk.Label(paths_frame, text="Flat Min/Max Lat").grid(row=4, column=0, sticky="w")
         flat_lat_row = ttk.Frame(paths_frame)
@@ -10093,7 +10230,7 @@ class HimawariProcessorApp:
         self.test_host_button = ttk.Button(buttons, text="Test Data Host", command=self._start_connectivity_check)
         self.test_host_button.grid(row=2, column=2, padx=(0, 8), pady=(8, 0))
         self.true_color_set_button = ttk.Button(
-            buttons, text="9 TC Styles", command=self._start_true_color_set
+            buttons, text="3 TC Styles", command=self._start_true_color_set
         )
         self.true_color_set_button.grid(row=2, column=3, padx=(0, 8), pady=(8, 0))
         self._install_tooltips()
@@ -10566,7 +10703,7 @@ class HimawariProcessorApp:
         self.url_var.set(config.user_url)
         self.mode_var.set(config.mode)
         self.composite_var.set(config.composite_choice)
-        self.satellite_layer_var.set(config.satellite_layer_mode)
+        self.satellite_layer_var.set("standard")
         self.hours_var.set(str(config.hours_back))
         self.interval_var.set(str(config.interval_minutes))
         self.fps_var.set(str(config.fps))
@@ -10585,6 +10722,8 @@ class HimawariProcessorApp:
         self.flat_min_lon_var.set(str(config.flat_min_lon))
         self.flat_max_lon_var.set(str(config.flat_max_lon))
         self.flat_resolution_var.set(str(config.flat_resolution_deg))
+        # Reflect the loaded resolution in the friendly quality dropdown.
+        self.output_quality_var.set(output_quality_for_resolution(config.flat_resolution_deg))
         self.timelapse_format_var.set(config.timelapse_format)
         self.auto_download_var.set(config.auto_download)
         self.gpu_acceleration_var.set(config.gpu_acceleration)
@@ -10612,30 +10751,72 @@ class HimawariProcessorApp:
         self._refresh_mode_state()
         self._update_setup_status()
 
-    def _apply_satellite_layer_defaults(self) -> None:
-        mode = normalized_satellite_layer_mode(self.satellite_layer_var.get())
-        if self.satellite_layer_var.get() != mode:
-            self.satellite_layer_var.set(mode)
-        if mode in {"live", "hd"}:
-            self.composite_var.set("True Color Reproduction Image")
-            self.map_view_var.set("flat")
-            self.zoom_earth_style_var.set(True)
-            self.night_fallback_var.set(True)
-            self.night_fallback_mode_var.set("hybrid")
-            self.border_lines_var.set(True)
-            self.map_labels_var.set(True)
-            self.crosshair_var.set(False)
-            self.border_color_var.set(SATELLITE_LAYER_BORDER_COLOR)
-            self.border_width_var.set(str(satellite_layer_border_width(self.border_width_var.get())))
-            # Mirror the runtime clamping in layer_defaults_config so the GUI
-            # shows the same label size the run will actually use. Previously
-            # the runtime clamped map_label_size via satellite_layer_map_label_size
-            # but the GUI left the raw value, so the displayed size and the saved
-            # config diverged from what the run produced.
-            self.map_label_size_var.set(str(satellite_layer_map_label_size(self.map_label_size_var.get())))
-            self._append_log(f"Satellite layer set to {mode}; flat-map true-color defaults applied.")
+    def _apply_output_quality(self) -> None:
+        """Fill the flat-map resolution from the chosen Output Quality level.
+
+        Higher quality -> finer degrees-per-pixel -> higher resolution. Picking
+        "Custom" leaves the manual resolution untouched. If the chosen quality
+        would exceed the safe flat-map pixel budget for the current region, it is
+        coarsened to the finest resolution that still fits (and logged), so a run
+        started right afterwards is valid.
+        """
+        name = self.output_quality_var.get().strip()
+        deg = output_quality_resolution_deg(name)
+        if deg is None:
+            self._append_log("Output quality: Custom (manual resolution kept).")
+            return
+        adjusted, note = self._quality_resolution_within_budget(deg)
+        self.flat_resolution_var.set(_format_resolution_deg(adjusted))
+        if note:
+            self.output_quality_var.set(output_quality_for_resolution(adjusted))
+            self._append_log(f"Output quality '{name}' -> {note}")
+        else:
+            self._append_log(
+                f"Output quality '{name}' -> flat-map resolution {adjusted:g} deg/px "
+                "(native output is always full sensor resolution)."
+            )
         self._update_setup_status()
         self._write_current_settings()
+
+    def _quality_resolution_within_budget(self, resolution_deg: float) -> tuple[float, str | None]:
+        """Coarsen a requested resolution until the current region fits the budget."""
+        try:
+            min_lat = float(self.flat_min_lat_var.get())
+            max_lat = float(self.flat_max_lat_var.get())
+            min_lon = float(self.flat_min_lon_var.get())
+            max_lon = float(self.flat_max_lon_var.get())
+        except Exception:
+            return resolution_deg, None
+        if min_lat >= max_lat or min_lon >= max_lon:
+            return resolution_deg, None
+        deg, adjusted = flat_resolution_for_budget(min_lat, max_lat, min_lon, max_lon, resolution_deg)
+        if adjusted:
+            return deg, (
+                f"coarsened to {deg:g} deg/px so the region stays under "
+                f"{MAX_FLAT_MAP_PIXELS:,} px."
+            )
+        return deg, None
+
+    def _on_flat_resolution_edited(self) -> None:
+        """Manual resolution edits switch the quality dropdown to Custom."""
+        try:
+            deg = float(self.flat_resolution_var.get())
+        except Exception:
+            return
+        self.output_quality_var.set(output_quality_for_resolution(deg))
+
+    def _refit_resolution_to_region(self) -> None:
+        """After a region change, coarsen the flat resolution if it now exceeds
+        the safe pixel budget, so the newly-chosen region is always runnable."""
+        try:
+            deg = float(self.flat_resolution_var.get())
+        except Exception:
+            return
+        adjusted, note = self._quality_resolution_within_budget(deg)
+        if note:
+            self.flat_resolution_var.set(_format_resolution_deg(adjusted))
+            self.output_quality_var.set(output_quality_for_resolution(adjusted))
+            self._append_log(f"Resolution {note}")
 
     def _apply_area_preset(self) -> None:
         name = self.area_preset_var.get().strip()
@@ -10659,6 +10840,7 @@ class HimawariProcessorApp:
             self.flat_max_lat_var.set(str(max_lat))
             self.flat_min_lon_var.set(str(min_lon))
             self.flat_max_lon_var.set(str(max_lon))
+            self._refit_resolution_to_region()
             self._append_log(
                 f"Area preset '{name}' applied: flat map lat {min_lat}..{max_lat}, lon {min_lon}..{max_lon}."
             )
@@ -10727,9 +10909,9 @@ class HimawariProcessorApp:
             "preview_button": "Quick Look: render a fast, coarse flat-map preview so you can check framing and colour before a full run. It does not change your settings.",
             "pick_region_button": "Pick Region: open a clickable mini-map and drag a box to set the flat-map crop instead of typing latitude and longitude.",
             "test_host_button": "Test Data Host: check whether the satellite data server is reachable (DNS and a quick HTTP request). Use this to tell a failed run apart from a network problem.",
-            "true_color_set_button": "9 TC Styles: render the True Color Reproduction product nine times in one go - the standard, live and HD satellite layers, each as a native round disk, a standard flat map, and a Zoom Earth-style flat map. Each image is saved with its layer + style in the filename; live layers use the latest scan.",
+            "true_color_set_button": "3 TC Styles: render the True Color Reproduction product three times in one go - a native round disk, a standard flat map, and a Zoom Earth-style flat map. Each image is saved with its style in the filename.",
             "area_preset_box": "Output Region: pick a region to frame the image. Regional presets and 'Full Disk (flat map)' switch to the flat map and fill the bounds; 'Full Disk (native)' uses the round-Earth view.",
-            "satellite_layer_box": "Satellite Layer: 'standard' is normal; 'live' grabs the latest scan; 'hd' applies stronger enhancement. live/hd also turn on flat-map true-color styling.",
+            "output_quality_box": "Output Quality: higher quality = higher resolution flat maps (finer detail, larger file, slower). It fills the deg/px value; native output is always full sensor resolution.",
             "map_view_box": "Map View: 'native' is the round full-disk Earth; 'flat' is a rectangular Web Mercator map you can crop with the bounds.",
         }
 
@@ -10762,7 +10944,7 @@ class HimawariProcessorApp:
             ("Clipboard", ["copy_paths_button", "copy_error_button", "copy_log_button", "copy_settings_button"]),
             ("Maintenance", ["update_app_button", "check_env_button", "quick_fix_button", "auto_fix_button", "help_button"]),
             ("Source", ["latest_url_button", "scan_browser_button", "local_files_button"]),
-            ("Choices", ["satellite_layer_box", "map_view_box", "area_preset_box"]),
+            ("Choices", ["output_quality_box", "map_view_box", "area_preset_box"]),
         ]
         helps = self._button_help_texts()
         for title, keys in sections:
@@ -10943,7 +11125,7 @@ class HimawariProcessorApp:
             getattr(self, "latest_url_button", None),
             getattr(self, "scan_browser_button", None),
             getattr(self, "local_files_button", None),
-            getattr(self, "satellite_layer_box", None),
+            getattr(self, "output_quality_box", None),
             getattr(self, "safe_perf_button", None),
             getattr(self, "best_perf_button", None),
             getattr(self, "gpu_check", None),
@@ -11363,7 +11545,8 @@ class HimawariProcessorApp:
             user_url=self.url_var.get().strip(),
             mode=self.mode_var.get(),
             composite_choice=self.composite_var.get(),
-            satellite_layer_mode=self.satellite_layer_var.get(),
+            # Live/HD layers were removed; the standard layer is the only option.
+            satellite_layer_mode="standard",
             hours_back=int(self.hours_var.get()),
             interval_minutes=int(self.interval_var.get()),
             fps=int(self.fps_var.get()),
@@ -11394,6 +11577,7 @@ class HimawariProcessorApp:
             flat_min_lon=self._read_float_var(self.flat_min_lon_var, "Flat map min longitude"),
             flat_max_lon=self._read_float_var(self.flat_max_lon_var, "Flat map max longitude"),
             flat_resolution_deg=self._read_float_var(self.flat_resolution_var, "Flat map resolution"),
+            output_quality=self.output_quality_var.get(),
             ram_limit_gb=self._read_float_var(self.ram_limit_var, "RAM limit"),
             dask_chunk_size=self.chunk_var.get(),
             dask_num_workers=int(self.dask_workers_var.get()),
@@ -11487,9 +11671,9 @@ class HimawariProcessorApp:
             self.messages.put(("error", str(exc)))
 
     def _start_true_color_set(self) -> None:
-        """Render True Color Reproduction across all nine layer/style cells
-        (standard/live/HD satellite layers x native/flat/Zoom Earth map styles)
-        from the current settings, in one batch."""
+        """Render True Color Reproduction across all three map-style cells
+        (native / flat / Zoom Earth flat, standard layer) from the current
+        settings, in one batch."""
         count = len(TRUE_COLOR_STYLE_SET)
         title = f"{count} True Color styles"
         if self.is_running:
@@ -11512,12 +11696,11 @@ class HimawariProcessorApp:
         style_names = "\n".join(f"  - {label}" for label, _suffix, _overrides in TRUE_COLOR_STYLE_SET)
         if not messagebox.askokcancel(
             title,
-            f"This renders the True Color Reproduction product {count} times - the "
-            "standard, live and HD satellite layers, each in the native, flat and "
-            "Zoom Earth-style map views:\n\n"
+            f"This renders the True Color Reproduction product {count} times - as a "
+            "native round disk, a standard flat map, and a Zoom Earth-style flat "
+            "map:\n\n"
             f"{style_names}\n\n"
-            "Each image is saved with its layer + style in the filename. Live "
-            "layers use the latest available scan. Start now?",
+            "Each image is saved with its style in the filename. Start now?",
         ):
             self._append_log(f"{title} canceled before processing.")
             return
@@ -11533,7 +11716,7 @@ class HimawariProcessorApp:
         self.run_started_at_utc = utc_timestamp()
         self._write_current_settings()
         self._append_log(
-            f"Starting {title} (standard/live/HD x native/flat/Zoom Earth)."
+            f"Starting {title} (native / flat / Zoom Earth flat)."
         )
 
         self.worker = threading.Thread(

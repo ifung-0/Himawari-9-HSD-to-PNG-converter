@@ -73,20 +73,22 @@ def _sample_storm_payload():
 # ---------------------------------------------------------------------------
 # 9-style true-color batch (3 satellite layers x 3 map styles)
 # ---------------------------------------------------------------------------
-def test_style_set_has_nine_cells():
-    assert len(p.TRUE_COLOR_STYLE_SET) == 9
-    assert len(p.TRUE_COLOR_SATELLITE_LAYERS) == 3
+def test_style_set_has_three_cells():
+    # The live/HD satellite layers were removed: only the standard layer remains,
+    # rendered in the three map styles (native, flat, Zoom Earth flat).
+    assert len(p.TRUE_COLOR_STYLE_SET) == 3
+    assert len(p.TRUE_COLOR_SATELLITE_LAYERS) == 1
     assert len(p.TRUE_COLOR_MAP_STYLES) == 3
 
 
-def test_style_set_covers_every_layer_and_style():
+def test_style_set_covers_every_map_style():
     suffixes = {suffix for _label, suffix, _ov in p.TRUE_COLOR_STYLE_SET}
-    expected = {
-        f"{layer}_{style}"
-        for layer in ("standard", "live", "hd")
-        for style in ("native", "flat", "zoomearth")
-    }
-    assert suffixes == expected
+    assert suffixes == {"native", "flat_standard", "flat_zoomearth"}
+
+
+def test_style_set_is_standard_layer_only():
+    for _label, _suffix, overrides in p.TRUE_COLOR_STYLE_SET:
+        assert overrides["satellite_layer_mode"] == "standard"
 
 
 def test_style_set_overrides_are_well_formed():
@@ -110,12 +112,13 @@ def test_style_variants_validate_and_keep_their_projection():
     base = p.true_color_style_base_config(p.default_config())
     for _label, _suffix, overrides in p.TRUE_COLOR_STYLE_SET:
         variant = replace(base, **overrides)
-        # layer_defaults_config (projection-preservation) needs no map projection
-        # backend, so check it for every cell.
+        # layer_defaults_config is now a no-op (standard layer), so each cell keeps
+        # exactly the projection it asked for.
         resolved = p.layer_defaults_config(variant)
         assert p.normalized_map_view(resolved.map_view) == p.normalized_map_view(overrides["map_view"])
         assert resolved.zoom_earth_style == overrides["zoom_earth_style"]
-        assert p.is_enhanced_satellite_layer(resolved) == (overrides["satellite_layer_mode"] in {"live", "hd"})
+        # No cell is ever "enhanced" now that live/HD are gone.
+        assert p.is_enhanced_satellite_layer(resolved) is False
         # Full validation (which exercises the flat-map projection maths) is run
         # only on the native cells so the check does not depend on a real pyproj.
         if p.normalized_map_view(overrides["map_view"]) == "native":
@@ -123,37 +126,82 @@ def test_style_variants_validate_and_keep_their_projection():
 
 
 # ---------------------------------------------------------------------------
-# layer_style_presets semantics
+# Satellite-layer removal: only the standard layer remains
 # ---------------------------------------------------------------------------
-def test_layer_presets_on_forces_flat_zoom_for_enhanced_layers():
-    for mode in ("live", "hd"):
-        cfg = replace(p.default_config(), satellite_layer_mode=mode, map_view="native", zoom_earth_style=False)
-        resolved = p.layer_defaults_config(cfg)
-        assert resolved.map_view == "flat"
-        assert resolved.zoom_earth_style is True
-        assert resolved.add_border_lines is True
+def test_only_standard_layer_mode_remains():
+    assert p.SATELLITE_LAYER_MODES == ("standard",)
 
 
-def test_layer_presets_off_preserves_projection_but_keeps_enhancement():
-    for mode in ("live", "hd"):
-        cfg = replace(
-            p.default_config(),
-            satellite_layer_mode=mode,
-            map_view="native",
-            zoom_earth_style=False,
-            add_border_lines=False,
-            layer_style_presets=False,
-        )
-        resolved = p.layer_defaults_config(cfg)
-        assert resolved.map_view == "native"
-        assert resolved.zoom_earth_style is False
-        assert resolved.add_border_lines is False
-        assert p.is_enhanced_satellite_layer(resolved) is True
+def test_legacy_layer_values_collapse_to_standard():
+    # Old saved configs / presets may still say live/hd/zoom_earth; they must load
+    # and be treated as standard rather than erroring.
+    for legacy in ("live", "hd", "zoom_earth", "anything"):
+        assert p.normalized_satellite_layer_mode(legacy) == "standard"
+        cfg = replace(p.default_config(), satellite_layer_mode=legacy)
+        assert p.is_enhanced_satellite_layer(cfg) is False
+        # A legacy value must not produce a configuration error.
+        assert not p.setup_configuration_errors(cfg)
+
+
+def test_layer_defaults_is_noop_for_standard():
+    # The standard layer never forces flat / Zoom Earth styling, so a native +
+    # borders-off config is preserved exactly (this is what fixes the region /
+    # pick-region choice from being silently overridden).
+    cfg = replace(
+        p.default_config(),
+        satellite_layer_mode="standard",
+        map_view="native",
+        zoom_earth_style=False,
+        add_border_lines=False,
+    )
+    resolved = p.layer_defaults_config(cfg)
+    assert resolved.map_view == "native"
+    assert resolved.zoom_earth_style is False
+    assert resolved.add_border_lines is False
 
 
 def test_standard_layer_is_never_enhanced():
     cfg = replace(p.default_config(), satellite_layer_mode="standard")
     assert p.is_enhanced_satellite_layer(cfg) is False
+
+
+# ---------------------------------------------------------------------------
+# Output quality (flat-map resolution) presets
+# ---------------------------------------------------------------------------
+def test_output_quality_levels_round_trip():
+    for name, deg in p.OUTPUT_QUALITY_LEVELS:
+        assert p.output_quality_resolution_deg(name) == deg
+        assert p.output_quality_for_resolution(deg) == name
+
+
+def test_output_quality_higher_is_finer_resolution():
+    degs = [deg for _name, deg in p.OUTPUT_QUALITY_LEVELS]
+    # Ordered low -> high quality, so degrees-per-pixel must strictly decrease
+    # (higher quality == higher resolution == fewer degrees per pixel).
+    assert degs == sorted(degs, reverse=True)
+
+
+def test_output_quality_custom_for_unmatched_resolution():
+    assert p.output_quality_for_resolution(0.0417) == p.OUTPUT_QUALITY_CUSTOM
+    assert p.OUTPUT_QUALITY_CUSTOM in p.output_quality_names()
+
+
+def test_overlay_render_scale_grows_with_image_size():
+    class _Area:
+        def __init__(self, w, h):
+            self.width = w
+            self.height = h
+
+    # At/under the reference dimension the scale is 1.0 (existing output unchanged).
+    assert p.overlay_render_scale(_Area(900, 800)) == 1.0
+    assert p.overlay_render_scale(_Area(p.OVERLAY_REFERENCE_DIM, 1000)) == 1.0
+    # A huge native full-disk raster scales up so labels/borders stay visible.
+    big = p.overlay_render_scale(_Area(22000, 22000))
+    assert big > 5.0
+    assert big <= p.OVERLAY_MAX_RENDER_SCALE
+    # A 16 px label and 1 px border become clearly visible on that raster.
+    assert p.scaled_label_size(16, _Area(22000, 22000)) >= 96
+    assert p.scaled_border_width(1.0, _Area(22000, 22000)) >= 5.0
 
 
 # ---------------------------------------------------------------------------

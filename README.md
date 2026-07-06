@@ -5,8 +5,50 @@ AWS S3, processes them with Satpy, and writes either a single PNG or a GIF/MP4
 timelapse. The pipeline is designed for a conservative 10 GiB memory budget,
 with defaults that favor lower peak RAM over speed.
 
-> **Current build:** `2026.07.02.01` — see [What's New](#whats-new) at the
+> **Current build:** `2026.07.04.01` — see [What's New](#whats-new) at the
 > bottom of this file for the latest changes.
+
+---
+
+## Quickstart
+
+Five steps to your first image. (Windows users can double-click `himawari.bat`
+and pick an option from the menu instead of typing the commands.)
+
+1. **Install Python 3.13 or 3.12**, then install the dependencies:
+   ```bash
+   python install_requirements.py
+   ```
+2. **Check your environment** (optional but recommended the first time):
+   ```bash
+   python check_environment.py        # add --fix to auto-repair
+   ```
+3. **Launch an interface** — pick one:
+   ```bash
+   python himawari_lowram_simple.py   # Simple GUI: just make a picture
+   python himawari_lowram_processor.py# Full GUI: every option
+   python himawari_cli.py --menu      # Terminal menu
+   python himawari_tui.py             # Full-screen text UI (great over SSH)
+   ```
+4. **Choose what to make.** Leave the URL blank to use the latest scan, pick a
+   product (True Color Reproduction is the default), and pick a look:
+   - **Map View** — `native` is the round full-disk Earth; `flat` is a
+     rectangular map you can crop to a **Region**.
+   - **Output Quality** — higher = higher-resolution flat maps (more detail,
+     larger file, slower). Native output is always full sensor resolution.
+   - **Labels / Borders** — turn them on and set the **label size** and
+     **border width**; both now stay visible even on the giant native disk.
+5. **Click Run** (or `python himawari_cli.py --run --url ...`). Images land in
+   your outputs folder — see [Where Files Go](#where-files-go).
+
+**Want all three looks at once?** Use **3 TC Styles** (button, CLI
+`--true-color-set`, or the menu entry) to render True Color as a native disk, a
+flat map, and a Zoom Earth-style flat map in one go. See
+[Generate 3 True Color styles at once](#generate-3-true-color-styles-at-once).
+
+**Lowest RAM / fastest:** keep the default `native` resampler, 1 Dask worker,
+and a small chunk size; use a **Region** + a lower **Output Quality** for flat
+maps. More detail in [Why This Version Is Low RAM](#why-this-version-is-low-ram).
 
 ---
 
@@ -119,11 +161,13 @@ It opens a smaller window with only the essentials:
 - **Product** — the same band/composite list as the full GUI.
 - **Output** — Single Image / Timelapse, hours back, interval, FPS, animation
   format (gif/mp4).
-- **Options** — just three things:
+- **Options** — the essentials:
   - **Map style**: *Native flat map* or *Zoom Earth style flat map* (radio
-    buttons — no native-round-disk option, no live/hd layer switching).
+    buttons — no native-round-disk option).
   - **Labels** toggle with a colour chooser and a size spinner.
-  - **Coastline & borders** toggle with a colour chooser.
+  - **Coastline & borders** toggle with a colour chooser and a **border width**
+    spinner.
+  - **Output quality** dropdown (higher = higher-resolution flat maps).
 - **Flat-map region** — the four latitude/longitude bound fields plus a
   **Pick Region (map)** button.
 - **Status** + **Start Processing** / **Stop**.
@@ -139,7 +183,7 @@ Check Env, Quick Fix, Auto Fix, Check Overlays, Open Outputs, Open Last, Copy
 Paths/Error/Log/Settings, Update App, Help.
 
 **What's locked (forced, not shown):**
-- Satellite layer = `standard` (no live/hd auto-switching).
+- Satellite layer = `standard` (the live/HD layers were removed program-wide).
 - Auto-download missing satellite files = **on** (always).
 - Write metadata sidecar = **off** (always).
 - Resampler = `native` (the low-RAM default).
@@ -271,33 +315,41 @@ folders, overlays, and custom preset management.
   infrared check, and a lower-RAM B13 timelapse. **Custom presets** can save
   and reload your current settings without changing the locked safe presets.
 
-#### Satellite Layer Selector
+#### Output Quality, Map View, and Region
 
-The **Satellite Layer** selector controls how the source scan and flat-map
-styling are chosen:
+The **live** and **HD** satellite layers were removed — only the **standard**
+layer remains, so there is no Satellite Layer selector any more. The standard
+layer no longer forces flat/Zoom Earth styling, which means your **Map View**
+and **Region** choices are always respected (previously picking a live/HD layer
+could silently flip a native or regional choice back to a full flat map).
 
-- **standard** — keeps the configured URL and rendering settings. Use it for
-  manual workflows, native round-disk output, single-band checks, or custom
-  advanced settings.
-- **live** — resolves the latest available NOAA Himawari FLDK scan when
-  processing starts, then applies the flat-map true-color defaults. It is
-  latest-at-run-start satellite imagery, not continuous streaming.
-- **hd** — keeps the selected/current scan URL and applies the stronger local
-  Zoom Earth-style flat-map rendering: brighter true color, chroma-speckle
-  cleanup, invalid limb/disk fill replacement, subtle grey-blue borders, labels
-  on, and crosshair off.
-
-> `live` and `hd` use Himawari satellite data only. They do **not** download
-> external Zoom Earth, Google, OpenStreetMap, commercial map, radar, wind, or
-> fire tiles.
+- **Map View** — `native` is the round full-disk Earth; `flat` is a rectangular
+  Web Mercator map you can crop with the bounds or the **Pick Region** map.
+- **Output Region** — regional presets and *Full Disk (flat map)* switch to the
+  flat map and fill the bounds; *Full Disk (native)* uses the round-Earth view.
+- **Output Quality** — a friendly resolution control for flat maps: higher
+  quality means finer degrees-per-pixel, i.e. **higher resolution** (more
+  detail, larger file, slower). It fills the `deg/px` box; typing a value by
+  hand switches the dropdown to *Custom*. If a quality would exceed the safe
+  flat-map pixel budget for the chosen region, the GUI coarsens it to the finest
+  resolution that still fits and logs the adjustment. **Native output is always
+  at the satellite's full sensor resolution** (already the highest quality), so
+  this control affects flat / Zoom Earth maps.
+- **Zoom Earth-style flat map** — areas the satellite cannot see are now filled
+  with a natural coloured basemap (deep-blue ocean, green/tan land) instead of a
+  dull grey patch, so off-disk regions look like a real map.
 
 #### Overlays, Labels, and Output
 
-- Optional coastline/country border overlays with a user-selected line color.
-  The default border color for live/hd is a subtle light grey-blue
-  (`#d8dee8`); the selected color is used for native and standard flat maps.
+- Optional coastline/country border overlays with a user-selected line color
+  and a configurable **border width** (GUI spinbox, CLI `--border-width`).
 - Flat-map label text size is configurable in the GUI beside the **Labels**
   toggle and from the CLI with `--map-label-size`.
+- **Labels and borders now scale with the output resolution.** On the enormous
+  native full disk (up to 22000×22000 px) a 1 px line and a 16 px label used to
+  be sub-pixel and effectively invisible; they are now scaled up automatically
+  so your chosen size/width stays visible at any output size. Images at or below
+  a normal flat-map size are unchanged.
 - In timelapse mode, **Image Format** controls the individual frame files
   (`.png` or `.tif`) and **Timelapse Format** controls the assembled animation
   (`.gif` or `.mp4`). If only one frame finishes successfully, the app now
@@ -387,15 +439,17 @@ flags for repeatable commands:
 ```powershell
 python himawari_cli.py --run --composite "B13 (Infrared Window)" --mode "Single Image"
 python himawari_cli.py --run --composite "True Color Reproduction Image" --night-fallback-mode hybrid
-python himawari_cli.py --run --satellite-layer live
-python himawari_cli.py --run --satellite-layer hd
+python himawari_cli.py --run --map-view flat --flat-min-lat -60 --flat-max-lat 60 --flat-min-lon 80 --flat-max-lon 200 --quality High
 python himawari_cli.py --run --map-view flat --flat-min-lat -60 --flat-max-lat 60 --flat-min-lon 80 --flat-max-lon 200 --flat-resolution-deg 0.05
-python himawari_cli.py --run --map-view flat --zoom-earth-style yes --map-labels yes --map-label-size 20 --night-boundary yes --crosshair yes --crosshair-type plus --crosshair-color "#ff0077"
+python himawari_cli.py --run --map-view flat --zoom-earth-style yes --map-labels yes --map-label-size 20 --border-lines yes --border-width 1.5 --night-boundary yes --crosshair yes --crosshair-type plus --crosshair-color "#ff0077"
 python himawari_cli.py --run --gpu-acceleration yes --composite "True Color Reproduction Image"
 ```
 
-Use `--satellite-layer standard`, `--satellite-layer live`, or
-`--satellite-layer hd` from the CLI for the same layer modes shown in the GUI.
+Use `--quality Draft (fastest)`/`Low`/`Standard`/`High`/`Ultra (slowest)` for a
+friendly flat-map resolution (higher = higher resolution). It overrides
+`--flat-resolution-deg` when both are given; native output is always full sensor
+resolution. The live/HD satellite layers were removed, so there is no
+`--satellite-layer` flag any more — the standard layer is always used.
 
 If you enable GPU acceleration from the CLI, choose one of the two supported
 true-color products. For B13, B11/SO2, and other single-band or specialty RGB
@@ -958,7 +1012,45 @@ reader dependencies.
 
 ## What's New
 
+### 2026.07.04.01 — Visible labels/borders, Output Quality, standard layer only
+
+- **Map labels & borders now show on the native full disk.** They were being
+  drawn at the size you chose (e.g. 16 px text, 1 px lines) directly onto the
+  22000×22000 px native raster, where they are sub-pixel and vanish once the
+  image is viewed scaled down. Overlays now **scale with the output resolution**
+  so your chosen sizes stay visible at any output size; normal flat maps are
+  unchanged.
+- **Choose your border thickness and label text size.** Both are exposed in
+  every interface — GUI spinboxes, the Simple GUI, CLI (`--border-width`,
+  `--map-label-size`), and TUI — and are honored at every resolution.
+- **New Output Quality control.** A friendly *Draft → Ultra* selector for
+  flat-map resolution: higher quality = higher resolution (finer
+  degrees-per-pixel, larger file, slower). It fills the `deg/px` value; editing
+  the value by hand switches it to *Custom*. Available in the GUI, Simple GUI,
+  CLI (`--quality`), and TUI. Native output is always full sensor resolution.
+- **Output Region / Pick Region reliability.** The live/HD satellite layers used
+  to silently override a native or regional choice back to a full flat map.
+  Removing those layers (below) means Map View and Region are now always
+  respected.
+- **The live and HD satellite layers were removed — standard only.** The
+  Satellite Layer selector is gone from the GUI, the `--satellite-layer` CLI
+  flag and TUI field are removed, and any old saved config/preset that still
+  says `live`/`hd` loads and is treated as `standard`.
+- **"9 TC Styles" is now "3 TC Styles".** With only the standard layer, the
+  batch renders the True Color Reproduction product in the three map styles —
+  **Native**, **Standard flat map**, and **Zoom Earth-style flat map** — with
+  `…_native`, `…_flat_standard`, and `…_flat_zoomearth` filenames. The button,
+  CLI `--true-color-set`, and the TUI/CLI menu item all reflect this.
+- **Zoom Earth flat map: coloured basemap.** Areas the satellite cannot see are
+  now filled with a natural coloured basemap (deep-blue ocean, green/tan land)
+  instead of a dull grey patch, so off-disk regions look like a real map.
+- **Launcher adds the Simple GUI.** `himawari.bat` now offers *Run Simple GUI*
+  in the menu and a `simple` action (`himawari simple`).
+
 ### 2026.07.02.01 — 9-cell True Color matrix, typhoon tracks, and bug fixes
+
+> Superseded by 2026.07.04.01: the live/HD satellite layers and the 9-cell
+> matrix described below were removed; the batch is now the 3-style set.
 
 - **"3 TC Styles" is now "9 TC Styles".** The batch action now renders
   **3 satellite layers × 3 map styles = 9** True-Color images. The layers are

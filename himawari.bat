@@ -70,6 +70,7 @@ if /i "%ACTION%"=="doctor" goto check_env
 if /i "%ACTION%"=="check" goto check_env
 if /i "%ACTION%"=="cli" goto run_cli
 if /i "%ACTION%"=="gui" goto run_gui
+if /i "%ACTION%"=="simple" goto run_simple
 if /i "%ACTION%"=="tui" goto run_tui
 if /i "%ACTION%"=="help" goto help
 
@@ -87,14 +88,16 @@ echo   1. Install Requirements
 echo   2. Quick Fix (repair environment)
 echo   3. Check Environment (doctor)
 echo   4. Run CLI
-echo   5. Run GUI
-echo   6. Run TUI
+echo   5. Run GUI (full)
+echo   6. Run Simple GUI
+echo   7. Run TUI
 echo   0. Exit
 echo.
 
-choice /c 1234560 /n /m "Choose an option (0-6): "
-if errorlevel 7 exit /b 0
-if errorlevel 6 goto run_tui
+choice /c 12345670 /n /m "Choose an option (0-7): "
+if errorlevel 8 exit /b 0
+if errorlevel 7 goto run_tui
+if errorlevel 6 goto run_simple
 if errorlevel 5 goto run_gui
 if errorlevel 4 goto run_cli
 if errorlevel 3 goto check_env
@@ -161,6 +164,17 @@ echo ERROR: Could not find GUI script
 pause
 goto menu
 
+:run_simple
+if not exist "%PROJECT_DIR%himawari_lowram_simple.py" (
+    echo ERROR: himawari_lowram_simple.py not found
+    pause
+    goto menu
+)
+echo Launching Simple GUI...
+"%PYTHON_CMD%" %PYTHON_ARGS% "%PROJECT_DIR%himawari_lowram_simple.py"
+pause
+goto menu
+
 :run_tui
 if not exist "%PROJECT_DIR%himawari_tui.py" (
     echo ERROR: himawari_tui.py not found
@@ -180,7 +194,8 @@ echo   install-reqs  Install Python requirements
 echo   quick-fix     Repair environment
 echo   check-env     Check environment (doctor)
 echo   cli           Run the command-line interface
-echo   gui           Run the graphical user interface
+echo   gui           Run the graphical user interface (full)
+echo   simple        Run the simplified graphical user interface
 echo   tui           Run the text user interface
 echo   help          Show this help
 echo.

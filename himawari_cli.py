@@ -51,9 +51,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--true-color-set",
         action="store_true",
         help=(
-            "Render the True Color Reproduction product across all nine cells "
-            "(standard/live/HD satellite layers x native/flat/Zoom Earth map "
-            "styles), then exit."
+            "Render the True Color Reproduction product across all three map styles "
+            "(native round disk, standard flat map, Zoom Earth-style flat map), "
+            "then exit."
         ),
     )
     parser.add_argument("--check-env", action="store_true", help="Run check_environment.py before any processing.")
@@ -82,13 +82,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help='Composite or band name, for example "True Color Reproduction Image" or "B13 (Infrared Window)".',
     )
-    parser.add_argument(
-        "--satellite-layer",
-        dest="satellite_layer_mode",
-        choices=processor.SATELLITE_LAYER_MODES,
-        default=None,
-        help="Satellite layer mode: standard keeps the configured URL, live resolves the latest NOAA scan, hd applies local Zoom Earth-style flat-map rendering.",
-    )
     parser.add_argument("--hours-back", type=int, default=None)
     parser.add_argument("--interval-minutes", type=int, default=None)
     parser.add_argument("--fps", type=int, default=None)
@@ -111,6 +104,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--flat-min-lon", type=float, default=None)
     parser.add_argument("--flat-max-lon", type=float, default=None)
     parser.add_argument("--flat-resolution-deg", type=float, default=None)
+    parser.add_argument(
+        "--quality",
+        dest="output_quality",
+        choices=[name for name, _deg in processor.OUTPUT_QUALITY_LEVELS],
+        default=None,
+        help=(
+            "Flat-map output quality (higher = higher resolution). Sets the "
+            "degrees-per-pixel; overrides --flat-resolution-deg when both are given. "
+            "Native output is always full sensor resolution."
+        ),
+    )
 
     parser.add_argument("--auto-download", type=parse_bool, default=None)
     parser.add_argument("--gpu-acceleration", type=parse_bool, default=None)
@@ -182,6 +186,36 @@ def config_from_args(args: argparse.Namespace) -> processor.ProcessorConfig:
         value = getattr(args, name, None)
         if value is not None:
             values[name] = value
+    # The friendly quality level drives the flat-map resolution (and wins over an
+    # explicit --flat-resolution-deg). Higher quality == finer degrees-per-pixel.
+    quality = getattr(args, "output_quality", None)
+    if quality is not None:
+        deg = processor.output_quality_resolution_deg(quality)
+        if deg is not None:
+            # Keep the chosen quality runnable for the current region: coarsen it
+            # if the full flat map would exceed the safe pixel budget (the GUI does
+            # the same). Only applies to flat maps and only to the friendly levels.
+            if processor.normalized_map_view(values.get("map_view", processor.MAP_VIEW)) == "flat":
+                fitted, adjusted = processor.flat_resolution_for_budget(
+                    values.get("flat_min_lat", processor.FLAT_MIN_LAT),
+                    values.get("flat_max_lat", processor.FLAT_MAX_LAT),
+                    values.get("flat_min_lon", processor.FLAT_MIN_LON),
+                    values.get("flat_max_lon", processor.FLAT_MAX_LON),
+                    deg,
+                )
+                if adjusted:
+                    print(
+                        f"Output quality '{quality}' coarsened to {fitted:g} deg/px so the "
+                        f"region stays under {processor.MAX_FLAT_MAP_PIXELS:,} px."
+                    )
+                deg = fitted
+            values["flat_resolution_deg"] = deg
+            values["output_quality"] = processor.output_quality_for_resolution(deg)
+    elif "flat_resolution_deg" in values:
+        # A manual resolution means the quality label is "Custom".
+        values["output_quality"] = processor.output_quality_for_resolution(
+            values["flat_resolution_deg"]
+        )
     config = processor.layer_defaults_config(processor.ProcessorConfig(**values))
     try:
         processor.validate_configuration(config)
@@ -200,7 +234,6 @@ def print_config(config: processor.ProcessorConfig) -> None:
     print(f"URL:                {config.user_url}")
     print(f"Mode:               {config.mode}")
     print(f"Composite/Band:     {config.composite_choice}")
-    print(f"Satellite layer:    {config.satellite_layer_mode}")
     print(f"Hours back:         {config.hours_back}")
     print(f"Interval minutes:   {config.interval_minutes}")
     print(f"FPS:                {config.fps}")
@@ -214,6 +247,9 @@ def print_config(config: processor.ProcessorConfig) -> None:
             f"Web Mercator, lat {config.flat_min_lat:g}..{config.flat_max_lat:g}, "
             f"lon {config.flat_min_lon:g}..{config.flat_max_lon:g}, "
             f"{config.flat_resolution_deg:g} deg/px at equator"
+        )
+        print(
+            f"Output quality:     {processor.output_quality_for_resolution(config.flat_resolution_deg)}"
         )
     print(f"Auto-download:      {yes_no(config.auto_download)}")
     print(f"GPU acceleration:   {yes_no(config.gpu_acceleration)}")
@@ -312,7 +348,6 @@ def edit_basic_settings(config: processor.ProcessorConfig) -> processor.Processo
     values["user_url"] = prompt_text("Himawari URL", config.user_url)
     values["mode"] = prompt_choice("Output mode", config.mode, ("Single Image", "Timelapse"))
     values["composite_choice"] = prompt_choice("Composite / band", config.composite_choice, sorted(processor.COMPOSITE_BANDS))
-    values["satellite_layer_mode"] = prompt_choice("Satellite layer", config.satellite_layer_mode, processor.SATELLITE_LAYER_MODES)
     values["image_format"] = prompt_choice("Image format", config.image_format, ("png", "tif"))
     if values["mode"] == "Timelapse":
         values["hours_back"] = prompt_int("Hours back", config.hours_back, 1, 240)
@@ -345,7 +380,24 @@ def edit_advanced_settings(config: processor.ProcessorConfig) -> processor.Proce
         values["flat_max_lat"] = prompt_float("Flat max latitude", config.flat_max_lat, -90.0)
         values["flat_min_lon"] = prompt_float("Flat min longitude", config.flat_min_lon, -360.0)
         values["flat_max_lon"] = prompt_float("Flat max longitude", config.flat_max_lon, -360.0)
-        values["flat_resolution_deg"] = prompt_float("Flat resolution degrees", config.flat_resolution_deg, 0.001)
+        # Friendly quality choice fills the resolution; "Custom" asks for deg/px.
+        current_quality = processor.output_quality_for_resolution(config.flat_resolution_deg)
+        chosen_quality = prompt_choice(
+            "Output quality (higher = higher resolution)",
+            current_quality,
+            processor.output_quality_names(),
+        )
+        quality_deg = processor.output_quality_resolution_deg(chosen_quality)
+        if quality_deg is None:
+            values["flat_resolution_deg"] = prompt_float(
+                "Flat resolution degrees/px", config.flat_resolution_deg, 0.001
+            )
+            values["output_quality"] = processor.output_quality_for_resolution(
+                values["flat_resolution_deg"]
+            )
+        else:
+            values["flat_resolution_deg"] = quality_deg
+            values["output_quality"] = chosen_quality
     values["output_template"] = prompt_text("Output filename template", config.output_template)
     values["add_border_lines"] = prompt_bool("Draw coastline/country borders", config.add_border_lines)
     values["border_line_color"] = prompt_text("Border line color", config.border_line_color)
@@ -406,8 +458,8 @@ def run_processor(config: processor.ProcessorConfig) -> list[Path]:
 
 
 def run_true_color_styles(config: processor.ProcessorConfig) -> list[Path]:
-    """Render True Color Reproduction across all nine layer/style cells
-    (standard/live/HD satellite layers x native/flat/Zoom Earth map styles)."""
+    """Render True Color Reproduction across all three map-style cells
+    (native round disk / standard flat map / Zoom Earth-style flat map)."""
     eta_estimator = processor.ProgressEtaEstimator()
 
     def progress(message: str, current: int | None, total: int | None) -> None:
@@ -420,8 +472,8 @@ def run_true_color_styles(config: processor.ProcessorConfig) -> list[Path]:
 
     count = len(processor.TRUE_COLOR_STYLE_SET)
     print(
-        f"Rendering True Color Reproduction in {count} cells: the standard, live "
-        "and HD satellite layers, each as native / flat / Zoom Earth-style.\n"
+        f"Rendering True Color Reproduction in {count} cells: native round disk, "
+        "standard flat map, and Zoom Earth-style flat map.\n"
     )
     outputs = processor.run_true_color_style_set(config, progress=progress)
     print()
@@ -441,7 +493,7 @@ def interactive_menu(config: processor.ProcessorConfig) -> int:
         print("3. Edit advanced settings")
         print("4. Check environment")
         print("5. Run processor")
-        print("6. Render 9 true color styles (standard/live/HD x native/flat/Zoom Earth)")
+        print("6. Render 3 true color styles (native / flat / Zoom Earth)")
         print("7. Update program (from GitHub main branch)")
         print("8. Exit")
         choice = input("Choose an option: ").strip()
@@ -506,7 +558,8 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print(
         "No processing started. Use --run to run once, --true-color-set for the "
-        "9-cell (layer x style) true-color batch, or --menu for the guided CLI."
+        "3-style (native / flat / Zoom Earth) true-color batch, or --menu for the "
+        "guided CLI."
     )
     return 0
 

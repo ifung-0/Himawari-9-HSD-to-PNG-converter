@@ -34,12 +34,10 @@ Launch:
 
 from __future__ import annotations
 
-import os
 import sys
-import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import colorchooser, filedialog, messagebox, ttk
+from tkinter import ttk
 
 # Locate and import the processor engine. The canonical file is
 # ``himawari_lowram_processor.py``; some older/renamed installs ship it as
@@ -178,6 +176,9 @@ def _load_simple_settings() -> ProcessorConfig:
         "map_label_size",
         "add_border_lines",
         "border_line_color",
+        "border_line_width",
+        "flat_resolution_deg",
+        "output_quality",
         "add_typhoon_tracks",
         "typhoon_track_color",
         "typhoon_data_source",
@@ -267,6 +268,25 @@ class HimawariSimpleApp(h.HimawariProcessorApp):
         except Exception:
             map_label_size = MAP_LABEL_SIZE
         try:
+            border_line_width = float(self.border_width_var.get())
+        except Exception:
+            border_line_width = 1.0
+        # Friendly quality dropdown -> flat-map resolution (higher = higher res).
+        quality = self.output_quality_var.get()
+        flat_resolution_deg = h.output_quality_resolution_deg(quality)
+        if flat_resolution_deg is None:
+            flat_resolution_deg = FLAT_RESOLUTION_DEG
+            quality = h.output_quality_for_resolution(flat_resolution_deg)
+        else:
+            # Keep the chosen quality runnable for the current region.
+            try:
+                flat_resolution_deg, _adj = h.flat_resolution_for_budget(
+                    flat_min_lat, flat_max_lat, flat_min_lon, flat_max_lon, flat_resolution_deg
+                )
+                quality = h.output_quality_for_resolution(flat_resolution_deg)
+            except Exception:
+                pass
+        try:
             download_workers = int(self.download_workers_var.get())
         except Exception:
             download_workers = h.DOWNLOAD_WORKERS
@@ -309,7 +329,7 @@ class HimawariSimpleApp(h.HimawariProcessorApp):
             allow_quality_fallback=False,
             add_border_lines=self.border_lines_var.get(),
             border_line_color=self.border_color_var.get(),
-            border_line_width=1.0,
+            border_line_width=border_line_width,
             add_map_labels=self.map_labels_var.get(),
             map_label_size=map_label_size,
             add_night_boundary=False,
@@ -322,7 +342,8 @@ class HimawariSimpleApp(h.HimawariProcessorApp):
             flat_max_lat=flat_max_lat,
             flat_min_lon=flat_min_lon,
             flat_max_lon=flat_max_lon,
-            flat_resolution_deg=FLAT_RESOLUTION_DEG,
+            flat_resolution_deg=flat_resolution_deg,
+            output_quality=quality,
             ram_limit_gb=ram_limit,
             dask_chunk_size=self.chunk_var.get(),
             dask_num_workers=dask_workers,
@@ -475,6 +496,27 @@ class HimawariSimpleApp(h.HimawariProcessorApp):
         ttk.Button(options_frame, text="Choose...", command=self._choose_border_color).grid(
             row=2, column=3, padx=4, pady=4
         )
+        ttk.Label(options_frame, text="Border width:").grid(row=2, column=4, sticky="w", padx=4, pady=4)
+        ttk.Spinbox(
+            options_frame, from_=0.25, to=5.0, increment=0.25,
+            textvariable=self.border_width_var, width=6,
+        ).grid(row=2, column=5, padx=4, pady=4, sticky="w")
+
+        # Output quality (flat-map resolution): higher = higher resolution.
+        ttk.Label(options_frame, text="Output quality:").grid(row=3, column=0, sticky="w", padx=4, pady=4)
+        ttk.Combobox(
+            options_frame,
+            textvariable=self.output_quality_var,
+            # Only the named levels: the simple GUI has no manual deg/px field, so
+            # "Custom" would be meaningless here.
+            values=[name for name, _deg in h.OUTPUT_QUALITY_LEVELS],
+            state="readonly",
+            width=16,
+        ).grid(row=3, column=1, columnspan=2, padx=4, pady=4, sticky="w")
+        ttk.Label(
+            options_frame,
+            text="Higher = higher resolution (larger, slower).",
+        ).grid(row=3, column=3, columnspan=3, sticky="w", padx=4, pady=4)
 
         # Typhoon tracks + colour chooser (drawn only when track data is found).
         ttk.Checkbutton(
@@ -622,7 +664,7 @@ class HimawariSimpleApp(h.HimawariProcessorApp):
             ("Quick Look", lambda: self._start_preview()),
             ("Pick Region", lambda: self._open_region_picker()),
             ("Test Data Host", lambda: self._start_connectivity_check()),
-            ("9 TC Styles", lambda: self._start_true_color_set()),
+            ("3 TC Styles", lambda: self._start_true_color_set()),
         ]
         # Split into two rows: 9 per row (18 buttons = two full rows of 9).
         per_row = 9
@@ -647,7 +689,7 @@ class HimawariSimpleApp(h.HimawariProcessorApp):
             "Quick Look": "preview_button",
             "Pick Region": "pick_region_button",
             "Test Data Host": "test_host_button",
-            "9 TC Styles": "true_color_set_button",
+            "3 TC Styles": "true_color_set_button",
         }
         for index, (label, command) in enumerate(button_specs):
             r = index // per_row
